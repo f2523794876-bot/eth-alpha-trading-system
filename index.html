@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ETH/BTC 短线交易决策系统</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="container">
+
+  <header class="topbar">
+    <div class="price-card" id="ethCard">
+      <div class="price-label">ETH 当前价格（USDT）</div>
+      <div class="price-value" id="ethPrice">--</div>
+      <div class="price-change" id="ethChange">--</div>
+    </div>
+    <div class="price-card" id="btcCard">
+      <div class="price-label">BTC 当前价格（USDT）</div>
+      <div class="price-value" id="btcPrice">--</div>
+      <div class="price-change" id="btcChange">--</div>
+    </div>
+    <div class="status-card">
+      <div class="update-time">更新时间：<span id="updateTime">--</span></div>
+      <div class="data-source" id="dataSource">数据来源：初始化中...</div>
+      <button id="retryBtn" class="btn-small">重试实时数据</button>
+    </div>
+  </header>
+
+  <section id="manualPanel" class="manual-panel">
+    <label class="manual-toggle">
+      <input type="checkbox" id="manualModeToggle">
+      启用手动输入价格模式（实时数据失败会自动开启）
+    </label>
+    <div class="manual-inputs">
+      <label>ETH 手动价格
+        <input type="number" id="manualEth" step="0.01" placeholder="例如 1802.50">
+      </label>
+      <label>BTC 手动价格
+        <input type="number" id="manualBtc" step="0.01" placeholder="例如 61000">
+      </label>
+      <button id="applyManualBtn" class="btn-small btn-accent">应用手动价格并重新计算</button>
+    </div>
+    <div id="manualWarning" class="manual-warning">⚠ 实时数据获取失败，请使用上方手动输入价格</div>
+  </section>
+
+  <main class="decision-panel">
+    <div class="state-display">
+      <div class="mini-label">当前市场状态</div>
+      <div class="state-value" id="stateValue">--</div>
+    </div>
+    <div class="advice-display">
+      <div class="mini-label">当前建议</div>
+      <div class="advice-value" id="adviceValue">--</div>
+      <div class="position-size" id="positionSize"></div>
+    </div>
+    <div class="risk-display">
+      <div class="mini-label">当前风险等级</div>
+      <div class="risk-value" id="riskValue">--</div>
+    </div>
+  </main>
+
+  <section class="levels-section">
+    <h2>关键位设置（可手动修改）</h2>
+    <div class="levels-grid">
+      <label>前低支撑 <input type="number" id="lv_qianDi"></label>
+      <label>弱势支撑 <input type="number" id="lv_ruoShi"></label>
+      <label>结构转换位 <input type="number" id="lv_jieGou"></label>
+      <label>多空分界 <input type="number" id="lv_fenJie"></label>
+      <label>换手区下沿 <input type="number" id="lv_yaLiLow"></label>
+      <label>换手区上沿 <input type="number" id="lv_yaLiHigh"></label>
+      <label>心理位/关键支撑 <input type="number" id="lv_xinLi"></label>
+      <label>当前上方压力 <input type="number" id="lv_yaLiShang"></label>
+      <label>突破第一目标 <input type="number" id="lv_target1"></label>
+      <label>突破第二目标 <input type="number" id="lv_target2"></label>
+    </div>
+    <button id="applyLevelsBtn" class="btn-small btn-accent">应用关键位修改</button>
+  </section>
+
+  <section class="table-section">
+    <h2>支撑压力一览</h2>
+    <div class="table-wrap">
+      <table id="levelsTable">
+        <thead><tr><th>类型</th><th>价格</th><th>说明</th></tr></thead>
+        <tbody id="levelsTableBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="explain-section">
+    <h2>多空逻辑解释</h2>
+    <p id="explainText">--</p>
+  </section>
+
+  <section class="dragonfly-section">
+    <h2>蜻蜓捕猎模型</h2>
+    <p class="static-text">
+      蜻蜓捕猎从不追逐猎物当前所在的位置，而是提前计算猎物下一步会出现在哪里，在拦截点耐心等待。
+      交易同理：不要在价格已经飞奔而去的地方追涨杀跌，而要判断下一个高概率的拦截区在哪里——现在究竟是"追涨风险区"还是"回踩低吸区"，当前价格是否已经不划算，是否应该耐心等待更好的赔率再出手。
+    </p>
+    <p id="dragonflyDynamicText">--</p>
+  </section>
+
+  <section class="plan-section">
+    <h2>操作计划</h2>
+    <div id="planContent">--</div>
+  </section>
+
+  <section class="risk-warning-section">
+    <h2>风险提示</h2>
+    <ul>
+      <li>小仓试错可以，但绝不能无限补保证金摊平亏损。</li>
+      <li>专业的加仓，是市场已经证明方向正确之后的加仓，不是亏损后为了摊平成本而加仓。</li>
+      <li>不要情绪化追涨杀跌，追高和杀跌往往恰好发生在赔率最差的位置。</li>
+      <li>本系统仅输出交易判断与风险提示，用于辅助思考，不代表投资建议，不会自动下单，最终决策与风险由使用者自行承担。</li>
+    </ul>
+  </section>
+
+  <footer class="footer">
+    ETH / BTC 15分钟短线趋势辅助判断系统 · 数据每 5 秒自动刷新 · 仅供参考，不构成投资建议
+  </footer>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

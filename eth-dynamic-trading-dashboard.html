@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ETH/BTC 动态支撑压力交易决策系统</title>
+<style>
+:root{
+  --bg: #0b0e14;
+  --panel: #131722;
+  --panel2: #171c29;
+  --panel-border: #232838;
+  --text: #e6e9f0;
+  --muted: #8b93a7;
+  --green: #26a69a;
+  --red: #ef5350;
+  --yellow: #d4a017;
+  --blue: #3b82f6;
+  --orange: #f0883e;
+  --purple: #a78bfa;
+}
+*{ box-sizing: border-box; }
+body{
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Segoe UI", system-ui, sans-serif;
+  line-height: 1.6;
+}
+.container{ max-width: 1180px; margin: 0 auto; padding: 20px 16px 60px; }
+h2{
+  font-size: 16px; color: var(--muted); margin: 0 0 12px;
+  border-left: 3px solid var(--blue); padding-left: 8px;
+  display:flex; align-items:center; gap:8px;
+}
+h2 .sub{ font-size:12px; color:#5b6478; font-weight:400; border-left:none; }
+.topbar{ display: grid; grid-template-columns: 1fr 1fr 1.3fr; gap: 12px; margin-bottom: 16px; }
+.price-card, .status-card{
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: 10px; padding: 14px 16px;
+}
+.price-label{ color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+.price-value{ font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.price-change{ font-size: 12px; color: var(--muted); margin-top: 4px; }
+.price-change.pos{ color: var(--green); }
+.price-change.neg{ color: var(--red); }
+.status-card{ display: flex; flex-direction: column; justify-content: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.data-source-error{ color: var(--red) !important; }
+.btn-small{
+  align-self: flex-start; background: var(--panel-border); color: var(--text);
+  border: 1px solid var(--panel-border); border-radius: 6px; padding: 6px 12px;
+  font-size: 12px; cursor: pointer;
+}
+.btn-small:hover{ background: #2a3040; }
+.btn-accent{ background: var(--blue); border-color: var(--blue); color: #fff; }
+.btn-accent:hover{ background: #2f6fd8; }
+.btn-row{ display:flex; gap:8px; flex-wrap:wrap; }
+
+.manual-panel{
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px;
+}
+.manual-toggle{ display: flex; align-items: center; gap: 8px; color: var(--muted); cursor: pointer; }
+.manual-inputs{ display: none; gap: 12px; margin-top: 10px; flex-wrap: wrap; align-items: flex-end; }
+.manual-panel.manual-active .manual-inputs{ display: flex; }
+.manual-inputs label{ display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.manual-inputs input{
+  background: var(--bg); border: 1px solid var(--panel-border); color: var(--text);
+  border-radius: 6px; padding: 6px 8px; width: 130px;
+}
+.manual-warning{ display: none; margin-top: 10px; color: var(--red); font-weight: 600; }
+.manual-panel.show-warning .manual-warning{ display: block; }
+.manual-note{ color:#5b6478; font-size:12px; margin-top:8px; }
+
+.decision-panel{ display: grid; grid-template-columns: 1.1fr 1.6fr 1fr; gap: 12px; margin-bottom: 16px; }
+.state-display, .advice-display, .risk-display{
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: 10px; padding: 16px; text-align: center;
+}
+.mini-label{ color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+.state-value{ font-size: 22px; font-weight: 800; }
+.state-sub{ font-size:12px; color:var(--muted); margin-top:6px; }
+.advice-value{ font-size: 14px; font-weight: 600; line-height: 1.6; text-align:left; }
+.position-size{ margin-top: 8px; font-size: 13px; color: var(--orange); text-align:left; }
+.risk-value{ font-size: 20px; font-weight: 800; }
+.risk-msg{ font-size:12px; color:var(--muted); margin-top:6px; }
+
+.state-bull{ color: var(--green); }
+.state-bear{ color: var(--red); }
+.state-range{ color: var(--orange); }
+.state-falsebreak{ color: var(--yellow); }
+.state-unknown, .state-no_data{ color: var(--muted); }
+
+.risk-mid{ color: var(--yellow); }
+.risk-high{ color: var(--red); }
+.risk-good{ color: var(--green); }
+.risk-unknown{ color: var(--muted); }
+
+.dyn-section, .levels-section, .table-section, .explain-section, .dragonfly-section, .plan-section, .risk-warning-section{
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: 10px; padding: 16px; margin-bottom: 16px;
+}
+.dyn-grid{
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+}
+.dyn-item{
+  background: var(--panel2); border: 1px solid var(--panel-border);
+  border-radius: 8px; padding: 10px 12px;
+}
+.dyn-item .label{ color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.dyn-item .value{ font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.dyn-item.accent .value{ color: var(--blue); }
+.dyn-item.res .value{ color: var(--red); }
+.dyn-item.sup .value{ color: var(--green); }
+.dyn-item.rr .value{ color: var(--purple); }
+
+.levels-grid{
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px; margin-bottom: 12px;
+}
+.levels-grid label{ display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.levels-grid input{
+  background: var(--bg); border: 1px solid var(--panel-border); color: var(--text);
+  border-radius: 6px; padding: 6px 8px;
+}
+
+.table-wrap{ overflow-x: auto; }
+table{ width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--panel-border); white-space: nowrap; }
+th{ color: var(--muted); font-weight: 600; }
+
+.static-text, #explainText, #dragonflyDynamicText{ color: var(--text); font-size: 14px; }
+#dragonflyDynamicText{ color: var(--text); margin-top: 8px; font-weight:600; }
+
+.plan-row{ padding: 6px 0; border-bottom: 1px dashed var(--panel-border); font-size: 14px; }
+.plan-row:last-child{ border-bottom: none; }
+.plan-key{ color: var(--blue); font-weight: 700; margin-right: 6px; }
+
+.risk-warning-section ul{ margin: 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+.risk-warning-section li{ margin-bottom: 6px; }
+
+.footer{ text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; }
+
+.badge{
+  display:inline-block; font-size:11px; padding:2px 8px; border-radius:10px;
+  border:1px solid var(--panel-border); color:var(--muted); margin-left:6px;
+}
+.badge.dynamic{ color: var(--blue); border-color: var(--blue); }
+.badge.manual{ color: var(--orange); border-color: var(--orange); }
+
+@media (max-width: 800px){
+  .topbar, .decision-panel{ grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <header class="topbar">
+    <div class="price-card" id="ethCard">
+      <div class="price-label">ETH 当前价格（USDT）</div>
+      <div class="price-value" id="ethPrice">--</div>
+      <div class="price-change" id="ethChange">--</div>
+    </div>
+    <div class="price-card" id="btcCard">
+      <div class="price-label">BTC 当前价格（USDT）</div>
+      <div class="price-value" id="btcPrice">--</div>
+      <div class="price-change" id="btcChange">--</div>
+    </div>
+    <div class="status-card">
+      <div class="update-time">更新时间：<span id="updateTime">--</span></div>
+      <div class="data-source" id="dataSource">数据来源：初始化中...</div>
+      <div class="btn-row">
+        <button id="retryBtn" class="btn-small">重试实时K线数据</button>
+      </div>
+    </div>
+  </header>
+
+  <section id="manualPanel" class="manual-panel">
+    <label class="manual-toggle">
+      <input type="checkbox" id="manualModeToggle">
+      启用手动输入模式（实时K线获取失败时会自动开启，页面不会崩溃）
+    </label>
+    <div class="manual-inputs">
+      <label>ETH 当前价
+        <input type="number" id="m_ethPrice" step="0.01" placeholder="如 1815.30">
+      </label>
+      <label>BTC 当前价
+        <input type="number" id="m_btcPrice" step="0.01" placeholder="如 61000">
+      </label>
+      <label>最近高点
+        <input type="number" id="m_recentHigh" step="0.01" placeholder="如 1850">
+      </label>
+      <label>最近低点
+        <input type="number" id="m_recentLow" step="0.01" placeholder="如 1780">
+      </label>
+      <label>最近20根K线高点
+        <input type="number" id="m_high20" step="0.01" placeholder="如 1830">
+      </label>
+      <label>最近20根K线低点
+        <input type="number" id="m_low20" step="0.01" placeholder="如 1795">
+      </label>
+      <button id="applyManualBtn" class="btn-small btn-accent">应用手动数据并重新计算</button>
+    </div>
+    <div id="manualWarning" class="manual-warning">⚠ 实时K线数据获取失败，请使用上方手动输入，系统将基于手动数据继续计算动态支撑压力（精度低于实时K线）</div>
+    <div class="manual-note">说明：手动模式下无法识别EMA排列、摆动高低点(swing)与真实ATR，系统会用你输入的高低点做近似估算，仅供参考。</div>
+  </section>
+
+  <main class="decision-panel">
+    <div class="state-display">
+      <div class="mini-label">动态市场状态</div>
+      <div class="state-value" id="stateValue">--</div>
+      <div class="state-sub" id="stateSub">--</div>
+    </div>
+    <div class="advice-display">
+      <div class="mini-label">动态交易建议</div>
+      <div class="advice-value" id="adviceValue">--</div>
+      <div class="position-size" id="positionSize"></div>
+    </div>
+    <div class="risk-display">
+      <div class="mini-label">当前盈亏比 / 风险</div>
+      <div class="risk-value" id="riskValue">--</div>
+      <div class="risk-msg" id="riskMsg">--</div>
+    </div>
+  </main>
+
+  <section class="dyn-section">
+    <h2>动态支撑压力系统 <span class="badge dynamic" id="dynModeBadge">实时K线</span></h2>
+    <div class="dyn-grid" id="dynGrid"></div>
+  </section>
+
+  <section class="levels-section">
+    <h2>人工参考位（仅供参考，不参与动态计算） <span class="badge manual">额外参考</span></h2>
+    <div class="levels-grid">
+      <label>参考位1 <input type="number" id="lv_ref1" value="1770"></label>
+      <label>参考位2 <input type="number" id="lv_ref2" value="1800"></label>
+      <label>参考位3 <input type="number" id="lv_ref3" value="1834"></label>
+      <label>参考位4（自定义） <input type="number" id="lv_ref4" placeholder="可留空"></label>
+    </div>
+    <button id="applyLevelsBtn" class="btn-small btn-accent">应用人工参考位</button>
+  </section>
+
+  <section class="table-section">
+    <h2>动态支撑压力一览</h2>
+    <div class="table-wrap">
+      <table id="levelsTable">
+        <thead><tr><th>类型</th><th>价格</th><th>来源 / 说明</th></tr></thead>
+        <tbody id="levelsTableBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="explain-section">
+    <h2>多空逻辑解释</h2>
+    <p id="explainText">--</p>
+  </section>
+
+  <section class="dragonfly-section">
+    <h2>蜻蜓捕猎模型（动态版）</h2>
+    <p class="static-text">
+      蜻蜓捕猎从不追逐猎物当前所在的位置，而是提前计算猎物下一步会出现在哪里，在拦截点耐心等待。
+      当前价格 = 猎物当前位置；动态压力位 = 猎物上方可能被拦截的位置；动态支撑位 = 猎物下方可能被接住的位置；
+      ATR = 猎物移动速度；成交量 = 猎物加速度；BTC方向 = 风向。系统据此判断当前最佳拦截区在哪里，而不是在猎物已经飞奔而去的地方追涨杀跌。
+    </p>
+    <p id="dragonflyDynamicText">--</p>
+  </section>
+
+  <section class="plan-section">
+    <h2>操作计划</h2>
+    <div id="planContent">--</div>
+  </section>
+
+  <section class="risk-warning-section">
+    <h2>风险提示</h2>
+    <ul>
+      <li>所有支撑压力、止损、目标位均为程序基于最新K线自动计算的动态结果，会随价格变化而变化，不是固定点位。</li>
+      <li>小仓试错可以，但绝不能无限补保证金摊平亏损。</li>
+      <li>专业的加仓，是市场已经证明方向正确之后的加仓，不是亏损后为了摊平成本而加仓。</li>
+      <li>不要情绪化追涨杀跌，追高和杀跌往往恰好发生在赔率最差的位置。</li>
+      <li>本系统仅输出交易判断与风险提示，用于辅助思考，不代表投资建议，不会自动下单，最终决策与风险由使用者自行承担。</li>
+    </ul>
+  </section>
+
+  <footer class="footer">
+    ETH / BTC 15分钟K线动态支撑压力决策系统 · 数据每 20 秒自动刷新 · 仅供参考，不构成投资建议
+  </footer>
+
+</div>
+<script>
+/* ETH/BTC 动态支撑压力交易决策系统
+   核心原则：支撑压力/止损/目标不再写死固定价格，全部基于最新K线（ATR / EMA / swing high-low）动态计算。
+   人工关键位仅作为额外参考，不参与动态判断。
+*/
+
+const ETH_KLINE_URL = 'https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=15m&limit=100';
+const BTC_KLINE_URL = 'https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=100';
+const REFRESH_INTERVAL_MS = 20000;
+
+let ethKlines = [];
+let btcKlines = [];
+let mode = 'init'; // 'api' | 'manual' | 'init'
+let manualMode = false; // user-forced manual toggle
+let manualData = null;
+let lastEth = null, lastBtc = null; // last successful analyzed metrics, for change% display
+let refLevels = { ref1: 1770, ref2: 1800, ref3: 1834, ref4: null };
+
+function $(id){ return document.getElementById(id); }
+function fmt(v, d = 2){
+  if(v === null || v === undefined || !isFinite(v)) return '--';
+  return v.toLocaleString('zh-CN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+/* ---------- K线获取 ---------- */
+
+async function fetchKlines(url){
+  const resp = await fetch(url, { cache: 'no-store' });
+  if(!resp.ok) throw new Error('HTTP ' + resp.status);
+  const raw = await resp.json();
+  if(!Array.isArray(raw) || raw.length === 0) throw new Error('K线数据为空');
+  return raw.map(k => ({
+    openTime: k[0],
+    open: parseFloat(k[1]),
+    high: parseFloat(k[2]),
+    low: parseFloat(k[3]),
+    close: parseFloat(k[4]),
+    volume: parseFloat(k[5]),
+    closeTime: k[6]
+  }));
+}
+
+async function fetchAll(){
+  try{
+    const [eth, btc] = await Promise.all([fetchKlines(ETH_KLINE_URL), fetchKlines(BTC_KLINE_URL)]);
+    ethKlines = eth;
+    btcKlines = btc;
+    mode = 'api';
+    $('manualPanel').classList.remove('show-warning');
+    $('dataSource').textContent = '数据来源：Binance 15分钟K线（实时）';
+    $('dataSource').classList.remove('data-source-error');
+    $('dynModeBadge').textContent = '实时K线';
+    $('dynModeBadge').className = 'badge dynamic';
+    return true;
+  } catch(err){
+    mode = 'manual';
+    $('manualPanel').classList.add('show-warning');
+    $('dataSource').textContent = '⚠ 实时K线获取失败，已切换为手动输入模式';
+    $('dataSource').classList.add('data-source-error');
+    $('manualPanel').classList.add('manual-active');
+    $('dynModeBadge').textContent = '手动模式（近似值）';
+    $('dynModeBadge').className = 'badge manual';
+    return false;
+  }
+}
+
+/* ---------- 指标计算 ---------- */
+
+function emaSeries(closes, period){
+  const k = 2 / (period + 1);
+  const out = [];
+  let prev;
+  for(let i = 0; i < closes.length; i++){
+    prev = (i === 0) ? closes[0] : (closes[i] * k + prev * (1 - k));
+    out.push(prev);
+  }
+  return out;
+}
+
+function calcATR(klines, period){
+  if(klines.length < period + 1) return null;
+  const trs = [];
+  for(let i = 1; i < klines.length; i++){
+    const h = klines[i].high, l = klines[i].low, pc = klines[i - 1].close;
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  const last = trs.slice(-period);
+  return last.reduce((a, b) => a + b, 0) / last.length;
+}
+
+function findSwings(klines){
+  const highs = [], lows = [];
+  for(let i = 2; i < klines.length - 2; i++){
+    const h = klines[i].high;
+    if(h > klines[i-1].high && h > klines[i-2].high && h > klines[i+1].high && h > klines[i+2].high){
+      highs.push({ idx: i, price: h, time: klines[i].openTime });
+    }
+    const l = klines[i].low;
+    if(l < klines[i-1].low && l < klines[i-2].low && l < klines[i+1].low && l < klines[i+2].low){
+      lows.push({ idx: i, price: l, time: klines[i].openTime });
+    }
+  }
+  return { highs, lows };
+}
+
+// 基于K线数组做完整动态分析（ETH与BTC通用）
+function analyzeKlines(klines){
+  const n = klines.length;
+  const closes = klines.map(k => k.close);
+  const price = closes[n - 1];
+
+  const ema5arr = emaSeries(closes, 5);
+  const ema10arr = emaSeries(closes, 10);
+  const ema20arr = emaSeries(closes, 20);
+  const ema5 = ema5arr[n - 1], ema10 = ema10arr[n - 1], ema20 = ema20arr[n - 1];
+
+  const atr14 = calcATR(klines, 14);
+  const atrPrev = n > 20 ? calcATR(klines.slice(0, n - 5), 14) : atr14;
+
+  const last20 = klines.slice(-20);
+  const last50 = klines.slice(-50);
+  const high20 = Math.max(...last20.map(k => k.high));
+  const low20 = Math.min(...last20.map(k => k.low));
+  const high50 = Math.max(...last50.map(k => k.high));
+  const low50 = Math.min(...last50.map(k => k.low));
+
+  const swings = findSwings(klines);
+  const swingHighsAbove = swings.highs.filter(s => s.price > price).sort((a, b) => a.price - b.price);
+  const swingLowsBelow = swings.lows.filter(s => s.price < price).sort((a, b) => b.price - a.price);
+
+  const firstResistance = swingHighsAbove.length ? swingHighsAbove[0].price : high20;
+  const secondResistance = swingHighsAbove.length > 1 ? swingHighsAbove[1].price : high50;
+  const firstSupport = swingLowsBelow.length ? swingLowsBelow[0].price : low20;
+  const secondSupport = swingLowsBelow.length > 1 ? swingLowsBelow[1].price : low50;
+
+  const recentSwingHigh = swings.highs.length ? swings.highs[swings.highs.length - 1] : null;
+  const recentSwingLow = swings.lows.length ? swings.lows[swings.lows.length - 1] : null;
+
+  const avgVol20 = last20.reduce((s, k) => s + k.volume, 0) / last20.length;
+  const lastVol = klines[n - 1].volume;
+  const volumeRatio = avgVol20 > 0 ? lastVol / avgVol20 : null;
+
+  const breakoutHigh20 = price > high20;
+  const breakdownLow20 = price < low20;
+
+  let risingLows = null, fallingHighs = null;
+  if(swings.lows.length >= 2){
+    risingLows = swings.lows[swings.lows.length - 1].price > swings.lows[swings.lows.length - 2].price;
+  }
+  if(swings.highs.length >= 2){
+    fallingHighs = swings.highs[swings.highs.length - 1].price < swings.highs[swings.highs.length - 2].price;
+  }
+
+  let trend = 'flat';
+  if(price > ema20 && ema5 > ema10 && ema10 > ema20) trend = 'up';
+  else if(price < ema20 && ema5 < ema10 && ema10 < ema20) trend = 'down';
+
+  // 突破/跌破后是否又快速跌回/涨回区间（简化版真假突破判断）
+  const priorHigh20 = n > 23 ? Math.max(...klines.slice(-23, -3).map(k => k.high)) : high20;
+  const brokeAndReturned = Math.max(...last20.slice(-3).map(k => k.high)) > priorHigh20 && price < priorHigh20;
+
+  return {
+    price, ema5, ema10, ema20, atr14, atrPrev,
+    high20, low20, high50, low50,
+    firstResistance, secondResistance, firstSupport, secondSupport,
+    recentSwingHigh, recentSwingLow,
+    volumeRatio, breakoutHigh20, breakdownLow20,
+    risingLows, fallingHighs, trend, brokeAndReturned,
+    isManual: false
+  };
+}
+
+// 手动模式下的近似分析（仅使用用户输入的6个数值）
+function analyzeManual(m){
+  const price = m.ethPrice;
+  const high20 = m.high20, low20 = m.low20;
+  const high50 = m.recentHigh, low50 = m.recentLow;
+  const atrApprox = (m.recentHigh > m.recentLow) ? (m.recentHigh - m.recentLow) / 14 : null;
+
+  const firstResistance = price < high20 ? high20 : (price < m.recentHigh ? m.recentHigh : Math.max(high20, m.recentHigh));
+  const secondResistance = Math.max(high20, m.recentHigh);
+  const firstSupport = price > low20 ? low20 : (price > m.recentLow ? m.recentLow : Math.min(low20, m.recentLow));
+  const secondSupport = Math.min(low20, m.recentLow);
+
+  return {
+    price, ema5: null, ema10: null, ema20: null, atr14: atrApprox, atrPrev: atrApprox,
+    high20, low20, high50, low50,
+    firstResistance, secondResistance, firstSupport, secondSupport,
+    recentSwingHigh: null, recentSwingLow: null,
+    volumeRatio: null, breakoutHigh20: price > high20, breakdownLow20: price < low20,
+    risingLows: null, fallingHighs: null, trend: 'unknown', brokeAndReturned: false,
+    isManual: true
+  };
+}
+
+/* ---------- 市场状态 / 建议 / 盈亏比 ---------- */
+
+function classifyState(eth, btc){
+  if(eth.isManual){
+    return { state: 'unknown', label: '手动模式（近似判断）',
+      sub: '缺少EMA/摆动结构数据，仅基于人工输入的高低点做近似支撑压力估算' };
+  }
+
+  const btcTrend = btc ? btc.trend : 'unknown';
+  const btcWeak = btcTrend === 'down';
+  const btcStrongOrFlat = btcTrend !== 'down';
+
+  const falseBreakoutRisk =
+    (eth.breakoutHigh20 || eth.brokeAndReturned) &&
+    ((eth.volumeRatio !== null && eth.volumeRatio < 1.2) || !(btcTrend === 'up' || (btc && btc.breakoutHigh20)) || eth.brokeAndReturned);
+
+  if(falseBreakoutRisk){
+    return { state: 'falsebreak', label: '假突破风险',
+      sub: '价格突破但成交量未放大，或BTC未同步突破，或突破后快速跌回区间' };
+  }
+
+  const bullish = eth.trend === 'up' && eth.risingLows !== false && btcStrongOrFlat;
+  if(bullish){
+    return { state: 'bull', label: '多头趋势',
+      sub: `EMA5>EMA10>EMA20，价格站上EMA20，BTC${btcWeak ? '走弱' : '未明显走弱'}` };
+  }
+
+  const bearish = eth.trend === 'down' && eth.fallingHighs !== false && btcWeak;
+  if(bearish){
+    return { state: 'bear', label: '空头趋势',
+      sub: 'EMA5<EMA10<EMA20，价格跌破EMA20，且BTC同步走弱' };
+  }
+
+  const emaSpread = Math.max(eth.ema5, eth.ema10, eth.ema20) - Math.min(eth.ema5, eth.ema10, eth.ema20);
+  const emaCompressed = eth.atr14 ? emaSpread < eth.atr14 * 0.5 : false;
+  const atrDeclining = (eth.atr14 !== null && eth.atrPrev !== null) ? eth.atr14 <= eth.atrPrev : false;
+  const inRange = eth.price >= eth.low20 && eth.price <= eth.high20;
+
+  if(inRange && emaCompressed && atrDeclining){
+    return { state: 'range', label: '震荡区间',
+      sub: '价格处于最近20根K线高低点之间，EMA缠绕，ATR收缩' };
+  }
+
+  return { state: 'unknown', label: '趋势不明 / 过渡',
+    sub: '多空条件未同时满足，建议结合下方动态支撑压力位耐心等待' };
+}
+
+function buildAdvice(eth, btc, stateInfo){
+  const price = eth.price;
+  const btcTrend = btc ? btc.trend : 'unknown';
+  let advice, biasDirection, positionSize;
+
+  if(price > eth.firstResistance){
+    const volOk = eth.isManual ? null : (eth.volumeRatio !== null && eth.volumeRatio >= 1.2);
+    const btcOk = eth.isManual ? null : (btcTrend === 'up' || (btc && btc.breakoutHigh20));
+    if(!eth.isManual && volOk && btcOk){
+      advice = `价格已突破动态第一压力 ${fmt(eth.firstResistance)}，成交量放大且BTC同步走强，方向确认。`;
+      positionSize = '小仓跟随，或等待回踩动态压力不破再介入，不追价重仓';
+      biasDirection = 'long';
+    } else {
+      advice = `价格突破动态第一压力 ${fmt(eth.firstResistance)}，但${eth.isManual ? '手动模式无法确认成交量与BTC联动' : '成交量未放大或BTC未同步突破'}，警惕假突破。`;
+      positionSize = '观望，或等待回踩确认后再决定，不建议追价';
+      biasDirection = 'long-caution';
+    }
+  } else if(price <= eth.firstSupport * 1.003 && price >= eth.firstSupport * 0.985){
+    advice = `价格回踩动态第一支撑 ${fmt(eth.firstSupport)} 附近，支撑暂未被有效跌破。`;
+    positionSize = '小仓试多，止损参考下方动态止损位';
+    biasDirection = 'long';
+  } else if(price < eth.firstSupport){
+    if(!eth.isManual && btcTrend === 'down'){
+      advice = `价格已跌破动态第一支撑 ${fmt(eth.firstSupport)}，且BTC同步走弱，方向确认向下。`;
+      positionSize = '反弹至动态压力附近再考虑小仓试空，不追空';
+      biasDirection = 'short';
+    } else {
+      advice = `价格跌破动态第一支撑 ${fmt(eth.firstSupport)}，但${eth.isManual ? '手动模式无法确认BTC联动' : 'BTC未同步走弱'}，信号不一致。`;
+      positionSize = '观望，等待BTC方向进一步确认';
+      biasDirection = 'neutral';
+    }
+  } else {
+    advice = `当前价格处于动态支撑 ${fmt(eth.firstSupport)} 与动态压力 ${fmt(eth.firstResistance)} 中间。`;
+    positionSize = '赔率一般，不适合重仓，观望或极轻仓试错';
+    biasDirection = 'neutral';
+  }
+
+  return { advice, positionSize, biasDirection };
+}
+
+function buildStopAndTargets(eth, biasDirection){
+  const atr = eth.atr14;
+  let stop = null, targets = [null, null, null], base = null, dirLabel = '';
+
+  if(biasDirection === 'long' || biasDirection === 'long-caution' || biasDirection === 'neutral'){
+    stop = (atr !== null) ? eth.firstSupport - atr * 0.3 : null;
+    base = eth.breakoutHigh20 ? eth.high20 : eth.firstResistance;
+    if(atr !== null){
+      targets = [base + atr * 0.5, base + atr * 1, base + atr * 1.5];
+    }
+    dirLabel = biasDirection === 'neutral' ? '多头参考（区间中性）' : '多头';
+  }
+  if(biasDirection === 'short'){
+    stop = (atr !== null) ? eth.firstResistance + atr * 0.3 : null;
+    base = eth.breakdownLow20 ? eth.low20 : eth.firstSupport;
+    if(atr !== null){
+      targets = [base - atr * 0.5, base - atr * 1, base - atr * 1.5];
+    }
+    dirLabel = '空头';
+  }
+  return { stop, targets, dirLabel };
+}
+
+function calcRR(eth, biasDirection, stop, targets){
+  if(stop === null || targets[0] === null) return null;
+  const price = eth.price;
+  if(biasDirection === 'short'){
+    const risk = stop - price;
+    const reward = price - targets[0];
+    return risk > 0 ? reward / risk : null;
+  }
+  // long / long-caution / neutral 统一用多头场景做参考
+  const risk = price - stop;
+  const reward = targets[0] - price;
+  return risk > 0 ? reward / risk : null;
+}
+
+function rrMessage(rr){
+  if(rr === null) return '数据不足，暂无法计算盈亏比';
+  if(rr > 3) return `盈亏比 ${rr.toFixed(2)}，赔率优秀，但仍需确认BTC和成交量`;
+  if(rr > 2) return `盈亏比 ${rr.toFixed(2)}，赔率较好，可以考虑小仓试错`;
+  if(rr < 1.5) return `盈亏比 ${rr.toFixed(2)}，赔率一般，不建议重仓`;
+  return `盈亏比 ${rr.toFixed(2)}，赔率中等，可小仓参与并注意风控`;
+}
+
+function rrClass(rr){
+  if(rr === null) return 'risk-unknown';
+  if(rr > 2) return 'risk-good';
+  if(rr < 1.5) return 'risk-high';
+  return 'risk-mid';
+}
+
+function dragonflyText(stateInfo, biasDirection, eth){
+  if(stateInfo.state === 'falsebreak'){
+    return `当前疑似假突破，不建议追多。最佳拦截区仍在动态支撑 ${fmt(eth.firstSupport)} 附近，建议等待回踩确认或观望。`;
+  }
+  if(biasDirection === 'long' && eth.price > eth.firstResistance){
+    return `当前已突破动态压力 ${fmt(eth.firstResistance)}，等待回踩确认后再介入，不追高。`;
+  }
+  if(biasDirection === 'long'){
+    return `当前不适合追多，最佳多头拦截区在动态支撑 ${fmt(eth.firstSupport)} 附近，价格已进入该区域。`;
+  }
+  if(biasDirection === 'short'){
+    return `价格已跌破动态支撑 ${fmt(eth.firstSupport)}，风向（BTC）同步转弱，最佳拦截区变为反弹至动态压力 ${fmt(eth.firstResistance)} 附近的空头点。`;
+  }
+  return `当前价格在动态支撑 ${fmt(eth.firstSupport)} 与压力 ${fmt(eth.firstResistance)} 中间，赔率不好，建议观望，等待价格到达拦截区再考虑介入。`;
+}
+
+/* ---------- 渲染 ---------- */
+
+function formatTime(ts){
+  if(!ts) return '--';
+  return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function computeChangeStr(klines, current){
+  if(!klines || klines.length < 5 || current == null) return '近1小时涨跌：数据不足';
+  const ref = klines[klines.length - 5].close; // 4 bars = 1 hour back
+  const pct = (current - ref) / ref * 100;
+  const sign = pct >= 0 ? '+' : '';
+  return `近1小时涨跌：${sign}${pct.toFixed(2)}%`;
+}
+
+function setChangeEl(el, klines, current){
+  el.textContent = computeChangeStr(klines, current);
+  el.classList.remove('pos', 'neg');
+  if(klines && klines.length >= 5 && current != null){
+    const ref = klines[klines.length - 5].close;
+    const pct = (current - ref) / ref * 100;
+    if(pct > 0) el.classList.add('pos');
+    if(pct < 0) el.classList.add('neg');
+  }
+}
+
+function render(){
+  let eth, btc;
+
+  if(mode === 'api' && !manualMode){
+    eth = analyzeKlines(ethKlines);
+    btc = analyzeKlines(btcKlines);
+    lastEth = eth; lastBtc = btc;
+    $('ethPrice').textContent = fmt(eth.price);
+    $('btcPrice').textContent = fmt(btc.price);
+    setChangeEl($('ethChange'), ethKlines, eth.price);
+    setChangeEl($('btcChange'), btcKlines, btc.price);
+  } else if(manualData){
+    eth = analyzeManual(manualData);
+    btc = null;
+    $('ethPrice').textContent = fmt(eth.price);
+    $('btcPrice').textContent = fmt(manualData.btcPrice);
+    $('ethChange').textContent = '手动模式：无历史序列';
+    $('ethChange').className = 'price-change';
+    $('btcChange').textContent = '手动模式：无历史序列';
+    $('btcChange').className = 'price-change';
+  } else {
+    $('ethPrice').textContent = '--';
+    $('btcPrice').textContent = '--';
+    $('ethChange').textContent = '等待数据...';
+    $('btcChange').textContent = '等待数据...';
+    renderNoData();
+    return;
+  }
+
+  $('updateTime').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+  const stateInfo = classifyState(eth, btc);
+  const { advice, positionSize, biasDirection } = buildAdvice(eth, btc, stateInfo);
+  const { stop, targets, dirLabel } = buildStopAndTargets(eth, biasDirection);
+  const rr = calcRR(eth, biasDirection, stop, targets);
+
+  // 状态面板
+  const stateEl = $('stateValue');
+  stateEl.textContent = stateInfo.label;
+  stateEl.className = 'state-value state-' + stateInfo.state;
+  $('stateSub').textContent = stateInfo.sub;
+
+  $('adviceValue').textContent = advice;
+  $('positionSize').textContent = '建议仓位：' + positionSize;
+
+  const riskEl = $('riskValue');
+  riskEl.textContent = rr !== null ? rr.toFixed(2) : '--';
+  riskEl.className = 'risk-value ' + rrClass(rr);
+  $('riskMsg').textContent = rrMessage(rr);
+
+  // 解释文本
+  let explain;
+  if(eth.isManual){
+    explain = `手动模式：ETH当前价 ${fmt(eth.price)}，基于你输入的最近高点/低点/20根高低点估算动态支撑压力。缺少K线序列，无法判断EMA排列、摆动结构与成交量，判断准确度低于实时K线模式，请谨慎参考。`;
+  } else {
+    const volTxt = eth.volumeRatio !== null ? `最新一根K线成交量约为20均量的 ${eth.volumeRatio.toFixed(2)} 倍` : '成交量数据不足';
+    const btcTxt = btc ? `BTC当前趋势判断为：${btc.trend === 'up' ? '走强' : btc.trend === 'down' ? '走弱' : '横盘/不明显'}` : 'BTC数据缺失';
+    explain = `ETH当前价 ${fmt(eth.price)}，动态第一压力 ${fmt(eth.firstResistance)}，动态第一支撑 ${fmt(eth.firstSupport)}，ATR(14)=${fmt(eth.atr14)}。${volTxt}。${btcTxt}（BTC=方向盘，ETH=放大器，两者不同步时信号打折扣）。`;
+  }
+  $('explainText').textContent = explain;
+
+  $('dragonflyDynamicText').textContent = dragonflyText(stateInfo, biasDirection, eth);
+
+  renderDynGrid(eth, btc, stop, targets, dirLabel, rr);
+  renderLevelsTable(eth, stop, targets, dirLabel);
+  renderPlan(eth, biasDirection, positionSize, stop, targets, dirLabel);
+}
+
+function renderNoData(){
+  $('stateValue').textContent = '等待数据';
+  $('stateValue').className = 'state-value state-no_data';
+  $('stateSub').textContent = '--';
+  $('adviceValue').textContent = '暂无有效价格数据，请等待实时K线恢复，或在上方填写手动输入数据。';
+  $('positionSize').textContent = '';
+  $('riskValue').textContent = '--';
+  $('riskValue').className = 'risk-value risk-unknown';
+  $('riskMsg').textContent = '--';
+  $('explainText').textContent = '当前没有可用的 ETH/BTC 数据，无法给出动态判断。';
+  $('dragonflyDynamicText').textContent = '数据缺失，暂无法判断最佳拦截区。';
+  $('dynGrid').innerHTML = '';
+  $('levelsTableBody').innerHTML = '';
+  $('planContent').textContent = '--';
+}
+
+function dynItem(cls, label, value){
+  return `<div class="dyn-item ${cls || ''}"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+}
+
+function renderDynGrid(eth, btc, stop, targets, dirLabel, rr){
+  const items = [];
+  items.push(dynItem('', 'ETH当前价格', fmt(eth.price)));
+  items.push(dynItem('', 'ATR(14)', eth.atr14 !== null ? fmt(eth.atr14) + (eth.isManual ? '（近似）' : '') : '--'));
+  items.push(dynItem('', '最近20根最高点', fmt(eth.high20)));
+  items.push(dynItem('', '最近20根最低点', fmt(eth.low20)));
+  items.push(dynItem('', '最近50根最高点', fmt(eth.high50) + (eth.isManual ? '（用最近高点近似）' : '')));
+  items.push(dynItem('', '最近50根最低点', fmt(eth.low50) + (eth.isManual ? '（用最近低点近似）' : '')));
+  items.push(dynItem('res', '最近局部高点(swing high)', eth.recentSwingHigh ? `${fmt(eth.recentSwingHigh.price)} @ ${formatTime(eth.recentSwingHigh.time)}` : '--（手动模式无法识别）'));
+  items.push(dynItem('sup', '最近局部低点(swing low)', eth.recentSwingLow ? `${fmt(eth.recentSwingLow.price)} @ ${formatTime(eth.recentSwingLow.time)}` : '--（手动模式无法识别）'));
+  items.push(dynItem('res', '动态第一压力', fmt(eth.firstResistance)));
+  items.push(dynItem('res', '动态第二压力', fmt(eth.secondResistance)));
+  items.push(dynItem('sup', '动态第一支撑', fmt(eth.firstSupport)));
+  items.push(dynItem('sup', '动态第二支撑', fmt(eth.secondSupport)));
+  items.push(dynItem('accent', `动态止损位（${dirLabel || '--'}）`, stop !== null ? fmt(stop) : '--'));
+  items.push(dynItem('accent', `动态目标位（${dirLabel || '--'}，ATR×0.5/1/1.5）`,
+    (targets[0] !== null) ? `${fmt(targets[0])} / ${fmt(targets[1])} / ${fmt(targets[2])}` : '--'));
+  items.push(dynItem('rr', '当前盈亏比', rr !== null ? rr.toFixed(2) : '--'));
+  items.push(dynItem('', '成交量 / 20均量比', eth.volumeRatio !== null ? eth.volumeRatio.toFixed(2) + ' 倍' : '--（手动模式无数据）'));
+  $('dynGrid').innerHTML = items.join('');
+}
+
+function renderLevelsTable(eth, stop, targets, dirLabel){
+  const rows = [
+    ['动态第一支撑', fmt(eth.firstSupport), '价格下方最近的 swing low（或最近20根低点）'],
+    ['动态第二支撑', fmt(eth.secondSupport), '价格下方第二个 swing low（或最近50根低点）'],
+    ['动态第一压力', fmt(eth.firstResistance), '价格上方最近的 swing high（或最近20根高点）'],
+    ['动态第二压力', fmt(eth.secondResistance), '价格上方第二个 swing high（或最近50根高点）'],
+    [`动态止损位（${dirLabel || '--'}）`, stop !== null ? fmt(stop) : '--', '支撑/压力 ± ATR×0.3'],
+    [`动态目标位1（${dirLabel || '--'}）`, targets[0] !== null ? fmt(targets[0]) : '--', '突破/跌破位 ± ATR×0.5'],
+    [`动态目标位2（${dirLabel || '--'}）`, targets[1] !== null ? fmt(targets[1]) : '--', '突破/跌破位 ± ATR×1'],
+    [`动态目标位3（${dirLabel || '--'}）`, targets[2] !== null ? fmt(targets[2]) : '--', '突破/跌破位 ± ATR×1.5'],
+    ['人工参考位1', fmt(refLevels.ref1), '用户手动输入，不参与动态计算'],
+    ['人工参考位2', fmt(refLevels.ref2), '用户手动输入，不参与动态计算'],
+    ['人工参考位3', fmt(refLevels.ref3), '用户手动输入，不参与动态计算']
+  ];
+  if(refLevels.ref4 !== null && isFinite(refLevels.ref4)){
+    rows.push(['人工参考位4', fmt(refLevels.ref4), '用户手动输入，不参与动态计算']);
+  }
+  const tbody = $('levelsTableBody');
+  tbody.innerHTML = '';
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    r.forEach(v => { const td = document.createElement('td'); td.textContent = v; tr.appendChild(td); });
+    tbody.appendChild(tr);
+  });
+}
+
+function renderPlan(eth, biasDirection, positionSize, stop, targets, dirLabel){
+  const el = $('planContent');
+  el.innerHTML = '';
+  const addRow = (key, value) => {
+    const row = document.createElement('div');
+    row.className = 'plan-row';
+    const k = document.createElement('span');
+    k.className = 'plan-key';
+    k.textContent = key + '：';
+    row.appendChild(k);
+    row.appendChild(document.createTextNode(value || '--'));
+    el.appendChild(row);
+  };
+
+  addRow('方向参考', dirLabel || '中性 / 观望');
+  addRow('建议仓位', positionSize);
+  if(biasDirection === 'long' || biasDirection === 'long-caution'){
+    addRow('试仓区', `回踩动态第一支撑 ${fmt(eth.firstSupport)} 附近，或有效突破动态第一压力 ${fmt(eth.firstResistance)} 后回踩不破`);
+    addRow('止损条件', `跌破动态止损位 ${fmt(stop)}`);
+    addRow('止盈目标', `${fmt(targets[0])} / ${fmt(targets[1])} / ${fmt(targets[2])}`);
+  } else if(biasDirection === 'short'){
+    addRow('试仓区', `反弹至动态第一压力 ${fmt(eth.firstResistance)} 附近承压处`);
+    addRow('止损条件', `突破动态止损位 ${fmt(stop)}`);
+    addRow('止盈目标', `${fmt(targets[0])} / ${fmt(targets[1])} / ${fmt(targets[2])}`);
+  } else {
+    addRow('等待条件', `价格到达动态支撑 ${fmt(eth.firstSupport)} 或动态压力 ${fmt(eth.firstResistance)}，且方向信号（EMA/成交量/BTC）趋于一致`);
+  }
+}
+
+/* ---------- 交互 ---------- */
+
+function readManualInputs(){
+  const e = parseFloat($('m_ethPrice').value);
+  const b = parseFloat($('m_btcPrice').value);
+  const rh = parseFloat($('m_recentHigh').value);
+  const rl = parseFloat($('m_recentLow').value);
+  const h20 = parseFloat($('m_high20').value);
+  const l20 = parseFloat($('m_low20').value);
+  if(![e, b, rh, rl, h20, l20].every(v => isFinite(v) && v > 0)){
+    return null;
+  }
+  return { ethPrice: e, btcPrice: b, recentHigh: rh, recentLow: rl, high20: h20, low20: l20 };
+}
+
+function applyManual(){
+  const data = readManualInputs();
+  if(!data){
+    alert('请完整填写全部6个手动输入项（均为正数）后再应用。');
+    return;
+  }
+  manualData = data;
+  mode = 'manual';
+  $('dataSource').textContent = '数据来源：手动输入（近似计算）';
+  $('dataSource').classList.remove('data-source-error');
+  $('manualPanel').classList.remove('show-warning');
+  $('dynModeBadge').textContent = '手动模式（近似值）';
+  $('dynModeBadge').className = 'badge manual';
+  render();
+}
+
+function applyLevels(){
+  const r1 = parseFloat($('lv_ref1').value);
+  const r2 = parseFloat($('lv_ref2').value);
+  const r3 = parseFloat($('lv_ref3').value);
+  const r4 = parseFloat($('lv_ref4').value);
+  refLevels.ref1 = isFinite(r1) ? r1 : null;
+  refLevels.ref2 = isFinite(r2) ? r2 : null;
+  refLevels.ref3 = isFinite(r3) ? r3 : null;
+  refLevels.ref4 = isFinite(r4) ? r4 : null;
+  render();
+}
+
+async function tick(){
+  if(!manualMode){
+    const ok = await fetchAll();
+    if(!ok && !manualData){
+      renderNoData();
+      $('updateTime').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      return;
+    }
+  }
+  render();
+}
+
+function init(){
+  $('manualModeToggle').addEventListener('change', (e) => {
+    manualMode = e.target.checked;
+    $('manualPanel').classList.toggle('manual-active', manualMode);
+    if(manualMode){
+      $('dataSource').textContent = '数据来源：手动输入（用户强制开启）';
+      $('dataSource').classList.remove('data-source-error');
+    }
+    render();
+  });
+
+  $('applyManualBtn').addEventListener('click', applyManual);
+  $('applyLevelsBtn').addEventListener('click', applyLevels);
+
+  $('retryBtn').addEventListener('click', async () => {
+    const ok = await fetchAll();
+    if(ok) render();
+  });
+
+  tick();
+  setInterval(tick, REFRESH_INTERVAL_MS);
+}
+
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

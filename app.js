@@ -1,0 +1,391 @@
+/* ETH/BTC 短线交易决策系统 - 决策逻辑
+   核心思想：BTC = 方向盘，ETH = 放大器。不能只看ETH单独走势。
+   蜻蜓捕猎模型：不追猎物当前的位置，而是判断下一个高概率拦截区。
+*/
+
+// ==== 数据源配置 ====
+const BINANCE_ETH_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT';
+const BINANCE_BTC_URL = 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT';
+const REFRESH_INTERVAL_MS = 5000;
+const HISTORY_WINDOW_MS = 15 * 60 * 1000; // 15分钟滚动窗口，用于判断BTC趋势 / ETH是否从低位快速反弹
+
+// ==== 关键位（可在页面手动修改） ====
+let keyLevels = {
+  qianDi: 1747,    // 前低支撑
+  ruoShi: 1750,    // 弱势支撑
+  jieGou: 1766,    // 结构转换位
+  fenJie: 1770,    // 多空分界
+  yaLiLow: 1780,   // 前期压力/换手区下沿
+  yaLiHigh: 1786,  // 前期压力/换手区上沿
+  xinLi: 1800,     // 心理位/关键支撑
+  yaLiShang: 1834, // 当前上方压力
+  target1: 1850,   // 突破后第一目标
+  target2: 1870    // 突破后第二目标
+};
+
+const LEVEL_IDS = ['qianDi','ruoShi','jieGou','fenJie','yaLiLow','yaLiHigh','xinLi','yaLiShang','target1','target2'];
+
+// ==== 运行时状态 ====
+let ethPrice = null;
+let btcPrice = null;
+let ethHistory = []; // [{t, price}]
+let btcHistory = [];
+let belowXinLiSince = null; // ETH持续跌破心理位的起始时间
+let manualMode = false;
+
+function $(id){ return document.getElementById(id); }
+
+// ==== 数据获取 ====
+async function fetchPrice(url){
+  const resp = await fetch(url, { cache: 'no-store' });
+  if(!resp.ok) throw new Error('HTTP ' + resp.status);
+  const data = await resp.json();
+  const p = parseFloat(data.price);
+  if(!isFinite(p)) throw new Error('价格解析失败');
+  return p;
+}
+
+async function fetchAll(){
+  try{
+    const [eth, btc] = await Promise.all([fetchPrice(BINANCE_ETH_URL), fetchPrice(BINANCE_BTC_URL)]);
+    ethPrice = eth;
+    btcPrice = btc;
+    $('manualPanel').classList.remove('show-warning');
+    $('dataSource').textContent = '数据来源：Binance 实时行情';
+    $('dataSource').classList.remove('data-source-error');
+  } catch(err){
+    $('manualPanel').classList.add('show-warning');
+    $('dataSource').textContent = '⚠ 实时数据获取失败，请使用手动输入价格';
+    $('dataSource').classList.add('data-source-error');
+    // 自动打开手动输入区域方便用户输入，但不清空已有价格，也不强制切换到手动模式
+    $('manualPanel').classList.add('manual-active');
+  }
+}
+
+// ==== 历史滚动窗口 ====
+function pushHistory(){
+  const now = Date.now();
+  if(ethPrice != null) ethHistory.push({ t: now, price: ethPrice });
+  if(btcPrice != null) btcHistory.push({ t: now, price: btcPrice });
+  const cutoff = now - HISTORY_WINDOW_MS;
+  ethHistory = ethHistory.filter(h => h.t >= cutoff);
+  btcHistory = btcHistory.filter(h => h.t >= cutoff);
+}
+
+function getBtcTrend(){
+  if(btcHistory.length < 2) return 'unknown';
+  const oldest = btcHistory[0].price;
+  const newest = btcHistory[btcHistory.length - 1].price;
+  const pct = (newest - oldest) / oldest * 100;
+  if(pct <= -0.15) return 'down';
+  if(pct >= 0.15) return 'up';
+  return 'flat';
+}
+
+function getEthRecentMin(){
+  if(ethHistory.length === 0) return null;
+  return Math.min(...ethHistory.map(h => h.price));
+}
+
+function updateBelowXinLiTimer(){
+  if(ethPrice == null) return;
+  if(ethPrice < keyLevels.xinLi){
+    if(belowXinLiSince === null) belowXinLiSince = Date.now();
+  } else {
+    belowXinLiSince = null;
+  }
+}
+
+function translateTrend(t){
+  switch(t){
+    case 'up': return '走强';
+    case 'down': return '走弱';
+    case 'flat': return '横盘/持平';
+    default: return '数据不足';
+  }
+}
+
+// ==== 核心决策引擎 ====
+function evaluateDecision(){
+  if(ethPrice == null || btcPrice == null){
+    return {
+      state: 'NO_DATA', stateLabel: '等待数据',
+      advice: '暂无有效价格，请等待实时数据恢复，或使用下方手动输入价格。',
+      positionSize: '不出手',
+      risk: '未知', riskClass: 'risk-unknown',
+      explain: '当前没有可用的 ETH 或 BTC 价格数据，无法给出判断。',
+      planType: 'wait',
+      waitReason: '价格数据缺失',
+      waitCondition: '恢复实时数据获取，或手动输入 ETH 与 BTC 价格'
+    };
+  }
+
+  updateBelowXinLiTimer();
+  const btcTrend = getBtcTrend();
+  const ethMin = getEthRecentMin();
+  const recoveryPct = (ethMin && ethMin > 0) ? (ethPrice - ethMin) / ethMin * 100 : 0;
+  const minutesBelowXinLi = belowXinLiSince ? (Date.now() - belowXinLiSince) / 60000 : 0;
+
+  const L = keyLevels;
+  let result;
+
+  // 一、多头确认：ETH突破上方压力，且BTC没有明显走弱
+  if(ethPrice > L.yaLiShang && btcTrend !== 'down'){
+    result = {
+      state: 'BULL_CONFIRMATION', stateLabel: '多头确认',
+      advice: `已突破 ${L.yaLiShang}，多头确认。不要立刻重仓追高，等待回踩 ${L.yaLiShang} 不破再跟随，或维持小仓。`,
+      positionSize: '小仓跟随（等回踩确认，不重仓追高）',
+      risk: '中', riskClass: 'risk-mid',
+      entryZone: `回踩 ${L.yaLiShang} 附近且不有效跌破`,
+      addCondition: `价格回踩 ${L.yaLiShang} 不破，且 BTC 同步走强`,
+      stopLoss: `有效跌破 ${L.xinLi}`,
+      target: `${L.target1} / ${L.target2}`,
+      explain: `ETH（放大器）已突破上方压力 ${L.yaLiShang}，BTC（方向盘）没有走弱，方向确认为多头。但价格已在高位，蜻蜓模型提醒：直接追价性价比变差，更好的赔率在回踩确认之后，而不是现在。`,
+      planType: 'long'
+    };
+  }
+  // 三、空头延续：ETH跌破多空分界，且BTC同步走弱
+  else if(ethPrice < L.fenJie && btcTrend === 'down'){
+    result = {
+      state: 'BEAR_CONTINUATION', stateLabel: '空头延续',
+      advice: `已跌破多空分界 ${L.fenJie}，且 BTC 同步走弱，空头延续。不做多，可等待反弹至压力区做空。`,
+      positionSize: '等待反弹，小仓试空',
+      risk: '中高', riskClass: 'risk-high',
+      entryZone: `反弹至 ${L.yaLiLow} - ${L.yaLiHigh} 附近承压处`,
+      addCondition: `反弹力度衰竭、BTC继续走弱时可小幅加仓`,
+      stopLoss: `重新站回 ${L.yaLiLow} 之上`,
+      target: `${L.ruoShi} / ${L.qianDi} / 更低`,
+      explain: `ETH跌破多空分界位 ${L.fenJie}，BTC同步走弱，方向确认向下。蜻蜓模型提醒：不要在价格已经下跌完的地方追空，等反弹到压力区再判断是否是好的拦截点。`,
+      planType: 'short'
+    };
+  }
+  // 二、多头回踩：ETH在心理位附近，未持续跌破太久，BTC未走弱
+  else if(ethPrice >= (L.xinLi - 5) && ethPrice <= (L.xinLi + 5) && minutesBelowXinLi < 3 && btcTrend !== 'down'){
+    result = {
+      state: 'BULL_PULLBACK', stateLabel: '多头回踩',
+      advice: `价格回踩心理位 ${L.xinLi} 附近，尚未持续跌破，BTC未走弱，可以小仓试多。`,
+      positionSize: '小仓试多',
+      risk: '中', riskClass: 'risk-mid',
+      entryZone: `${L.xinLi - 5} - ${L.xinLi + 5} 区间`,
+      addCondition: `重新站上 ${L.yaLiShang}`,
+      stopLoss: `${L.xinLi - 10} 或有效跌破 ${L.xinLi - 5}`,
+      target: `${L.yaLiShang} / ${L.target1}`,
+      explain: `价格回踩到关键心理位/支撑位 ${L.xinLi} 附近，属于低吸区域而非追涨区域，符合蜻蜓模型"在猎物下一步落点提前等待"的思路。`,
+      planType: 'long'
+    };
+  }
+  // 五、转换观察：ETH从低位快速反弹，还未突破上方压力
+  else if(ethPrice < L.yaLiShang && ethPrice > L.fenJie && ethMin != null && recoveryPct > 0.8){
+    result = {
+      state: 'TRANSITION_WATCH', stateLabel: '转换观察',
+      advice: `价格从低位快速反弹，但还未突破 ${L.yaLiShang}，方向尚未确认，不追高。`,
+      positionSize: '暂不进场',
+      risk: '中', riskClass: 'risk-mid',
+      explain: `ETH从近15分钟低点约 ${ethMin.toFixed(2)} 快速反弹了约 ${recoveryPct.toFixed(2)}%，但尚未突破 ${L.yaLiShang}，方向未定。此时追高相当于"追猎物当前的位置"，不是好的拦截点。`,
+      planType: 'wait',
+      waitReason: '价格快速反弹但方向未确认，追高性价比差',
+      waitCondition: `突破 ${L.yaLiShang} 并站稳，或回踩 ${L.xinLi} 获得支撑确认`
+    };
+  }
+  // 四、震荡洗盘：ETH在区间内反复，BTC横盘
+  else if(ethPrice >= L.fenJie && ethPrice <= L.yaLiShang && btcTrend === 'flat'){
+    result = {
+      state: 'RANGE_CHOP', stateLabel: '震荡洗盘',
+      advice: `ETH在 ${L.fenJie} - ${L.yaLiShang} 区间反复震荡，BTC横盘，这个区间容易假突破和假跌破。`,
+      positionSize: '观望或极轻仓试错',
+      risk: '高（假信号多）', riskClass: 'risk-high',
+      explain: `价格在关键区间内反复拉锯，BTC也缺乏方向，属于洗盘阶段，追涨杀跌很容易被打止损。`,
+      planType: 'wait',
+      waitReason: '区间震荡，方向不明，容易出现假信号',
+      waitCondition: `有效突破 ${L.yaLiShang}，或有效跌破 ${L.fenJie}`
+    };
+  }
+  // 六、观望：信号冲突，或价格位置没有赔率优势
+  else {
+    result = {
+      state: 'STAND_ASIDE', stateLabel: '观望',
+      advice: `ETH 与 BTC 信号不一致，或当前价格没有明显赔率优势，建议不出手。`,
+      positionSize: '不出手',
+      risk: '高（信号冲突）', riskClass: 'risk-high',
+      explain: `ETH与BTC方向不一致（例如ETH强但BTC弱），或价格处于区间中段没有清晰的支撑压力参照，此时出手的赔率不划算，耐心等待更好的位置。`,
+      planType: 'wait',
+      waitReason: 'ETH与BTC方向不一致，或当前价格没有清晰赔率',
+      waitCondition: `等待价格到达关键支撑/压力位，且 BTC 与 ETH 方向趋于一致`
+    };
+  }
+
+  result.btcTrend = btcTrend;
+  result.ethMin = ethMin;
+  result.recoveryPct = recoveryPct;
+  return result;
+}
+
+// ==== 渲染 ====
+function formatMoney(v){
+  if(v == null) return '--';
+  return v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function computeChangeStr(history, current){
+  if(!current || history.length < 2) return '15分钟涨跌：数据积累中';
+  const first = history[0].price;
+  const pct = (current - first) / first * 100;
+  const sign = pct >= 0 ? '+' : '';
+  return `15分钟涨跌：${sign}${pct.toFixed(2)}%`;
+}
+
+function setChangeEl(el, history, current){
+  el.textContent = computeChangeStr(history, current);
+  el.classList.remove('pos', 'neg');
+  if(history.length >= 2 && current){
+    const pct = (current - history[0].price) / history[0].price * 100;
+    if(pct > 0) el.classList.add('pos');
+    if(pct < 0) el.classList.add('neg');
+  }
+}
+
+function render(){
+  $('ethPrice').textContent = formatMoney(ethPrice);
+  $('btcPrice').textContent = formatMoney(btcPrice);
+  setChangeEl($('ethChange'), ethHistory, ethPrice);
+  setChangeEl($('btcChange'), btcHistory, btcPrice);
+  $('updateTime').textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+
+  const d = evaluateDecision();
+
+  const stateEl = $('stateValue');
+  stateEl.textContent = d.stateLabel;
+  stateEl.className = 'state-value state-' + d.state.toLowerCase();
+
+  $('adviceValue').textContent = d.advice;
+  $('positionSize').textContent = '仓位建议：' + d.positionSize;
+
+  const riskEl = $('riskValue');
+  riskEl.textContent = d.risk;
+  riskEl.className = 'risk-value ' + (d.riskClass || '');
+
+  $('explainText').textContent = d.explain;
+
+  let dragonflyDynamic;
+  if(d.ethMin != null){
+    dragonflyDynamic = `参考数据：近15分钟 ETH 最低点约 ${d.ethMin.toFixed(2)}，当前价格较该低点变化 ${d.recoveryPct.toFixed(2)}%。BTC 近15分钟趋势判断为：${translateTrend(d.btcTrend)}。`;
+  } else {
+    dragonflyDynamic = '数据积累中，暂不足以判断近15分钟的低点与BTC趋势，随着时间推移判断会自动变得更准确。';
+  }
+  $('dragonflyDynamicText').textContent = dragonflyDynamic;
+
+  renderLevelsTable();
+  renderPlan(d);
+}
+
+function renderLevelsTable(){
+  const L = keyLevels;
+  const rows = [
+    ['前低支撑', L.qianDi, '下方重要支撑，跌破后看更低目标'],
+    ['弱势支撑', L.ruoShi, '空头延续目标位之一'],
+    ['结构转换位', L.jieGou, '结构强弱转换参考位'],
+    ['多空分界', L.fenJie, '有效跌破且BTC走弱 = 空头延续'],
+    ['前期压力/换手区', `${L.yaLiLow} - ${L.yaLiHigh}`, '反弹做空的参考承压区'],
+    ['心理位/关键支撑', L.xinLi, '多头回踩试多的参考位'],
+    ['当前上方压力', L.yaLiShang, '有效突破 = 多头确认'],
+    ['突破后第一目标', L.target1, '多头确认后的第一目标'],
+    ['突破后第二目标', L.target2, '多头确认后的第二目标']
+  ];
+  const tbody = $('levelsTableBody');
+  tbody.innerHTML = '';
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    const c0 = document.createElement('td'); c0.textContent = r[0];
+    const c1 = document.createElement('td'); c1.textContent = r[1];
+    const c2 = document.createElement('td'); c2.textContent = r[2];
+    tr.appendChild(c0); tr.appendChild(c1); tr.appendChild(c2);
+    tbody.appendChild(tr);
+  });
+}
+
+function renderPlan(d){
+  const el = $('planContent');
+  el.innerHTML = '';
+  const addRow = (key, value) => {
+    const row = document.createElement('div');
+    row.className = 'plan-row';
+    const k = document.createElement('span');
+    k.className = 'plan-key';
+    k.textContent = key + '：';
+    row.appendChild(k);
+    row.appendChild(document.createTextNode(value || '--'));
+    el.appendChild(row);
+  };
+
+  if(d.planType === 'wait'){
+    addRow('观望原因', d.waitReason || d.explain);
+    addRow('等待什么条件', d.waitCondition || '等待关键位确认');
+  } else if(d.planType === 'long' || d.planType === 'short'){
+    addRow('试仓区', d.entryZone);
+    addRow('加仓条件', d.addCondition);
+    addRow('止损条件', d.stopLoss);
+    addRow('止盈目标', d.target);
+  } else {
+    addRow('提示', '暂无有效计划，等待数据');
+  }
+}
+
+// ==== 手动输入 / 关键位交互 ====
+function applyManualPrices(){
+  const e = parseFloat($('manualEth').value);
+  const b = parseFloat($('manualBtc').value);
+  if(isFinite(e) && e > 0) ethPrice = e;
+  if(isFinite(b) && b > 0) btcPrice = b;
+  $('dataSource').textContent = '数据来源：手动输入';
+  $('dataSource').classList.remove('data-source-error');
+  $('manualPanel').classList.remove('show-warning');
+  pushHistory();
+  render();
+}
+
+function applyLevels(){
+  LEVEL_IDS.forEach(id => {
+    const v = parseFloat($('lv_' + id).value);
+    if(isFinite(v)) keyLevels[id] = v;
+  });
+  render();
+}
+
+function initLevelInputs(){
+  LEVEL_IDS.forEach(id => {
+    const input = $('lv_' + id);
+    if(input) input.value = keyLevels[id];
+  });
+}
+
+// ==== 主循环 ====
+async function tick(){
+  if(!manualMode){
+    await fetchAll();
+  }
+  pushHistory();
+  render();
+}
+
+function init(){
+  initLevelInputs();
+
+  $('manualModeToggle').addEventListener('change', (e) => {
+    manualMode = e.target.checked;
+    $('manualPanel').classList.toggle('manual-active', manualMode);
+  });
+
+  $('applyManualBtn').addEventListener('click', applyManualPrices);
+  $('applyLevelsBtn').addEventListener('click', applyLevels);
+
+  $('retryBtn').addEventListener('click', async () => {
+    await fetchAll();
+    pushHistory();
+    render();
+  });
+
+  tick();
+  setInterval(tick, REFRESH_INTERVAL_MS);
+}
+
+document.addEventListener('DOMContentLoaded', init);
