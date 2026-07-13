@@ -151,6 +151,20 @@
 </details>
 </article>
 </section>
+<section class="grid" id="forecastSection">
+<article class="card span12">
+<h2>走势预测与情景推演</h2>
+<div class="pill warn" id="forecastDisclaimer">规则型权重，尚未经过历史胜率校准</div>
+<div id="forecastBlocked" class="warn" hidden></div>
+<div id="forecastBetting" class="warn">等待V1.1决策数据</div>
+<div id="forecastLogWarning" class="warn" hidden></div>
+<div class="grid">
+<article class="card span4"><h2>未来15分钟</h2><div id="forecast15m">等待已收盘行情</div></article>
+<article class="card span4"><h2>未来1小时</h2><div id="forecast1h">等待已收盘行情</div></article>
+<article class="card span4"><h2>未来4小时</h2><div id="forecast4h">等待已收盘行情</div></article>
+</div>
+</article>
+</section>
 <div class="foot">风险声明：本工具只提供基于公开行情和显式规则的决策辅助，不承诺盈利，不连接账户，不自动下单，不提供杠杆或亏损摊平建议。</div>
 </main>
 <script>/*__CORE__*/</script>
@@ -182,6 +196,18 @@ function fillSettings(){const s=C.loadRiskSettings(localStorage);$('setFee').val
 function renderRisk(){if(!last)return;if(last.isManual){$('riskBudget').textContent='建议试仓金额：手动模式不计算；仓位：手动模式不计算';return}const p=last.worthBetting?{entry:last.confirmedPrice,stop:last.stopLoss}:{entry:last.triggerPlans.long.estimatedEntry,stop:last.triggerPlans.long.invalidation},r=C.calcRiskBudget(p.entry,p.stop,currentSettings(),C.COST_DEFAULT);$('riskBudget').innerHTML=r.status==='ok'?`最大允许亏损金额：$${fmt(r.maxLossAmount)} · 建议试仓名义金额：$${fmt(r.suggestedNotional)} · 所需资金：$${fmt(r.suggestedMargin)} · 加仓后总风险是否超过原始预算：${r.addOnWithinBudget?'否':'是（默认禁止，需先降低原仓风险）'}`:r.message}
 function tick(){const c=C.getCountdown15m();$('countdown').textContent=c.text;$('nextRefresh').textContent='下一次预计刷新：'+(nextAt?new Date(nextAt).toLocaleTimeString():'—');if(last?.isManual){$('closeStatus').textContent=`手动输入 ETH：${fmt(last.price)} · BTC：${fmt(last.btcPrice)}`;$('closeWarning').textContent='手动观察模式不是实时行情，不生成交易建议'}else if(last){$('closeStatus').textContent=`当前实时价格：${fmt(last.price)} · 最近收盘确认价：${fmt(last.confirmedPrice)} · 正式状态：${stateZh[last.state]||last.state}`;$('closeWarning').textContent=last.ltf15m.intrabarWarning||'盘中价格未改变正式收盘状态'}else{$('closeStatus').textContent='行情数据已失效';$('closeWarning').textContent='最后已知信息不可用于决策'}}
 window.invalidateDashboard=(reason,known)=>{const k=known||last,CV=$('structureChart'),ctx=CV&&CV.getContext('2d');C.invalidateDashboard(id=>$(id),k,reason);if(ctx){ctx.clearRect(0,0,CV.width,CV.height);ctx.fillStyle='#fb7185';ctx.fillText('数据失效，图表交易标记已清空',20,30)}last=null};document.addEventListener('v11decision',e=>renderV11(e.detail));$('saveSettings').onclick=()=>{const r=C.saveRiskSettings(localStorage,currentSettings());if(!r.ok)return alert(r.message);Object.assign(C.COST_DEFAULT,{takerFeeRate:r.value.takerFeeRate,slippageRate:r.value.slippageRate,spreadRate:r.value.spreadRate});renderRisk();$('refresh').click()};$('exportJson').onclick=()=>download('ETH-Alpha-决策日志.json',C.exportLogsJSON(loadLogs()),'application/json');$('exportCsv').onclick=()=>download('ETH-Alpha-决策日志.csv',C.exportLogsCSV(loadLogs()),'text/csv;charset=utf-8');$('clearLogs').onclick=()=>{if(C.clearDecisionLogs(localStorage,window.confirm)){logsHtml()}};fillSettings();logsHtml();tick();setInterval(tick,1000)})();
+</script>
+<script data-v12="forecast-layer">/*__FORECAST__*/
+;(()=>{const F=window.ETHAlphaForecast,byId=id=>document.getElementById(id),fmt=n=>Number.isFinite(Number(n))?Number(n).toLocaleString('zh-CN',{maximumFractionDigits:2}):'—';
+const horizonIds={m15:'forecast15m',h1:'forecast1h',h4:'forecast4h'};
+function zoneText(z){return z?`${fmt(z[0])} – ${fmt(z[1])}`:'不可用'}
+function horizonHtml(h,now){if(!h)return'<div class="warn">手动观察模式不生成走势预测、权重、区间、目标或日志</div>';if(now>h.validUntil)return'<div class="warn forecast-expired">预测已过期，等待刷新</div>';if(h.directionLabel==='数据不足')return`<div class="warn">数据不足：${h.suppressedReason}</div><div class="muted">数据截至：${h.dataAsOf?new Date(h.dataAsOf).toLocaleString():'不可用'}</div>`;const w=h.weights,r=h.priceRange,t=h.scenarioTargets,path=h.mostLikelyPath;return `<div class="big">${h.directionLabel}</div><div class="row"><span>偏多权重</span><b>${w.bullish}%</b></div><div class="row"><span>偏空权重</span><b>${w.bearish}%</b></div><div class="row"><span>震荡权重</span><b>${w.ranging}%</b></div><div class="row"><span>置信度（数据完整度评分，非胜率）</span><b>${h.confidence.score} · ${h.confidence.label}</b></div><div class="muted">${h.confidence.explanation}</div><div class="zone"><b>规则型预计波动区间：${fmt(r.lower)} – ${fmt(r.upper)}</b><div class="muted">${r.basis.join('；')}</div></div><div class="row"><span>偏多情景目标区</span><b>${zoneText(t.bullishZone)}</b></div><div class="row"><span>偏空情景目标区</span><b>${zoneText(t.bearishZone)}</b></div><div class="row"><span>震荡情景区间</span><b>${zoneText(t.rangingZone)}</b></div><div class="warn">${t.disclaimer}</div><div class="zone"><b>最可能路径</b><div>${path?path.text:'当前无清晰路径'}</div></div><div><b>预测失效条件（仅以已收盘K线确认）</b><ul>${h.invalidation.map(x=>`<li>${x.text}</li>`).join('')}</ul></div><div><b>支持证据</b><ul>${h.supportingEvidence.map(x=>`<li>${x}</li>`).join('')||'<li>无清晰支持证据</li>'}</ul></div><div><b>反对证据</b><ul>${h.opposingEvidence.map(x=>`<li>${x}</li>`).join('')||'<li>无清晰反对证据</li>'}</ul></div><div class="muted">数据截至：${new Date(h.dataAsOf).toLocaleString()} · 有效期至：${new Date(h.validUntil).toLocaleString()}</div><div class="pill warn">${h.disclaimer}</div>`}
+function renderForecast(f,now=Date.now()){const blocked=byId('forecastBlocked'),betting=byId('forecastBetting');if(!f){clearForecast('预测对象不可用');return}blocked.hidden=!f.blockedByV11;blocked.textContent=f.blockedByV11?'当前不满足V1.1交易许可，预测仅供参考，不构成入场理由':'';betting.hidden=false;betting.textContent=f.executability.note;for(const [k,id] of Object.entries(horizonIds))byId(id).innerHTML=horizonHtml(f[k],now);}
+function clearForecast(reason){window.__prevForecast=null;for(const id of Object.values(horizonIds)){const n=byId(id);n.textContent='预测已失效，等待下次成功刷新';n.className='invalidated'}const b=byId('forecastBlocked');b.style.display='block';b.textContent=`预测已失效：${reason||'数据异常'}`;byId('forecastBetting').textContent='不值得下注：预测数据不可用'}
+function writeForecastLogs(f,now){if(f.isManual)return;const warning=byId('forecastLogWarning');warning.hidden=true;for(const [key,horizon] of [['m15','15m'],['h1','1h'],['h4','4h']]){const h=f[key];if(!h||h.directionLabel==='数据不足'||now>h.validUntil)continue;try{const entry=F.buildForecastLogEntry(f,h,horizon),result=F.saveForecastLog(entry,localStorage);if(!result.ok){warning.hidden=false;warning.textContent=result.reason||'预测日志写入失败（不影响页面预测）'}}catch(e){warning.hidden=false;warning.textContent='预测日志写入失败（不影响页面预测）'}}}
+document.addEventListener('v11decision',e=>{const d=e.detail;try{const f=F.buildForecast(window.__lastMarketData,d,window.__prevForecast,Date.now());window.__prevForecast=f;renderForecast(f);if(!d.isManual&&d.dataHealth==='normal')writeForecastLogs(f,Date.now())}catch(err){clearForecast(err.message)}});
+const previousInvalidateDashboard=window.invalidateDashboard;window.invalidateDashboard=function(reason,known){if(typeof previousInvalidateDashboard==='function')previousInvalidateDashboard(reason,known);clearForecast(reason)};
+window.renderForecast=renderForecast;window.clearForecast=clearForecast;window.writeForecastLogs=writeForecastLogs;setInterval(()=>{if(window.__prevForecast)renderForecast(window.__prevForecast,Date.now())},1000)})();
 </script>
 </body>
 </html>

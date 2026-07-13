@@ -26,5 +26,7 @@ template=template
   .replace("showLogs();}function showLogs()", "showLogs();document.dispatchEvent(new CustomEvent('v11decision',{detail:d}));}function showLogs()")
   .replace("showLogs();refresh();setInterval", "window.renderDashboard=render;showLogs();refresh();setInterval");
 const core=fs.readFileSync(path.join(root,'v1-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
-fs.writeFileSync(path.join(root,'eth-dynamic-trading-dashboard.html'),template.replace('/*__CORE__*/',core));
+const forecast=fs.readFileSync(path.join(root,'v1_2-forecast-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
+template=template.replace("cache=await C.fetchAllTimeframeKlines();const d=", "cache=await C.fetchAllTimeframeKlines();window.__lastMarketData=cache;const d=");
+fs.writeFileSync(path.join(root,'eth-dynamic-trading-dashboard.html'),template.replace('/*__CORE__*/',core).replace('/*__FORECAST__*/',forecast));
 console.log('built eth-dynamic-trading-dashboard.html');
