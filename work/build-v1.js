@@ -13,7 +13,8 @@ template=template
   .replace("'BTC联动：'+d.btcAlignment", "'BTC联动：'+(zhAlign[d.btcAlignment]||d.btcAlignment)")
   .replace("d.falseBreakoutTier;$('falseBreakout')", "zhTier[d.falseBreakoutTier]||d.falseBreakoutTier;$('falseBreakout')")
   .replace("`${d.volumeQuality.label} · ${d.volumeQuality.evidence.join(' · ')}`", "`${zhVolume[d.volumeQuality.label]||d.volumeQuality.label} · ${d.volumeQuality.evidence.join(' · ')}`")
-  .replace("${x.dataHealth} / ${x.worthBetting?'值得':'不下注'}", "${zhHealth[x.dataHealth]||x.dataHealth} / ${x.worthBetting?'值得':'不下注'}");
+  .replace("${x.dataHealth} / ${x.worthBetting?'值得':'不下注'}", "${zhHealth[x.dataHealth]||x.dataHealth} / ${x.worthBetting?'值得':'不下注'}")
+  .replace("showLogs();}function showLogs()", "showLogs();document.dispatchEvent(new CustomEvent('v11decision',{detail:d}));}function showLogs()");
 const core=fs.readFileSync(path.join(root,'v1-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
 fs.writeFileSync(path.join(root,'eth-dynamic-trading-dashboard.html'),template.replace('/*__CORE__*/',core));
 console.log('built eth-dynamic-trading-dashboard.html');
