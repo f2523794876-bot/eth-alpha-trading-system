@@ -1,6 +1,158 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ETH Alpha V1 · 多周期动态交易决策</title><style>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ETH Alpha V1 · 多周期动态交易决策</title>
+<style>
 :root{--bg:#071018;--panel:#101c27;--line:#253646;--text:#e8f1f7;--muted:#8fa4b5;--cyan:#2dd4bf;--blue:#60a5fa;--red:#fb7185;--amber:#fbbf24;--green:#34d399}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% -20%,#123044 0,transparent 35%),var(--bg);color:var(--text);font:14px/1.55 system-ui,-apple-system,"PingFang SC",sans-serif}.wrap{max-width:1440px;margin:auto;padding:22px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}.eyebrow{color:var(--cyan);letter-spacing:.15em;font-size:12px}.title{font-size:28px;margin:4px 0}.sub,.muted{color:var(--muted)}button{background:var(--cyan);color:#04221e;border:0;border-radius:9px;padding:10px 16px;font-weight:700;cursor:pointer}.stamp{text-align:right}.banner{margin:16px 0;padding:12px 15px;border:1px solid var(--line);border-radius:10px;background:#0b1822}.banner.normal{border-color:#196c61}.banner.delayed{border-color:#8b6b18;color:#ffe29a}.banner.invalid{border-color:#9f3044;background:#2b1018;color:#ffc1cb}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}.card{background:linear-gradient(145deg,#12212d,#0d1822);border:1px solid var(--line);border-radius:13px;padding:16px}.span12{grid-column:span 12}.span8{grid-column:span 8}.span6{grid-column:span 6}.span4{grid-column:span 4}.span3{grid-column:span 3}h2{font-size:15px;margin:0 0 12px;color:#c8d8e4}.big{font-size:25px;font-weight:750}.state{color:var(--cyan)}.bad{color:var(--red)}.warn{color:var(--amber)}.good{color:var(--green)}.row{display:flex;justify-content:space-between;gap:10px;border-top:1px solid #1c2b37;padding:7px 0}.row:first-child{border:0}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 9px;margin:2px;color:#bcd0df}.zone{border-left:3px solid var(--blue);padding:7px 10px;margin:7px 0;background:#0a151e}.score{font-size:38px;color:var(--cyan)}ul{padding-left:20px;margin:8px 0}.manual{display:none}.manual.open{display:block}.manual-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.manual input{width:100%;background:#08131c;border:1px solid var(--line);color:white;padding:9px;border-radius:7px}details{margin-top:12px}summary{cursor:pointer;color:var(--cyan)}.foot{margin-top:18px;color:var(--muted);font-size:12px}.loading{opacity:.55}@media(max-width:850px){.span8,.span6,.span4,.span3{grid-column:span 12}.top{display:block}.stamp{text-align:left;margin-top:12px}.manual-grid{grid-template-columns:1fr 1fr}}
-</style></head><body><main class="wrap" id="app"><header class="top"><div><div class="eyebrow">ETH ALPHA · V1 REST DECISION CORE</div><div class="title">多周期动态交易决策系统</div><div class="sub">4小时战略方向 → 1小时趋势结构 → 15分钟执行位置 · BTC对应周期确认</div></div><div class="stamp"><button id="refresh">刷新六路行情</button><div id="updated" class="muted">尚未更新</div></div></header><div id="health" class="banner invalid">正在获取 ETH/BTC 六路 REST K线…</div><section class="grid"><article class="card span3"><h2>实时价格 / 确认价</h2><div id="price" class="big">—</div><div id="confirmed" class="muted">收盘确认：—</div><div id="intrabar" class="warn"></div></article><article class="card span3"><h2>当前市场状态</h2><div id="state" class="big state">—</div><div id="stateReason" class="muted">—</div></article><article class="card span3"><h2>是否值得下注</h2><div id="worth" class="big">否</div><div id="permission" class="muted">等待数据</div></article><article class="card span3"><h2>透明评分</h2><div id="score" class="score">—</div><div class="muted">评分不替代硬性安全规则</div></article><article class="card span4"><h2>4小时战略方向</h2><div id="htf" class="big">—</div><div id="htfMeta" class="muted">—</div></article><article class="card span4"><h2>1小时趋势结构</h2><div id="mtf" class="big">—</div><div id="mtfMeta" class="muted">—</div></article><article class="card span4"><h2>15分钟执行位置</h2><div id="ltf" class="big">—</div><div id="btc" class="muted">BTC联动：—</div></article><article class="card span8"><h2>交易决策（非自动下单）</h2><div id="advice" class="big">数据到位后生成</div><div class="row"><span>试仓条件 / 区域</span><b id="entry">—</b></div><div class="row"><span>专业加仓条件</span><b id="addon">—</b></div><div class="row"><span>动态止损</span><b id="stop">—</b></div><div class="row"><span>动态目标</span><b id="targets">—</b></div><div class="row"><span>毛 / 净盈亏比</span><b id="rr">—</b></div><div class="row"><span>假突破风险</span><b id="falseBreakout">—</b></div></article><article class="card span4"><h2>蜻蜓最佳拦截区</h2><div id="dragonZone" class="big">—</div><div id="dragonText" class="muted">—</div><h2 style="margin-top:18px">成交量质量</h2><div id="volume">—</div></article><article class="card span6"><h2>动态支撑区域</h2><div id="supports">—</div></article><article class="card span6"><h2>动态压力区域</h2><div id="resistances">—</div></article><article class="card span6"><h2>离场条件</h2><ul id="exits"><li>等待数据</li></ul></article><article class="card span6"><h2>评分证据</h2><div id="scoreItems">—</div></article><article class="card span12"><h2>数据健康与决策日志</h2><div id="warnings">—</div><details><summary>查看最近决策日志（本机浏览器 localStorage，最多500条）</summary><div id="logs"></div></details><details><summary id="manualToggle">API不可用？启用手动模式（仅15分钟近似，4h/1h不可用）</summary><div id="manual" class="manual"><div class="manual-grid"><input id="mEth" placeholder="ETH价格"><input id="mBtc" placeholder="BTC价格"><input id="mHigh" placeholder="近期高点"><input id="mLow" placeholder="近期低点"><input id="mH20" placeholder="20根高点"><input id="mL20" placeholder="20根低点"></div><p class="muted">手动模式缺少真实多周期、成交量与BTC K线，系统会阻断实时建议，仅提供近似结构展示。</p><button id="manualRun">计算手动近似值</button></div></details></article></section><div class="foot">风险声明：本工具只提供基于公开行情和显式规则的决策辅助，不承诺盈利，不连接账户，不自动下单，不提供杠杆或亏损摊平建议。</div></main>
-<script>/*__CORE__*/</script><script>
-(()=>{const C=window.ETHAlphaCore,$=id=>document.getElementById(id),fmt=C.fmt;let cache=null,prev={},busy=false;const names={BULL_CONFIRMATION:'多头确认',BULL_PULLBACK:'多头回踩',BEAR_CONTINUATION:'空头延续',TRANSITION_WATCH:'过渡观察',RANGE_CHOP:'区间震荡',STAND_ASIDE:'禁止参与',HTF_BULL_TREND:'4H多头趋势',HTF_BEAR_TREND:'4H空头趋势',HTF_BULL_PULLBACK:'4H多头回踩',HTF_BEAR_REBOUND:'4H空头反弹',HTF_RANGE:'4H区间',HTF_TRANSITION:'4H过渡'};function zones(a){return a.map(z=>`<div class="zone"><b>第${z.rank}区：${fmt(z.lower)} – ${fmt(z.upper)}</b><div class="muted">中心 ${fmt(z.center)} · ${z.confidence} · ${z.source} · Swing ${z.sourceSwingCount}个</div></div>`).join('');}function render(d){$('price').textContent=fmt(d.price);$('confirmed').textContent='收盘确认：'+fmt(d.confirmedPrice);$('intrabar').textContent=d.ltf15m.intrabarWarning||'收盘确认状态';$('state').textContent=names[d.state]||d.state;$('stateReason').textContent=d.stateReason;$('worth').textContent=d.worthBetting?'值得（仍需风控）':'不值得';$('worth').className='big '+(d.worthBetting?'good':'bad');$('permission').textContent=d.signalPermission.reason+` · 仓位上限 ${d.signalPermission.positionSizeCapPct}%`;$('score').textContent=d.score.total;$('htf').textContent=names[d.htfState]||d.htfState;$('htfMeta').textContent=`趋势 ${d.htf4h.trend} · 确认价 ${fmt(d.htf4h.confirmedPrice)}`;$('mtf').textContent=names[d.mtfState]||d.mtfState;$('mtfMeta').textContent=`趋势 ${d.mtf1h.trend} · 确认价 ${fmt(d.mtf1h.confirmedPrice)}`;$('ltf').textContent=names[d.state]||d.state;$('btc').textContent='BTC联动：'+d.btcAlignment;$('advice').textContent=d.advice;$('entry').textContent=d.entryZone;$('addon').textContent=d.addOnCondition;$('stop').textContent=fmt(d.stopLoss);$('targets').textContent=d.targets.map(fmt).join(' / ');$('rr').textContent=d.riskReward.status==='ok'?`${d.riskReward.grossValue.toFixed(2)} / ${d.riskReward.netValue.toFixed(2)}（成本 ${fmt(d.riskReward.costAmount)}）`:d.riskReward.message;$('falseBreakout').textContent=d.falseBreakoutTier;$('falseBreakout').className=d.falseBreakoutTier==='confirmation_failed'?'bad':d.falseBreakoutTier==='warning'?'warn':'good';$('dragonZone').textContent=d.bestInterceptionZone.zone;$('dragonText').textContent=d.dragonflyText;$('volume').textContent=`${d.volumeQuality.label} · ${d.volumeQuality.evidence.join(' · ')}`;$('supports').innerHTML=zones(d.supportZones);$('resistances').innerHTML=zones(d.resistanceZones);$('exits').innerHTML=d.exitConditions.map(x=>`<li>${x}</li>`).join('');$('scoreItems').innerHTML=d.score.items.map(x=>`<div class="row"><span>${x.name} <small class="muted">${x.reason}</small></span><b>${x.points>0?'+':''}${x.points}/${x.maxPoints}</b></div>`).join('');$('warnings').innerHTML=d.warnings.length?d.warnings.map(x=>`<span class="pill">${x}</span>`).join(''):'<span class="good">无额外警告</span>';const h=$('health');h.className='banner '+d.dataHealth;h.textContent=d.isManual?'手动模式（近似值）：4h/1h不可用，实时建议已阻断。':d.dataHealth==='normal'?'数据正常：六路REST K线完整、时间同步，正式状态仅使用已收盘K线。':d.dataHealth==='delayed'?'数据延迟或周期不同步：建议已降级，请核对更新时间。':'数据失效：禁止实时交易建议，不保留上一条建议冒充当前建议。';$('updated').textContent='数据更新时间：'+new Date(d.updatedAt).toLocaleString()+' · '+(d.ltf15m.dataQuality.isStale?'数据陈旧':'数据新鲜');prev={ltf:d.state,mtf:d.mtfState,htf:d.htfState};const log=C.buildDecisionLogEntry(d);d.decisionLogId=log.id;C.saveDecisionLog(log,localStorage);showLogs();}function showLogs(){let a=[];try{a=JSON.parse(localStorage.getItem('ethAlphaDecisionLogs')||'[]')}catch(e){}$('logs').innerHTML=a.slice(-10).reverse().map(x=>`<div class="row"><span>${new Date(x.timestamp).toLocaleString()} · ${names[x.state]||x.state}</span><b>${x.dataHealth} / ${x.worthBetting?'值得':'不下注'}</b></div>`).join('')||'暂无';}async function refresh(){if(busy)return;busy=true;$('app').classList.add('loading');$('health').textContent='正在刷新 ETH/BTC × 15m/1h/4h 六路行情…';try{cache=await C.fetchAllTimeframeKlines();const d=C.buildDecision(cache.eth,cache.btc,null,prev,C.COST_DEFAULT);if(cache.partial)d.warnings.push('部分API失败：'+cache.failed.join(', '));render(d);}catch(e){$('health').className='banner invalid';$('health').textContent='实时数据获取失败：'+e.message+'。已清空实时建议，请使用手动近似模式或稍后重试。';$('advice').textContent='禁止实时交易建议';$('worth').textContent='否';}finally{busy=false;$('app').classList.remove('loading');}}$('refresh').onclick=refresh;$('manualToggle').onclick=()=>$('manual').classList.toggle('open');$('manualRun').onclick=()=>{try{const i={ethPrice:+$('mEth').value,btcPrice:+$('mBtc').value,recentHigh:+$('mHigh').value,recentLow:+$('mLow').value,high20:+$('mH20').value,low20:+$('mL20').value};const v=C.validateManualInput(i);if(!v.ok)throw Error(v.message);const empty={tf15m:[],tf1h:[],tf4h:[]};render(C.buildDecision(empty,empty,i,{},C.COST_DEFAULT));}catch(e){alert(e.message)}};document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refresh()});showLogs();refresh();setInterval(refresh,30000);})();
-</script></body></html>
+</style>
+</head>
+<body>
+<main class="wrap" id="app">
+<header class="top">
+<div>
+<div class="eyebrow">ETH ALPHA · V1 REST DECISION CORE</div>
+<div class="title">多周期动态交易决策系统</div>
+<div class="sub">4小时战略方向 → 1小时趋势结构 → 15分钟执行位置 · BTC对应周期确认</div>
+</div>
+<div class="stamp">
+<button id="refresh">刷新六路行情</button>
+<div id="updated" class="muted">尚未更新</div>
+</div>
+</header>
+<div id="health" class="banner invalid">正在获取 ETH/BTC 六路 REST K线…</div>
+<section class="grid">
+<article class="card span3">
+<h2>实时价格 / 确认价</h2>
+<div id="price" class="big">—</div>
+<div id="confirmed" class="muted">收盘确认：—</div>
+<div id="intrabar" class="warn">
+</div>
+</article>
+<article class="card span3">
+<h2>当前市场状态</h2>
+<div id="state" class="big state">—</div>
+<div id="stateReason" class="muted">—</div>
+</article>
+<article class="card span3">
+<h2>是否值得下注</h2>
+<div id="worth" class="big">否</div>
+<div id="permission" class="muted">等待数据</div>
+</article>
+<article class="card span3">
+<h2>透明评分</h2>
+<div id="score" class="score">—</div>
+<div class="muted">评分不替代硬性安全规则</div>
+</article>
+<article class="card span4">
+<h2>4小时战略方向</h2>
+<div id="htf" class="big">—</div>
+<div id="htfMeta" class="muted">—</div>
+</article>
+<article class="card span4">
+<h2>1小时趋势结构</h2>
+<div id="mtf" class="big">—</div>
+<div id="mtfMeta" class="muted">—</div>
+</article>
+<article class="card span4">
+<h2>15分钟执行位置</h2>
+<div id="ltf" class="big">—</div>
+<div id="btc" class="muted">BTC联动：—</div>
+</article>
+<article class="card span8">
+<h2>交易决策（非自动下单）</h2>
+<div id="advice" class="big">数据到位后生成</div>
+<div class="row">
+<span>试仓条件 / 区域</span>
+<b id="entry">—</b>
+</div>
+<div class="row">
+<span>专业加仓条件</span>
+<b id="addon">—</b>
+</div>
+<div class="row">
+<span>动态止损</span>
+<b id="stop">—</b>
+</div>
+<div class="row">
+<span>动态目标</span>
+<b id="targets">—</b>
+</div>
+<div class="row">
+<span>毛 / 净盈亏比</span>
+<b id="rr">—</b>
+</div>
+<div class="row">
+<span>假突破风险</span>
+<b id="falseBreakout">—</b>
+</div>
+</article>
+<article class="card span4">
+<h2>蜻蜓最佳拦截区</h2>
+<div id="dragonZone" class="big">—</div>
+<div id="dragonText" class="muted">—</div>
+<h2 style="margin-top:18px">成交量质量</h2>
+<div id="volume">—</div>
+</article>
+<article class="card span6">
+<h2>动态支撑区域</h2>
+<div id="supports">—</div>
+</article>
+<article class="card span6">
+<h2>动态压力区域</h2>
+<div id="resistances">—</div>
+</article>
+<article class="card span6">
+<h2>离场条件</h2>
+<ul id="exits">
+<li>等待数据</li>
+</ul>
+</article>
+<article class="card span6">
+<h2>评分证据</h2>
+<div id="scoreItems">—</div>
+</article>
+<article class="card span12">
+<h2>数据健康与决策日志</h2>
+<div id="warnings">—</div>
+<details>
+<summary>查看最近决策日志（本机浏览器 localStorage，最多500条）</summary>
+<div id="logs">
+</div>
+</details>
+<details>
+<summary id="manualToggle">API不可用？启用手动模式（仅15分钟近似，4h/1h不可用）</summary>
+<div id="manual" class="manual">
+<div class="manual-grid">
+<input id="mEth" placeholder="ETH价格">
+<input id="mBtc" placeholder="BTC价格">
+<input id="mHigh" placeholder="近期高点">
+<input id="mLow" placeholder="近期低点">
+<input id="mH20" placeholder="20根高点">
+<input id="mL20" placeholder="20根低点">
+</div>
+<p class="muted">手动模式缺少真实多周期、成交量与BTC K线，系统会阻断实时建议，仅提供近似结构展示。</p>
+<button id="manualRun">计算手动近似值</button>
+</div>
+</details>
+</article>
+</section>
+<div class="foot">风险声明：本工具只提供基于公开行情和显式规则的决策辅助，不承诺盈利，不连接账户，不自动下单，不提供杠杆或亏损摊平建议。</div>
+</main>
+<script>/*__CORE__*/</script>
+<script>
+(()=>{const C=window.ETHAlphaCore,$=id=>document.getElementById(id),fmt=C.fmt;let cache=null,prev={},busy=false;const names={BULL_CONFIRMATION:'多头确认',BULL_PULLBACK:'多头回踩',BEAR_CONTINUATION:'空头延续',TRANSITION_WATCH:'过渡观察',RANGE_CHOP:'区间震荡',STAND_ASIDE:'禁止参与',HTF_BULL_TREND:'4H多头趋势',HTF_BEAR_TREND:'4H空头趋势',HTF_BULL_PULLBACK:'4H多头回踩',HTF_BEAR_REBOUND:'4H空头反弹',HTF_RANGE:'4H区间',HTF_TRANSITION:'4H过渡'};function zones(a){return a.map(z=>`<div class="zone">
+<b>第${z.rank}区：${fmt(z.lower)} – ${fmt(z.upper)}</b>
+<div class="muted">中心 ${fmt(z.center)} · ${z.confidence} · ${z.source} · Swing ${z.sourceSwingCount}个</div>
+</div>`).join('');}function render(d){$('price').textContent=fmt(d.price);$('confirmed').textContent='收盘确认：'+fmt(d.confirmedPrice);$('intrabar').textContent=d.ltf15m.intrabarWarning||'收盘确认状态';$('state').textContent=names[d.state]||d.state;$('stateReason').textContent=d.stateReason;$('worth').textContent=d.worthBetting?'值得（仍需风控）':'不值得';$('worth').className='big '+(d.worthBetting?'good':'bad');$('permission').textContent=d.signalPermission.reason+` · 仓位上限 ${d.signalPermission.positionSizeCapPct}%`;$('score').textContent=d.score.total;$('htf').textContent=names[d.htfState]||d.htfState;$('htfMeta').textContent=`趋势 ${d.htf4h.trend} · 确认价 ${fmt(d.htf4h.confirmedPrice)}`;$('mtf').textContent=names[d.mtfState]||d.mtfState;$('mtfMeta').textContent=`趋势 ${d.mtf1h.trend} · 确认价 ${fmt(d.mtf1h.confirmedPrice)}`;$('ltf').textContent=names[d.state]||d.state;$('btc').textContent='BTC联动：'+d.btcAlignment;$('advice').textContent=d.advice;$('entry').textContent=d.entryZone;$('addon').textContent=d.addOnCondition;$('stop').textContent=fmt(d.stopLoss);$('targets').textContent=d.targets.map(fmt).join(' / ');$('rr').textContent=d.riskReward.status==='ok'?`${d.riskReward.grossValue.toFixed(2)} / ${d.riskReward.netValue.toFixed(2)}（成本 ${fmt(d.riskReward.costAmount)}）`:d.riskReward.message;$('falseBreakout').textContent=d.falseBreakoutTier;$('falseBreakout').className=d.falseBreakoutTier==='confirmation_failed'?'bad':d.falseBreakoutTier==='warning'?'warn':'good';$('dragonZone').textContent=d.bestInterceptionZone.zone;$('dragonText').textContent=d.dragonflyText;$('volume').textContent=`${d.volumeQuality.label} · ${d.volumeQuality.evidence.join(' · ')}`;$('supports').innerHTML=zones(d.supportZones);$('resistances').innerHTML=zones(d.resistanceZones);$('exits').innerHTML=d.exitConditions.map(x=>`<li>${x}</li>`).join('');$('scoreItems').innerHTML=d.score.items.map(x=>`<div class="row">
+<span>${x.name} <small class="muted">${x.reason}</small>
+</span>
+<b>${x.points>0?'+':''}${x.points}/${x.maxPoints}</b>
+</div>`).join('');$('warnings').innerHTML=d.warnings.length?d.warnings.map(x=>`<span class="pill">${x}</span>`).join(''):'<span class="good">无额外警告</span>';const h=$('health');h.className='banner '+d.dataHealth;h.textContent=d.isManual?'手动模式（近似值）：4h/1h不可用，实时建议已阻断。':d.dataHealth==='normal'?'数据正常：六路REST K线完整、时间同步，正式状态仅使用已收盘K线。':d.dataHealth==='delayed'?'数据延迟或周期不同步：建议已降级，请核对更新时间。':'数据失效：禁止实时交易建议，不保留上一条建议冒充当前建议。';$('updated').textContent='数据更新时间：'+new Date(d.updatedAt).toLocaleString()+' · '+(d.ltf15m.dataQuality.isStale?'数据陈旧':'数据新鲜');prev={ltf:d.state,mtf:d.mtfState,htf:d.htfState};const log=C.buildDecisionLogEntry(d);d.decisionLogId=log.id;C.saveDecisionLog(log,localStorage);showLogs();}function showLogs(){let a=[];try{a=JSON.parse(localStorage.getItem('ethAlphaDecisionLogs')||'[]')}catch(e){}$('logs').innerHTML=a.slice(-10).reverse().map(x=>`<div class="row">
+<span>${new Date(x.timestamp).toLocaleString()} · ${names[x.state]||x.state}</span>
+<b>${x.dataHealth} / ${x.worthBetting?'值得':'不下注'}</b>
+</div>`).join('')||'暂无';}async function refresh(){if(busy)return;busy=true;$('app').classList.add('loading');$('health').textContent='正在刷新 ETH/BTC × 15m/1h/4h 六路行情…';try{cache=await C.fetchAllTimeframeKlines();const d=C.buildDecision(cache.eth,cache.btc,null,prev,C.COST_DEFAULT);if(cache.partial)d.warnings.push('部分API失败：'+cache.failed.join(', '));render(d);}catch(e){$('health').className='banner invalid';$('health').textContent='实时数据获取失败：'+e.message+'。已清空实时建议，请使用手动近似模式或稍后重试。';$('advice').textContent='禁止实时交易建议';$('worth').textContent='否';}finally{busy=false;$('app').classList.remove('loading');}}$('refresh').onclick=refresh;$('manualToggle').onclick=()=>$('manual').classList.toggle('open');$('manualRun').onclick=()=>{try{const i={ethPrice:+$('mEth').value,btcPrice:+$('mBtc').value,recentHigh:+$('mHigh').value,recentLow:+$('mLow').value,high20:+$('mH20').value,low20:+$('mL20').value};const v=C.validateManualInput(i);if(!v.ok)throw Error(v.message);const empty={tf15m:[],tf1h:[],tf4h:[]};render(C.buildDecision(empty,empty,i,{},C.COST_DEFAULT));}catch(e){alert(e.message)}};document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refresh()});showLogs();refresh();setInterval(refresh,30000);})();
+</script>
+</body>
+</html>
