@@ -1,6 +1,6 @@
 # V1_2_CODEX_IMPLEMENTATION_TASK.md — 给 Codex 的 V1.2「走势预测层」实现工单
 
-版本：v1.2-draft-1
+版本：v1.2-draft-2（随 `V1_2_FORECAST_SPEC.md` v1.2-draft-2 同步修订，修订原因见 `V1_2_FORECAST_SPEC.md` §16 变更记录，本文档不重复展开，只同步接口/签名/接线细节）
 依据：`V1_2_FORECAST_SPEC.md`（算法真相来源，本文档只定义"怎么落地成代码"，不重复定义算法，任何算法细节冲突以该文档为准）+ 现有 `v1-core.js`（V1.1冻结核心，不可修改）。
 角色分工：本文档作者（Claude Code）负责本轮 V1.2 的架构设计与验收规范，**不编写正式业务代码**；Codex 负责实际编码；PROJECT_AUDIT.md / STRATEGY_SPEC.md / ACCEPTANCE_TESTS.md / V1_IMPLEMENTATION_REPORT.md / TEST_RESULTS.md 是 V1.1 的既有交付物，本轮不改动。
 
@@ -40,11 +40,17 @@
 - 先写一个空的 `buildForecast()` 返回全 `null` 的 `ForecastOutput`，跑通 `require('../v1-core.js')` 引用链路。
 - 自测：新建 `tests/v12-forecast-tests.js`，第一个测试就断言 `require('../v1_2-forecast-core.js').toString()` 不包含对 `v1-core.js` 内部私有函数名的裸调用（防止意外复制实现）。
 
-### 步骤2：实现12项因子函数（spec §4.1）
-- 每个因子实现为独立小函数 `factorTrend4h(ethTf, decision)`、`factorStructure1h(...)` 等，签名统一返回 `ForecastFactorResult`（不含 `weightMax`，由步骤3按horizon注入）。
+### 步骤2：实现12项因子函数（spec §4.1，输入参数已按spec §0订正为 `ethSnap`/`btcSnap`，不是draft-1中不存在的 `ethTf`/`btcTf`）
+- 每个因子实现为独立小函数 `factorTrend4h(ethSnap, horizon)`、`factorStructure1h(ethSnap, horizon, decision)` 等，签名统一返回 `ForecastFactorResult`（不含 `weightMax`，由步骤3按horizon注入）。`ethSnap`/`btcSnap` 是调用方（`buildHorizonForecast`）已经对 `marketData.eth`/`marketData.btc` 六路原始K线调用 `C.analyzeKlines()` 后得到的 `{tf15m,tf1h,tf4h}` 派生对象（spec §0/§11.2），因子函数内部**不得**自己再调用 `analyzeKlines`，只读取传入的快照，避免12个因子各自重复分析同一份K线。
+- 因子2/3（`structure1h`/`structure15m`）在状态机结果为 `TRANSITION_WATCH` 时，必须调用 spec §4.1.1 定义的 `transitionWatchSplit(snap)` 辅助函数（`snap` 为该因子对应周期的快照），返回值直接作为 `{bull,bear,range}`；**不得**自造 `range=0.6+方向0.2` 这类总和不为1的旧算法。
 - 因子4（`emaSlopeOwn`）需要调用已导出的 `C.emaSeries(closes, 5)`，`closes` 从对应周期**已收盘**K线数组中取，不使用未收盘K线参与斜率计算。
+- 因子5（`swingStructure`）missing判定必须是"`swingHighs.length<2` **或** `swingLows.length<2`"（逻辑或，不是draft-1错误的逻辑与），且 `status='ok'` 时必须覆盖 spec §4.4 列出的5类情形（两种单侧混合、单边缺失走missing、完整多头、完整空头），单测按5类各建一个fixture。
+- 因子7（`srDistance`）内部先调用 `C.buildSRZones(snapshot)` 取 `resistanceZones[0]`/`supportZones[0]`，再用 spec §6.0 定义的 `isValidZone(zone, side, confirmedPrice)` 做双边校验（任一侧无效或ATR无效即 `status='missing'`），校验通过后才调用 `C.calcPositionMetrics(confirmedPrice, s0, r0, atr14)`。`isValidZone` 作为模块内部小函数实现，签名与 spec §6.0 一致，同时供步骤4的价格区间/情景目标复用（不得写两份重复实现）。
+- 因子8（`volumeQuality`）签名为 `factorVolumeQuality(rawKlinesForTf, atr14, stateBias)`，`rawKlinesForTf` 取自 `marketData.eth[对应tf]`（该horizon自身周期的原始K线，不是15m），内部调用 `C.calcVolumeQuality(rawKlinesForTf, atr14, stateBias)`。方向判定严格按 spec 问题5的唯一阈值实现：`ratio>=1.2&&sustained===true&&takerBuyRatio>=0.55`→多头，`<=0.45`→空头，`0.45~0.55`或 `ratio<1.2`或 `!sustained`→`range=1`；`label==='unavailable'` 或 `takerBuyRatio===null`→`status='missing'`（不做保守方向猜测）。
+- 因子9（`btcAlignment3tf`）签名为 `factorBtcAlignment3tf(bias, btcSnapshotForHorizon, failedKeys, horizon)`，`failedKeys` 即 `marketData.failed`（真实格式 `'btc.tf15m'`等，见spec §10.4），函数内部按 `horizon` 映射到对应的 `'btc.'+tfKey`，命中则返回 `status='missing', hardMissing:true`，供 `buildHorizonForecast` 识别并触发 spec §5.2 条件3的整horizon降级。
+- 因子10（`falseBreakoutRisk`）签名为 `factorFalseBreakoutRisk(ethSnapshotForHorizon, btcSnapshotForHorizon)`，内部直接调用 `C.falseBreakoutTier(ethSnapshotForHorizon, btcSnapshotForHorizon)` 得到该horizon**自己的**tier（不接受外部传入的 `tier` 字符串，防止调用方把15m的 `decision.falseBreakoutTier` 传给1h/4h这类误用——signature本身锁死这条红线）。
 - 因子12（`mtfConflict`）必须以因子1/2/3的**计算结果对象**为输入参数，不接受K线/快照作为输入（强制签名 `factorMtfConflict(f1, f2, f3)`），从函数签名层面锁死"不得重复读取原始数据"的红线。
-- 自测：逐个因子写单元测试，用构造的 `AnalyzedSnapshot` fixture 覆盖"明确方向""震荡""missing"三种情况。
+- 自测：逐个因子写单元测试，用构造的 `AnalyzedSnapshot` fixture 覆盖"明确方向""震荡""missing"三种情况；因子2/3/5/7/8/9/10 额外覆盖本条目列出的专属边界（TRANSITION_WATCH三分支、swing五类、SR双边、成交量五档、BTC真实key、假突破逐周期）。
 
 ### 步骤3：实现权重表与归一化（spec §4.2、§5）
 - 权重表用一个纯数据常量 `FACTOR_WEIGHTS = { '15m': {trend4h:6, ...}, '1h': {...}, '4h': {...} }`，直接照抄 spec §4.2 表格数值，**不得调整**（如认为数值需要调整，必须先回到 spec 提出再决定，不允许 Codex 自行改权重）。
@@ -72,10 +78,13 @@
 - 严格按 spec §14 的"状态/标签优先级总表"实现判定顺序，不得调换。
 - `buildForecast()` 是唯一对外入口，内部按 15m→1h→4h 顺序分别跑一遍步骤2-5的流水线，任何一步的门槛判定失败都在该horizon层面截断，不影响其他horizon。
 
-### 步骤7：实现预测日志接口（spec §12）
-- `buildForecastLogEntry(forecast, horizon)` + `saveForecastLog(entry, storage)`（`storage` 参数注入，签名对照 `v1-core.js` 现有 `saveDecisionLog(entry, storage)` 的既有模式），`localStorage` key 用 `ethAlphaForecastLogs`（对照V1.1实际使用的 `ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11`，**必须是不同的key**，避免存储互相覆盖或共用容量上限时互相挤占）。
-- `outcomeAfter*`/`brierScoreComponent`/`directionAccuracy`/`rangeCoverage`/`calibrationBucket`/`calibratedProbability` 字段一律写 `null`，**不实现**任何回填逻辑。
-- 手动模式（`decision.isManual===true`）不写日志，与V1.1现有 `if(d.isManual)return` 规则一致。
+### 步骤7：实现预测日志接口（spec §12，已按问题10重写schema）
+- 三个版本号常量，模块顶部定义并导出：`SCHEMA_VERSION='v1.2-log-1'`、`FORECAST_ALGORITHM_VERSION='v1.2-draft-2'`、`FACTOR_WEIGHT_VERSION='v1.2-weights-1'`。后续任何修改 §4.1/§4.2/§5-§9 算法或权重表的提交，必须同步递增对应常量（spec §12.2版本号红线）。
+- `buildForecastLogEntry(forecast, horizonForecast, horizon)` + `saveForecastLog(entry, storage)`（`storage` 参数注入，签名对照 `v1-core.js` 现有 `saveDecisionLog(entry, storage)` 的既有模式），`localStorage` key 用 `ethAlphaForecastLogs`（对照V1.1实际使用的 `ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11`，**必须是不同的key**，避免存储互相覆盖或共用容量上限时互相挤占）。`forecast` 提供顶层字段（`generatedAt`/`blockedByV11`/`executability.worthBetting`），`horizonForecast` 提供该horizon自己的字段（`weights`/`priceRange`/`scenarioTargets`/`factors`/`dataAsOf`/`validUntil`等）。
+- `factorResults` 字段必须完整写入该horizon全部12项 `ForecastFactorResult`（含 `status='missing'` 的因子，逐项 `id/status/bull/bear/range/weightMax/points/evidenceText`），不得只写摘要——这是本轮相对draft-1 `tripleTimeframeFeatures` 摘要式记录的核心修订，保证V2能独立复现当时的方向权重计算过程而不依赖当前代码版本。
+- `outcomeAfter1Bar`/`outcomeAfter4Bars`/`outcomeAfter16Bars` 三个字段**都要**产出结构（值恒为 `null`，等V2回填），字段命名与语义严格遵守 spec §12.1 的唯一定义：**固定15分钟为1个bar**，不随该条日志自身的 `horizon` 变化（`horizon='4h'` 的日志里 `outcomeAfter1Bar` 依然是"15分钟后"而不是"4小时后"）。实现中**不得**出现 `bar单位=horizon周期` 这类换算逻辑。
+- 其余 `brierScoreComponent`/`directionAccuracy`/`rangeCoverage`/`calibrationBucket`/`calibratedProbability` 字段一律写 `null`，**不实现**任何回填逻辑。
+- 手动模式（`decision.isManual===true`）不写日志，与V1.1现有 `if(d.isManual)return` 规则一致；`directionLabel==='数据不足'` 的horizon**仍然写入**日志（详见spec §12.3），不得跳过。
 
 ### 步骤8：UI 接线（不改现有三块脚本）
 - 在 `eth-dynamic-trading-dashboard.html` 现有 `</section>`（V1.1网格结束标签，具体定位以文件当前实际结构为准，Codex 实现时自行定位不猜测行号）之后，新增：
@@ -95,17 +104,36 @@
   </section>
   ```
   （具体 class 命名沿用现有 `.card`/`.span4`/`.span12`/`.pill`/`.warn` 约定，实际DOM细节允许Codex按现有CSS调整，但**语义ID命名**必须保持 `forecast15m`/`forecast1h`/`forecast4h`/`forecastDisclaimer`/`forecastBlocked`/`forecastBetting`，供 `V1_2_ACCEPTANCE_TESTS.md` 的UI测试按ID断言。）
-- 第4个 `<script>` 块内，在现有 `refresh()` 调用链**之后**（不修改 `refresh()` 函数体本身，改为在其成功回调路径末尾追加一行调用，或监听其已有的 `v11decision` CustomEvent）：
+- 唯一允许触碰 `refresh()` 函数体的改动（spec §11.3已核对真实源码给出精确定位）：在 `cache=await C.fetchAllTimeframeKlines();` 之后、`const d=C.buildDecision(cache.eth,cache.btc,null,prev,C.COST_DEFAULT);` 之前，插入且仅插入一行：
+  ```js
+  window.__lastMarketData = cache;
+  ```
+  不允许修改这行前后的既有分支判断、不允许改变既有DOM写入顺序、不允许新增第二行。`window.__lastMarketData` 就是 `fetchAllTimeframeKlines()` 的原始返回值（spec §0 的 `marketData`），**不是**已分析好的快照——draft-1 设想的 `window.__lastEthTf`/`__lastBtcTf`/`__lastFetchMeta` 三个变量在v1.1真实代码中并不存在对应的已算好数据可以直接暴露（BTC的1h/4h快照 `buildDecision` 内部算完就丢弃，不写入返回对象，见spec §0），因此本轮改为只暴露最原始的六路K线集合，`ethSnap`/`btcSnap` 由 `buildForecast` 内部通过 `C.analyzeKlines` 自行派生（spec §11.2）。
+- 第4个 `<script>` 块内（新增文件/新增DOM，不改前三块），监听既有的 `v11decision` CustomEvent，**不新增**任何自定义事件：
   ```js
   document.addEventListener('v11decision', (e) => {
     const d = e.detail;
-    const f = window.ETHAlphaForecast.buildForecast(window.__lastEthTf, window.__lastBtcTf, d, window.__lastFetchMeta, window.__prevForecast);
+    const f = window.ETHAlphaForecast.buildForecast(window.__lastMarketData, d, window.__prevForecast, Date.now());
     window.__prevForecast = f;
     renderForecast(f);
   });
+
+  // 包装（不修改）既有的 window.invalidateDashboard：
+  // cache.partial===true 导致 throw、或 render(d) 内部因 dataHealth!=='normal' 早退时，
+  // v11decision 当次刷新根本不会触发，必须靠这个钩子统一清空预测面板（spec §10.2(b)）。
+  const prevInvalidateDashboard = window.invalidateDashboard;
+  window.invalidateDashboard = function(reason, known){
+    if (typeof prevInvalidateDashboard === 'function') prevInvalidateDashboard(reason, known);
+    clearForecast(reason);
+  };
+
+  function clearForecast(reason){
+    window.__prevForecast = null;   // 不复用旧对象引用
+    // 将 forecast15m/forecast1h/forecast4h 三个DOM区域重置为"预测已失效，等待下次成功刷新"文案，
+    // 并把 reason 写入 forecastBlocked 区域；不得让方向/权重/区间/目标类数字继续停留在旧值。
+  }
   ```
-  （`window.__lastEthTf`/`__lastBtcTf`/`__lastFetchMeta` 需要在现有 `refresh()` 内补一行赋值以暴露给这个新监听器；这是本工单**唯一允许**触碰 `refresh()` 函数体的地方，且只能是"新增一行赋值"，不能修改其既有逻辑分支、不能改变其既有的DOM写入/异常处理行为。若技术上有更干净、完全不用碰 `refresh()` 的方案（例如让 `buildDecision` 调用点所在的闭包直接多传一个回调），Codex 可自行选择，但目标不变：现有 `refresh()` 对外可观察行为必须逐字节保持不变，第三方无法通过跑101项测试或读函数字符串察觉任何差异。）
-- `renderForecast(f)` 独立函数，只做 `textContent`/`innerHTML` 写入，不改变 `f` 本身，遵循 V1.1 既有的直写DOM风格。
+- `renderForecast(f)` 独立函数，只做 `textContent`/`innerHTML` 写入，不改变 `f` 本身，遵循 V1.1 既有的直写DOM风格；`now > horizonForecast.validUntil` 时必须整体切换为"预测已过期，等待刷新"展示（清空/遮蔽方向、权重、区间、目标，不能只加一行提示同时旧数字继续显示，见 spec §10.3）。
 
 ### 步骤9：中文枚举映射
 - 新增 `zhPathScenario`、`zhInvalidation`、`zhDirectionExplain` 等映射对象，风格与现有 `names`/`zhTrend`/`zhAlign` 一致，声明在第4个脚本块顶部。
@@ -121,17 +149,26 @@
 ## 3. 函数接口清单（Codex 必须实现的最小函数集合，签名固定；内部实现细节自行组织，但行为必须匹配 `V1_2_FORECAST_SPEC.md`）
 
 ```js
-// ---- 因子层（spec §4.1，每个因子一个函数，统一返回 ForecastFactorResult 但不含 weightMax）----
-function factorTrend4h(ethTf, decision) -> Omit<ForecastFactorResult, 'weightMax'|'points'>
-function factorStructure1h(ethTf, decision) -> ...
-function factorStructure15m(ethTf, decision) -> ...
+// ---- 版本常量（spec §12.2）----
+const SCHEMA_VERSION = 'v1.2-log-1';
+const FORECAST_ALGORITHM_VERSION = 'v1.2-draft-2';
+const FACTOR_WEIGHT_VERSION = 'v1.2-weights-1';
+
+// ---- 因子层（spec §4.1，每个因子一个函数，统一返回 ForecastFactorResult 但不含 weightMax；
+//      参数是 ethSnap/btcSnap —— buildHorizonForecast 内部对 marketData 六路原始K线调用 C.analyzeKlines 后
+//      得到的派生快照，不是draft-1中不存在的 ethTf/btcTf）----
+function factorTrend4h(ethSnap) -> Omit<ForecastFactorResult, 'weightMax'|'points'>   // 读 ethSnap.tf4h.trend
+function factorStructure1h(ethSnap, decision) -> ...   // 读 decision.mtfState；TRANSITION_WATCH时调用 transitionWatchSplit(ethSnap.tf1h)
+function factorStructure15m(ethSnap, decision) -> ...  // 读 decision.state；TRANSITION_WATCH时调用 transitionWatchSplit(ethSnap.tf15m)
+function transitionWatchSplit(snap: AnalyzedSnapshot) -> { bull: number, bear: number, range: number }   // spec §4.1.1 唯一算法，供上面两个因子共用
 function factorEmaSlopeOwn(closedCloses: number[], atr14: number|null) -> ...
-function factorSwingStructure(snapshot: AnalyzedSnapshot) -> ...
+function factorSwingStructure(snapshot: AnalyzedSnapshot) -> ...   // missing条件：swingHighs.length<2 || swingLows.length<2（逻辑或）
 function factorAtrState(snapshot: AnalyzedSnapshot, decisionStateBias: 'up'|'down'|'flat') -> ...
-function factorSrDistance(positionMetrics) -> ...
-function factorVolumeQuality(volumeQuality, decisionStateBias) -> ...
-function factorBtcAlignment3tf(bias: 'up'|'down'|'flat', btcSnapshot: AnalyzedSnapshot) -> ... // status='missing'时须能表达"硬性missing"（见spec§10.4），建议返回值带 hardMissing:true 标记
-function factorFalseBreakoutRisk(tier: string, hasBreakout: boolean, hasBreakdown: boolean) -> ...
+function isValidZone(zone: {lower:number,upper:number}|null, side: 'support'|'resistance', confirmedPrice: number) -> boolean   // spec §6.0，因子7与§6/§7区间生成共用同一份实现
+function factorSrDistance(snapshot: AnalyzedSnapshot) -> ...   // 内部调用 C.buildSRZones(snapshot) 取 r0/s0，isValidZone 双边校验后再调 C.calcPositionMetrics
+function factorVolumeQuality(rawKlinesForTf: Kline[], atr14: number|null, decisionStateBias: 'up'|'down'|'flat') -> ...   // 内部调用 C.calcVolumeQuality(rawKlinesForTf, atr14, decisionStateBias)，唯一阈值见spec问题5
+function factorBtcAlignment3tf(bias: 'up'|'down'|'flat', btcSnapshotForHorizon: AnalyzedSnapshot, failedKeys: string[], horizon: '15m'|'1h'|'4h') -> ...   // failedKeys 即 marketData.failed 真实格式；命中该horizon对应的 'btc.'+tf 时返回 status='missing', hardMissing:true
+function factorFalseBreakoutRisk(ethSnapshotForHorizon: AnalyzedSnapshot, btcSnapshotForHorizon: AnalyzedSnapshot) -> ...   // 内部调用 C.falseBreakoutTier(ethSnapshotForHorizon, btcSnapshotForHorizon)，逐horizon独立调用，不接受外部传入的tier字符串
 function factorRangePosition(recentHigh20, recentLow20, confirmedPrice) -> ...
 function factorMtfConflict(f1, f2, f3) -> ...   // 只接受另外三个因子的结果对象，不接受快照
 
@@ -140,28 +177,29 @@ const FACTOR_WEIGHTS: Record<'15m'|'1h'|'4h', Record<string, number>>
 function computeDirectionWeights(factorResults: ForecastFactorResult[], horizon: '15m'|'1h'|'4h')
   -> { weights: DirectionWeights|null, directionLabel: string, availableWeight: number }
 
-// ---- 区间/目标/路径/失效（spec §6-§9）----
-function buildPriceRange(snapshot, weights, decisionZones) -> PriceRangeEstimate
-function buildScenarioTargets(snapshot, priceRange, decisionZones) -> ScenarioTargets
-function pickMostLikelyPath(directionLabel, snapshot, factorResults) -> PathScenario | null
+// ---- 区间/目标/路径/失效（spec §6-§9，均通过 snapshot 内部调用 C.buildSRZones + isValidZone 取用结构位，不接受外部预先算好的zone）----
+function buildPriceRange(snapshot: AnalyzedSnapshot, weights: DirectionWeights|null) -> PriceRangeEstimate
+function buildScenarioTargets(snapshot: AnalyzedSnapshot, priceRange: PriceRangeEstimate) -> ScenarioTargets
+function pickMostLikelyPath(directionLabel, ethSnapshotForHorizon: AnalyzedSnapshot, btcSnapshotForHorizon: AnalyzedSnapshot, factorResults) -> PathScenario | null   // 需要btcSnapshot是为了走§8表格里"该horizon自己的falseBreakoutTier"判定
 function buildInvalidationConditions(directionLabel, mostLikelyPath, snapshot, decision) -> InvalidationCondition[]
 
 // ---- 置信度与证据（spec 概念表#9、§9）----
 function computeConfidence(availableWeight, top, second, mtfConflictFactor) -> ConfidenceScore
 function pickEvidence(directionLabel, factorResults) -> { supportingEvidence: string[], opposingEvidence: string[] }
 
-// ---- 编排（spec §11.2）----
-function buildHorizonForecast(horizon, ethTf, btcTf, decision, fetchMeta) -> HorizonForecast | null
-function buildForecast(ethTf, btcTf, decision, fetchMeta, prevForecast) -> ForecastOutput
+// ---- 编排（spec §11.2，marketData 是 fetchAllTimeframeKlines() 的原始返回结构，buildForecast 内部自行调用 analyzeKlines 派生 ethSnap/btcSnap）----
+function buildHorizonForecast(horizon: '15m'|'1h'|'4h', ethSnap, btcSnap, decision, marketData, prevForecast, now) -> HorizonForecast | null
+function buildForecast(marketData: {eth:{tf15m:Kline[],tf1h:Kline[],tf4h:Kline[]}, btc:{tf15m:Kline[],tf1h:Kline[],tf4h:Kline[]}, partial:boolean, succeeded:string[], failed:string[]}, decision: DecisionOutput, prevForecast: ForecastOutput|null, now: number) -> ForecastOutput
 
 // ---- V2 接口（spec §12，只建结构，不实现回填）----
-function buildForecastLogEntry(forecast: ForecastOutput, horizon: '15m'|'1h'|'4h') -> ForecastLogEntry
+function buildForecastLogEntry(forecast: ForecastOutput, horizonForecast: HorizonForecast, horizon: '15m'|'1h'|'4h') -> ForecastLogEntry
 function saveForecastLog(entry: ForecastLogEntry, storage: Storage) -> void
 
 // ---- 导出（v1_2-forecast-core.js 的 module.exports / window.ETHAlphaForecast）----
 module.exports = {
-  factorTrend4h, factorStructure1h, factorStructure15m, factorEmaSlopeOwn, factorSwingStructure,
-  factorAtrState, factorSrDistance, factorVolumeQuality, factorBtcAlignment3tf, factorFalseBreakoutRisk,
+  SCHEMA_VERSION, FORECAST_ALGORITHM_VERSION, FACTOR_WEIGHT_VERSION,
+  factorTrend4h, factorStructure1h, factorStructure15m, transitionWatchSplit, factorEmaSlopeOwn, factorSwingStructure,
+  factorAtrState, isValidZone, factorSrDistance, factorVolumeQuality, factorBtcAlignment3tf, factorFalseBreakoutRisk,
   factorRangePosition, factorMtfConflict, FACTOR_WEIGHTS, computeDirectionWeights,
   buildPriceRange, buildScenarioTargets, pickMostLikelyPath, buildInvalidationConditions,
   computeConfidence, pickEvidence, buildHorizonForecast, buildForecast,
@@ -202,7 +240,7 @@ module.exports = {
 1. 禁止修改 `v1-core.js`。
 2. 禁止修改现有三个 `<script>` 块的既有逻辑（第2节步骤8明确的唯一例外除外）。
 3. 禁止修改 `v1.1.0` tag、`main` 分支历史、任何已发布 release。
-4. 禁止在 `v1_2-forecast-core.js` 中直接发起网络请求（K线数据必须由调用方通过 `ethTf`/`btcTf` 参数传入，预测层不自己 fetch）。
+4. 禁止在 `v1_2-forecast-core.js` 中直接发起网络请求（K线数据必须由调用方通过 `marketData` 参数传入，预测层不自己 fetch）。
 5. 禁止引入任何第三方npm包/CDN脚本。
 6. 禁止实现V2回测引擎、WebSocket、条件提醒推送、模拟仓位追踪（V2/V3范围）。
 7. 禁止实现任何下单、撤单、读取交易所API Key/Secret的代码。
