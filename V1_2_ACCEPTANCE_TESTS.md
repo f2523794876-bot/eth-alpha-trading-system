@@ -1,6 +1,6 @@
 # V1_2_ACCEPTANCE_TESTS.md — V1.2「走势预测层」验收测试规范
 
-版本：v1.2-draft-2（随 `V1_2_FORECAST_SPEC.md` v1.2-draft-2 同步修订，修订原因见 `V1_2_FORECAST_SPEC.md` §16 变更记录；本轮新增T21-T31，重写T10/T12/T14/T15/T17，详见文末"draft-1→draft-2变更摘要"）
+版本：v1.2-draft-3（随 `V1_2_FORECAST_SPEC.md` v1.2-draft-3 同步修订；新增blocked审计、固定checksum、构建失配与V1.2真实REST生产链验收）
 依据：`V1_2_FORECAST_SPEC.md`（每条用例都标注对应章节）。所有测试**必须用构造好的合成K线/合成快照数据跑**，不能只靠人工打开页面观察——沿用 `ACCEPTANCE_TESTS.md` 已确立的"合成数据优先"原则（PROJECT_AUDIT.md 已证明实盘验证会漏掉关键分支）。
 
 **fixture真实性红线（呼应问题3/12，T28专门测试本条）**：所有涉及 `marketData`/`failed`/`succeeded` 字段的用例，字段名和取值格式必须与 `v1-core.js` `fetchAllTimeframeKlines()` 的真实返回结构逐字节一致（`{eth:{tf15m,tf1h,tf4h},btc:{tf15m,tf1h,tf4h},partial,succeeded,failed}`，`failed`/`succeeded` 内的字符串格式固定为 `asset+'.'+key`，如 `'btc.tf4h'`）。**禁止**测试自造一套近似结构（如用 `ethTf`/`btcTf` 命名、或用 `'btc-tf4h'` 连字符格式）让测试通过而生产代码实际收到的数据形状不同。
@@ -68,7 +68,7 @@ node tests/v12-ui-tests.js
 
 | 用例 | 断言 |
 |---|---|
-| T4.1 | 因子 `mtfConflict` 的 `status==='ok'` 且 `range===1`（三者互不相同时全部导向震荡桶，见spec§4.1第12行） |
+| T4.1 | 因子 `timeframeAgreementProxy` 的 `status==='ok'` 且 `range===1`（三者互不相同时全部导向震荡桶，见spec§4.1第12行）；术语明确为规则一致性代理，不是统计准确率 |
 | T4.2 | 至少有一个horizon的 `directionLabel` 为 `'不确定'` 或 `'震荡'`（不应出现"三周期冲突却仍给出高置信度单一方向"的情况） |
 | T4.3 | 该horizon的 `confidence.score` 明显低于T1.1同条件下（agreementFactor分量拖低总分） |
 
@@ -80,7 +80,7 @@ node tests/v12-ui-tests.js
 
 | 用例 | 断言 |
 |---|---|
-| T5.1 | 因子 `btcAlignment3tf` 在4h horizon下 `status==='ok'`，`range>=0.7`（conflict按spec§4.1第9行分配） |
+| T5.1 | 因子 `btcAlignmentOwnTf` 在4h horizon下 `status==='ok'`，`range>=0.7`（conflict按spec§4.1第9行分配），中文标签为“BTC对应周期联动” |
 | T5.2 | `h4.weights.bullish` 相比"BTC支持"场景（T1.1）明显更低 |
 | T5.3 | `h4.opposingEvidence` 中包含提及BTC冲突的证据文本 |
 
@@ -254,10 +254,11 @@ node tests/v12-ui-tests.js
 
 | 用例 | 断言 |
 |---|---|
-| T17.1 | `buildForecastLogEntry(forecast, horizonForecast, '1h')` 返回对象包含 spec§12 定义的**全部**字段（逐字段名断言存在性）：`schemaVersion`/`forecastAlgorithmVersion`/`factorWeightVersion`/`id`/`source`/`symbol`/`generatedAt`/`timestamp`/`horizon`/`dataAsOf`/`validUntil`/`confirmedPrice`/`atr14`/`directionLabel`/`dataHealth`/`blockedByV11`/`worthBetting`/`closedKlineRef`/`factorResults`/`directionWeights`/`priceRange`/`scenarioTargets`/`invalidation`/`mostLikelyPath`/`confidence`/`outcomeAfter1Bar`/`outcomeAfter4Bars`/`outcomeAfter16Bars`/`brierScoreComponent`/`directionAccuracy`/`rangeCoverage`/`calibrationBucket`/`calibratedProbability` |
+| T17.1 | `buildForecastLogEntry(forecast, horizonForecast, '1h')` 返回对象包含 spec§12 定义的**全部**字段，包括 `status`/`blocked`/`blockReasons`/`algorithmVersion`/`weightVersion`；`calibratedProbability`恒为null |
 | T17.2 | `outcomeAfter1Bar`/`outcomeAfter4Bars`/`outcomeAfter16Bars`/`brierScoreComponent`/`directionAccuracy`/`rangeCoverage`/`calibrationBucket`/`calibratedProbability` 在V1.2生成的条目中恒为 `null`（V1.2不做回填） |
 | T17.3 | 手动模式下调用 `saveForecastLog` 不写入任何 `localStorage` 记录（与V1.1决策日志规则一致） |
 | T17.4 | `saveForecastLog` 使用的 `localStorage` key 为 `ethAlphaForecastLogs`，与V1.1现有的 `ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11` 均不同（防止存储互相覆盖） |
+| T17.5 | 数据不足、陈旧、关键周期缺失、预测失败或过期均写blocked审计；方向、权重、区间、目标、路径、置信度为null或空集合，不能沿用旧预测 |
 | T17.5 | `closedKlineRef` 只包含引用信息（`symbol`/`timeframe`/`lastClosedOpenTime`），不包含完整K线数组（防止日志体积失控），且长度恒为6（ETH+BTC×三周期） |
 | T17.6 | `directionLabel==='数据不足'` 的horizon**仍然**产出日志条目（`factorResults`如实记录missing因子，`directionWeights`/`priceRange`等为null），不得因为没有方向结论就跳过写入（spec§12.3） |
 | T17.7 | `factorResults` 长度恒为12，且每一项包含 `id`/`status`/`bull`/`bear`/`range`/`weightMax`/`points`/`evidenceText` 全部字段；用该日志条目独立重算一遍 §5.1-§5.3（不调用被测代码本身，而是测试脚本自行按spec公式重算），得到的 `directionWeights` 必须与日志中记录的完全一致（这是"可复现性"的直接验证，防止 `factorResults` 记录了却对不上最终权重） |
@@ -447,6 +448,15 @@ node tests/v12-ui-tests.js
 | T31.1 | 四份V1.2文档（本文档+SPEC+CODEX任务书+ARCHITECTURE_REVIEW）中出现"bar"定义的地方，全部一致地描述为"固定15分钟跨度"，不出现"以预测horizon自身周期为单位"这一互斥的另一种定义（人工/grep双重核对，见`V1_2_ARCHITECTURE_REVIEW.md`验收清单） |
 | T31.2 | 对 `horizon='4h'` 的日志条目，`outcomeAfter1Bar`（值为null，但生成该字段的代码逻辑）对应的时间锚点是 `dataAsOf+15分钟`，**不是** `dataAsOf+4小时`（用注入mock的"当前时间"驱动一次假设性回填逻辑桩函数验证锚点计算正确，即使V1.2本身不实现真回填，也要验证字段的时间语义没有被写反） |
 | T31.3 | 修改 `FACTOR_WEIGHTS` 中任意一个数值后（测试脚本临时mock），若未同步更新 `FACTOR_WEIGHT_VERSION`，则有一条断言专门检测"权重表校验和"与"记录在案的版本号校验和快照"不一致时测试**必须失败**（验证版本号红线不是摆设，而是真的会被测试网住——用一个记录当前 `FACTOR_WEIGHTS` 内容hash并与 `FACTOR_WEIGHT_VERSION` 绑定比对的机制实现） |
+| T31.4 | 固定checksum与权重版本显式绑定，预期checksum不得由运行时权重对象生成；只改点数、版本或checksum任一项均失败，合法权重更新必须同步三者 |
+
+### T32：V1.2真实REST正式生产链（独立于V1.1的8项REST冒烟）
+
+执行 `node tests/v12-live-rest-test.js`，真实Binance数据必须依次经过 `fetchAllTimeframeKlines → buildDecision → buildForecast → 三个时窗 → buildForecastLogEntry/saveForecastLog`。分别断言三时窗生成、权重和100、`calibratedProbability=null`、区间目标有限且有序、三条日志写入、同`dataAsOf`去重、数据不足blocked审计不携带旧预测、手动模式不写日志。报告必须将V1.1真实REST数量与V1.2真实REST生产链数量分开列出。
+
+### T33：构建替换失配保护
+
+`work/build-v1.js` 每个目标与核心占位符必须校验精确出现次数。测试分别构造目标缺失、目标重复和正常单次匹配；前两者必须抛出“构建替换失配”并终止，正常匹配才允许生成HTML。
 
 ---
 

@@ -1,6 +1,6 @@
 # V1_2_FORECAST_SPEC.md — ETH Alpha 走势预测层（概率预测层）算法与数据规范
 
-版本：v1.2-draft-2（在 v1.2-draft-1 基础上修订，修订原因见文末变更记录；V1.1 `v1.1.0`/commit `d9289ef` 之上的**增量**文档，不修改、不覆盖 STRATEGY_SPEC.md 已定义的任何算法）
+版本：v1.2-draft-3（在 v1.2-draft-2 基础上关闭独立复审3项P1与3项P2；V1.1 `v1.1.0`/commit `d9289ef` 之上的**增量**文档，不修改、不覆盖 STRATEGY_SPEC.md 已定义的任何算法）
 角色：本文档只做 V1.2「走势预测层」的**架构设计与验收规范**，不是实现代码，也不由本文档作者实现正式业务代码。
 适用范围：ETH/USDT 走势预测面板，三个独立预测时窗——未来15分钟 / 未来1小时 / 未来4小时，均在 V1.1 已有的三周期数据（4H/1H/15m，ETH+BTC）之上计算，不新增任何数据源、不新增任何K线请求。
 唯一算法真相来源声明：本文档是 V1.2 预测算法的唯一 source of truth。V1_2_CODEX_IMPLEMENTATION_TASK.md 中的函数接口必须实现本文档定义的行为；V1_2_ACCEPTANCE_TESTS.md 的用例必须验证本文档定义的规则；V1_2_ARCHITECTURE_REVIEW.md 负责核对三者一致性。四份文档如有冲突，以本文档为准。
@@ -12,7 +12,7 @@
 
 ---
 
-## 0. 记号约定（v1.2-draft-2 已按 V1.1 真实代码订正，见文末变更记录第1条）
+## 0. 记号约定（v1.2-draft-3）
 
 **订正说明**：draft-1 曾错误地假设 `C.buildDecision()` 接收的是"已经算好的 `{tf15m:AnalyzedSnapshot,...}`"对象，并假设 V1.2 可以直接复用这份引用。经与 `v1-core.js` 源码核对，这与事实不符：
 
@@ -60,7 +60,7 @@
 | 6 | 动态目标位 | V1.1 已有的、与止损/入场绑定的可执行止盈位 | V1.1（不变） | `decision.targets` |
 | 7 | 预计波动区间 | V1.2 对未来价格活动范围的规则型区间估计，探索性、非入场依据 | V1.2 新增 | `HorizonForecast.priceRange` |
 | 8 | 可执行性评分 | 该信号是否值得下注的评分 | V1.1（不变，V1.2 只透传不重算） | `decision.opportunityScores` / `decision.worthBetting`，见 §11.3 |
-| 9 | 置信度 | V1.2 对"这次预测本身数据完整度与内部一致性"的元评分，**不是**胜率，不是概率 | V1.2 新增 | `HorizonForecast.confidence`，UI 必须写"置信度（数据完整度评分，非胜率）" |
+| 9 | 置信度 | V1.2 对"这次预测本身数据完整度与规则内部一致性代理"的元评分，**不是**统计胜率、预测准确率或概率 | V1.2 新增 | `HorizonForecast.confidence`，UI 必须写"置信度（数据完整度与规则一致性代理评分，不是统计胜率或预测准确率）" |
 | 10 | 胜率 | 该方向历史上真实兑现的比例 | V2（本轮不实现） | V1.2 不产出任何胜率数值，禁止出现"胜率XX%"字样 |
 
 **强制措辞规则**：V1.2 当前只能得到规则型权重时，页面和日志一律使用"偏多权重""偏空权重""震荡权重"或同等表述；**禁止**出现"上涨概率60%""胜率70%"等未经校准的表述。任何新增文案在合并前必须逐条核对本表。
@@ -194,10 +194,10 @@ interface ForecastOutput {
 | 6 | `atrState` | ATR波动状态 | 目标周期快照的 `atr14`/`atrPrev` | `atr14>atrPrev×1.15`（扩张）：若同周期状态机方向为多→`bull=1`，为空→`bear=1`，否则`range=1`；`atr14<atrPrev×0.85`（收缩）→`range=1`；其余→按同周期状态机方向50%+`range=0.5` | `atr14`或`atrPrev`为`null` → missing |
 | 7 | `srDistance` | 动态支撑压力距离 | 用 §6.0 定义的 `C.buildSRZones(目标周期快照)` 得到 `resistanceZones[0]`(`r0`)/`supportZones[0]`(`s0`)，`C.calcPositionMetrics(confirmedPrice, s0, r0, atr14)` 算出 `supportDistanceAtr`/`resistanceDistanceAtr` | 距压力<0.4×距支撑（更靠近压力）→`bear=0.6,range=0.4`；距支撑<0.4×距压力（更靠近支撑）→`bull=0.6,range=0.4`；其余→`range=1` | **已订正为双边校验（问题7）**：`!isValidZone(r0,'resistance',confirmedPrice)` 或 `!isValidZone(s0,'support',confirmedPrice)` 或 `atr14` 无效（`null`/`NaN`/`≤0`）→ missing。任一侧（压力或支撑）越过 `confirmedPrice`（方向错误）、非有限数值、或ATR无效都会触发，不再是"两者同时为null才missing"这一几乎不可能触发的旧条件（`resolveLevels` 的ATR外推兜底导致 `firstResistance`/`firstSupport` 原始level本身几乎不会是`null`，真正会缺失的是加了ATR半宽后的zone） |
 | 8 | `volumeQuality` | 成交量质量 | 对目标horizon对应周期自身的**原始K线数组**（`marketData.eth[对应tf]`，逐周期取用，不复用15m的量能；`calcVolumeQuality` 内部自行按 `isClosed` 过滤，调用方不预先过滤）调用 `C.calcVolumeQuality(marketData.eth[对应tf], ethSnap[horizon].atr14, 同周期状态机方向标签)`，取其 `ratio`/`sustained`/`takerBuyRatio` | **唯一阈值（问题5已订正，取代未定义的"与方向一致"）**：多头量能确认 `ratio>=1.2 && sustained===true && takerBuyRatio>=0.55` → `bull=1`；空头量能确认 `ratio>=1.2 && sustained===true && takerBuyRatio<=0.45` → `bear=1`；`0.45<takerBuyRatio<0.55`（含 `ratio>=1.2&&sustained` 但买盘比例中性）→`range=1`（量能扩张但方向不明，导向震荡，不确认任一方向）；`ratio<1.2` 或 `sustained===false` → `range=1`（未放量或未持续，不给方向加分） | `C.calcVolumeQuality()` 返回 `label==='unavailable'`（K线不足/`volume`基准为0）或 `takerBuyRatio===null`（`last.volume===0` 导致无法计算买盘占比）→ missing。`takerBuyRatio===null` **明确按missing处理**，不采用保守方向猜测，因为买盘占比缺失时无法验证问题5要求的双向阈值 |
-| 9 | `btcAlignment3tf` | BTC三周期联动 | 对目标horizon所在周期，调用已导出的 `C.btcAlignment(bias, btcSnap[对应周期])` | `'support'→`按ETH本周期状态机方向`=1`；`'conflict'→range=0.7`+反方向`0.3`；`'neutral'→range=1` | 该周期BTC K线获取失败——即 `marketData.failed` 包含真实标识 `'btc.tf15m'`/`'btc.tf1h'`/`'btc.tf4h'`（**已订正为 `fetchAllTimeframeKlines` 真实key格式 `asset+'.'+key`，问题3**，不再使用不存在的 `'btc-tf4h'` 写法）→ **硬性missing，且触发§10.4整horizon降级**，不参与普通因子重归一化 |
+| 9 | `btcAlignmentOwnTf` | BTC对应周期联动 | 只对目标horizon所在周期调用已导出的 `C.btcAlignment(bias, btcSnap[对应周期])`；名称明确表示它不是一次性汇总BTC三个周期 | `'support'→`按ETH本周期状态机方向`=1`；`'conflict'→range=0.7`+反方向`0.3`；`'neutral'→range=1` | 该周期BTC K线获取失败——即 `marketData.failed` 包含真实标识 `'btc.tf15m'`/`'btc.tf1h'`/`'btc.tf4h'`（**已订正为 `fetchAllTimeframeKlines` 真实key格式 `asset+'.'+key`，问题3**，不再使用不存在的 `'btc-tf4h'` 写法）→ **硬性missing，且触发§10.4整horizon降级**，不参与普通因子重归一化 |
 | 10 | `falseBreakoutRisk` | 假突破风险 | **该horizon自己的** `C.falseBreakoutTier(ethSnap[horizon], btcSnap[horizon])`（**已订正为逐周期独立调用，问题4**，不是只代表15m的 `decision.falseBreakoutTier`；15m结果允许与 `decision.falseBreakoutTier` 做一致性断言，见§8） | `'confirmation_failed'→range=1`（原方向失效）；`'warning'→`原方向`0.5,range=0.5`；`'none'`且存在突破/跌破→原方向`=1`；`'none'`且无突破→`range=1` | 目标快照本身不可用（已被更上层的整体缺失判定拦截，不单独判missing） |
 | 11 | `rangePosition` | 当前价格处于区间的位置 | `recentHigh20`/`recentLow20` 与 `confirmedPrice` 算出的区间位置百分比 | `>70%（近顶部）→bear=0.6,range=0.4`；`<30%（近底部）→bull=0.6,range=0.4`；其余→`range=1` | `recentHigh20`或`recentLow20`为`null` → missing |
-| 12 | `mtfConflict` | 多周期方向冲突（元因子） | 只读取因子1/2/3**已经算出的**主导方向（各自bull/bear/range中最大者），不重新读取原始K线 | 三者主导方向一致→该方向`=1`；三者中两者一致→该方向`0.5,range=0.5`；三者互不相同→`range=1` | 因子1/2/3中有≥2个为missing → missing |
+| 12 | `timeframeAgreementProxy` | 三周期规则一致性代理（元因子） | 只读取因子1/2/3**已经算出的**主导方向（各自bull/bear/range中最大者），不重新读取原始K线；这是规则代理指标，不是统计准确率 | 三者主导方向一致→该方向`=1`；三者中两者一致→该方向`0.5,range=0.5`；三者互不相同→`range=1` | 因子1/2/3中有≥2个为missing → missing |
 
 ### 4.1.1 `TRANSITION_WATCH` 唯一算法（P0问题2修复：draft-1 的 `range=0.6+方向0.2` 总和只有0.8，违反 `ForecastFactorResult` 的 `bull+bear+range===1` 不变量）
 
@@ -228,10 +228,12 @@ function transitionWatchSplit(snap):
 | 6 | `atrState` | 8 | 6 | 5 |
 | 7 | `srDistance` | 12 | 10 | 8 |
 | 8 | `volumeQuality` | 10 | 8 | 6 |
-| 9 | `btcAlignment3tf` | 6 | 9 | 12 |
+| 9 | `btcAlignmentOwnTf` | 6 | 9 | 12 |
 | 10 | `falseBreakoutRisk` | 4 | 5 | 6 |
 | 11 | `rangePosition` | 2 | 2 | 3 |
-| 12 | `mtfConflict` | 2 | 1 | 4 |
+| 12 | `timeframeAgreementProxy` | 2 | 1 | 4 |
+
+权重版本固定为 `v1.2-weights-1`，固定FNV-1a校验和为 `10996160`。该预期值与版本号作为独立规范快照写死，运行时不得从 `FACTOR_WEIGHTS` 自行计算“预期checksum”后再与自身比较。任意权重点数变化必须同步更新权重版本、固定checksum和本规范快照，否则校验失败。
 | | **合计** | **100** | **100** | **100** |
 
 设计意图：15分钟预测更看重自身周期的执行结构（因子3权重22）和成交量/S-R距离（近端确认）；4小时预测更看重4H自身趋势（因子1权重22）和BTC三周期联动（宏观相关性更重要，因子9权重12）；1小时预测介于两者之间。
@@ -275,7 +277,7 @@ points.range = factor.weightMax × factor.range
 
 1. `decision.isManual === true`（手动观察模式，见§10.1，此时**三个horizon全部**为数据不足，不单独判断）。
 2. `decision.dataHealth !== 'normal'` 且非手动模式（数据延迟/失效，见§10.2）。
-3. 因子9（`btcAlignment3tf`）在该horizon判定为"硬性missing"（对应周期BTC数据获取失败，见§10.4）。
+3. 因子9（`btcAlignmentOwnTf`）在该horizon判定为"硬性missing"（对应周期BTC数据获取失败，见§10.4）。
 4. 该horizon缺失权重总和（所有`status='missing'`因子的`weightMax`之和）≥ 40（即可用权重不足60）。
 5. 该horizon对应周期自身的`AnalyzedSnapshot.dataQuality.isStale === true`。
 6. 该horizon对应周期自身的 `ethSnap[horizon].atr14` 无效（`null`、`undefined`、`NaN` 或 `≤0`）——ATR是§6价格区间半径、§7情景目标ATR外推、多个因子（`emaSlopeOwn`/`atrState`/`srDistance`）missing判定的共同基础，一旦无效，priceRange/scenarioTargets 无法生成任何有意义的数值，且此时按 `assessDataQuality`（`v1-core.js`）的定义 `sufficientForATR14===false`（`closed.length<15`），该周期本身就已经过短，不适合再给出任何方向或区间结论，因此直接判"数据不足"而不是让 §6/§7 静默回退成毫无意义的默认值。
@@ -697,9 +699,11 @@ V1.2 只需为以下字段预留结构和写入接口，**不实现**回放引�
 ```ts
 interface ForecastLogEntry {
   // ---- 0. 版本与可复现性元信息（新增，问题10核心诉求） ----
-  schemaVersion: string;             // 本interface自身的版本号，如 'v1.2-log-1'；interface字段增删时必须递增
-  forecastAlgorithmVersion: string;  // 对应 V1_2_FORECAST_SPEC.md 的版本号，如 'v1.2-draft-2'；§4-§9算法有任何行为变化时必须递增，见下方"版本号红线"
+  schemaVersion: string;             // 本interface自身的版本号，当前 'v1.2-log-2'；interface字段增删时必须递增
+  forecastAlgorithmVersion: string;  // 对应 V1_2_FORECAST_SPEC.md 的版本号，当前 'v1.2-draft-3'；§4-§9算法有任何行为变化时必须递增，见下方"版本号红线"
   factorWeightVersion: string;       // 对应 §4.2 权重表版本号，如 'v1.2-weights-1'；权重表数值变化时必须递增，独立于 forecastAlgorithmVersion（算法不变但只调权重时，只需升这个号）
+  algorithmVersion: string;          // forecastAlgorithmVersion的审计别名，blocked日志也必须存在
+  weightVersion: string;             // factorWeightVersion的审计别名，blocked日志也必须存在
   id: string;
   source: 'Binance';                 // 与 v1-core.js buildEnhancedLogEntry 的 source 字段口径一致，固定值
   symbol: 'ETHUSDT';                 // V1.2 预测面板固定针对 ETH/USDT，与 V1.1 pairs[0] 一致
@@ -708,9 +712,12 @@ interface ForecastLogEntry {
   horizon: '15m' | '1h' | '4h';
   dataAsOf: number;                   // = HorizonForecast.dataAsOf
   validUntil: number;                 // = HorizonForecast.validUntil
-  confirmedPrice: number;             // 该horizon对应周期快照的 confirmedPrice，复现§6/§7区间计算的基准点
-  atr14: number;                      // 该horizon对应周期快照的 atr14，复现§6/§7 ATR外推的半径基础
-  directionLabel: HorizonForecast['directionLabel'];
+  status: 'valid' | 'blocked' | 'blocked_by_v11';
+  blocked: boolean;
+  blockReasons: string[];
+  confirmedPrice: number | null;       // blocked审计固定为null
+  atr14: number | null;                // blocked审计固定为null
+  directionLabel: HorizonForecast['directionLabel'] | null; // blocked审计固定为null
   dataHealth: DecisionOutput['dataHealth'];   // 透传 decision.dataHealth，记录当时的数据健康度
   blockedByV11: boolean;               // = ForecastOutput.blockedByV11
   worthBetting: boolean;               // = ForecastOutput.executability.worthBetting
@@ -765,13 +772,17 @@ interface ForecastLogEntry {
 
 ### 12.3 写入函数
 
-写入函数（仿照 `v1-core.js` 中 `buildDecisionLogEntry`/`saveDecisionLog(entry, storage)` 的既有模式，`storage` 以参数注入而非硬编码 `window.localStorage`，便于Node测试传入mock storage）：`buildForecastLogEntry(forecast, horizonForecast, horizon)` 生成单个horizon的日志条目（每次成功刷新最多产出3条，`m15`/`h1`/`h4` 各一条，`horizonForecast===null` 时不产出该horizon的条目），`saveForecastLog(entry, storage)` 写入独立的 `localStorage` key `ethAlphaForecastLogs`（对照V1.1实际使用的 `ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11`，命名风格保持一致但key本身必须不同，避免互相污染/超限清空互相挤占）。手动模式（`isManual===true`）**不写入**预测日志，与V1.1决策日志规则完全一致；`directionLabel==='数据不足'` 的horizon**仍然写入**日志（`factorResults` 中missing因子照实记录，`directionWeights`/`priceRange`等为null），因为"这次没能给出预测"本身也是需要被V2统计覆盖率的历史事实，不能因为没有方向结论就假装这条记录不存在。
+写入函数（仿照 `v1-core.js` 中 `buildDecisionLogEntry`/`saveDecisionLog(entry, storage)` 的既有模式，`storage` 以参数注入而非硬编码 `window.localStorage`，便于Node测试传入mock storage）：`buildForecastLogEntry(forecast, horizonForecast, horizon, options?)` 生成单个horizon的日志条目，`saveForecastLog(entry, storage)` 写入独立的 `localStorage` key `ethAlphaForecastLogs`（对照V1.1实际使用的 `ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11`，命名风格保持一致但key本身必须不同，避免互相污染/超限清空互相挤占）。手动模式（`isManual===true`）**不写入**正式预测日志，与V1.1决策日志规则完全一致。
+
+正常预测写 `status='valid'`；数据不足、数据陈旧、关键周期缺失、预测失败或预测过期必须写 `status='blocked'`、`blocked=true`、非空 `blockReasons`、`dataHealth`、`dataAsOf`、`horizon`、`algorithmVersion`、`weightVersion`，且 `calibratedProbability=null`。blocked审计的 `directionLabel`、`directionWeights`、`priceRange`、`scenarioTargets`、`mostLikelyPath`、`confidence` 必须为null，`invalidation`与已失效K线引用必须为空集合，不能沿用上一条成功预测。唯一键仍由交易对、时窗、`dataAsOf`、算法版本和权重版本组成；同一键只保留一条，最多保存1500条。
 
 MFE（最大有利波动）/MAE（最大不利波动）、"是否先到目标还是先到失效位"的计算方法、Brier Score/方向准确率/区间覆盖率/校准曲线的具体统计公式，均属于V2范围，本文档不定义，只保证字段占位存在且命名到位，供V2直接读取而不需要改V1.2的日志schema。
 
 ---
 
 ## 13. UI 区域字段规范
+
+正式单文件HTML由 `work/build-v1.js` 从模板和两个核心模块生成。构建脚本的每个文本替换目标与 `/*__CORE__*/`、`/*__FORECAST__*/` 占位符都必须校验精确出现次数；目标缺失或重复时立即抛错并终止构建，禁止静默输出残缺HTML。
 
 新增中文区域标题："**走势预测与情景推演**"，作为独立的 `<article class="card span12">`（或拆分为3个 `span4` 子卡片，Codex任务中细化），置于V1.1现有面板下方，不得插入或穿插进V1.1现有卡片内部。
 

@@ -7,7 +7,7 @@ test('页面标题中文',()=>assert.match(html,/走势预测与情景推演/));
 test('规则型权重免责声明常驻',()=>assert.match(html,/规则型权重，尚未经过历史胜率校准/));
 test('三张预测卡标题',()=>{for(const x of ['未来15分钟','未来1小时','未来4小时'])assert.match(html,new RegExp(x))});
 test('规则区间措辞',()=>assert.match(html,/规则型预计波动区间/));
-test('置信度明确非胜率',()=>assert.match(html,/置信度（数据完整度评分，非胜率）/));
+test('置信度明确为规则代理且非准确率',()=>assert.match(html,/置信度（数据完整度与规则一致性代理评分，不是统计胜率或预测准确率）/));
 test('V1.1交易许可提示',()=>assert.match(html,/当前不满足V1\.1交易许可/));
 test('不值得下注并排区域',()=>assert.match(html,/forecastBetting/));
 test('页面合计四个脚本标签',()=>assert.equal((html.match(/<script(?:\s[^>]*)?>/g)||[]).length,4));
@@ -19,13 +19,19 @@ test('唯一市场数据暴露行存在',()=>assert.match(html,/cache=await C\.f
 test('预测监听既有事件',()=>assert.match(html,/addEventListener\('v11decision'/));
 test('失效包装清空预测',()=>assert.match(html,/previousInvalidateDashboard[\s\S]*clearForecast\(reason\)/));
 test('过期整体遮蔽',()=>assert.match(html,/预测已过期，等待刷新/));
-test('生产预测日志接线',()=>assert.match(html,/buildForecastLogEntry\(f,h,horizon\)[\s\S]*saveForecastLog\(entry,localStorage\)/));
+test('生产预测日志接线',()=>assert.match(html,/buildForecastLogEntry\(f,h,horizon,\{now\}\)[\s\S]*saveForecastLog\(entry,localStorage\)/));
+test('数据不足不再被生产日志路径跳过',()=>assert.doesNotMatch(html,/h\.directionLabel==='数据不足'\|\|now>h\.validUntil\)continue/));
+test('生产失效路径写blocked审计',()=>assert.match(html,/function writeFailureAudit[\s\S]*writeForecastLogs\(f,Date\.now\(\)\)/));
 test('手动模式不写预测日志',()=>assert.match(html,/function writeForecastLogs\(f,now\)\{if\(f\.isManual\)return/));
 test('日志错误非阻塞提示',()=>assert.match(html,/预测日志写入失败（不影响页面预测）/));
 test('新增区域无裸露英文路径枚举',()=>{const visible=html.replace(/<script(?:\s[^>]*)?>[\s\S]*?<\/script>/g,'').replace(/<style>[\s\S]*?<\/style>/g,'');for(const x of ['PULLBACK_THEN_UP','INSUFFICIENT_DATA','BREAKOUT_THEN_PULLBACK','RANGE_ROUND_TRIP'])assert.doesNotMatch(visible,new RegExp(x))});
 test('禁用交易宣传措辞',()=>{const v12=html.slice(html.indexOf('<section class="grid" id="forecastSection">'));assert.doesNotMatch(v12,/真实概率|真实胜率|胜率\s*\d|概率\s*\d+%|必涨|必跌|稳赚|保证盈利/)});
 test('v1-core冻结哈希',()=>assert.equal(crypto.createHash('sha256').update(fs.readFileSync(path.join(__dirname,'../v1-core.js'))).digest('hex'),'0a4d9e712859d79ecae592aacffe371abfba29a2c6b7b76119a68c49e0471a97'));
 test('模板包含预测核心占位',()=>assert.match(template,/\/\*__FORECAST__\*\//));
+const builder=require('../work/build-v1.js');
+test('构建替换目标缺失时失败',()=>assert.throws(()=>builder.replaceExact('abc','missing','x',1,'测试占位'),/构建替换失配/));
+test('构建替换目标重复时失败',()=>assert.throws(()=>builder.replaceExact('x-x','x','y',1,'测试占位'),/实际 2 处/));
+test('构建替换计数正确时成功',()=>assert.equal(builder.replaceExact('a-b','a','z',1,'测试占位'),'z-b'));
 function setup(throwSet=false){const ids=[...html.matchAll(/id="([^"]+)"/g)].map(x=>x[1]),listeners={};class El{constructor(id){this.id=id;this.textContent='';this.innerHTML='';this.className='';this.hidden=false;this.style={};} }const nodes=Object.fromEntries(ids.map(id=>[id,new El(id)]));let store={};const localStorage={getItem:k=>store[k]??null,setItem:(k,v)=>{if(throwSet){const e=Error('quota');e.name='QuotaExceededError';throw e}store[k]=String(v)},removeItem:k=>delete store[k]},document={getElementById:id=>nodes[id],addEventListener:(n,f)=>(listeners[n]||(listeners[n]=[])).push(f),dispatchEvent:e=>(listeners[e.type]||[]).forEach(f=>f(e))};const ctx={console,document,localStorage,setInterval(){},Date,Math,JSON,Number,Object,Array,String,RegExp,Promise};ctx.window=ctx;ctx.globalThis=ctx;ctx.ETHAlphaCore=C;ctx.invalidateDashboard=()=>{};const m=html.match(/<script data-v12="forecast-layer">([\s\S]*?)<\/script>/);vm.runInNewContext(m[1],ctx);return{ctx,nodes,localStorage,store,dispatch:d=>document.dispatchEvent({type:'v11decision',detail:d})}}
 const now=Date.now();function bars(tf,base=3000,dir=1){const ms=C.TF_MS[tf],a=[],end=Math.floor(now/ms)*ms-1;for(let i=0;i<120;i++){const openTime=end-(120-i)*ms+1,c=base+dir*i*.8+Math.sin(i*.8)*4,o=c-dir*.3,v=i>=117?220:100+i%7;a.push({openTime,open:o,high:Math.max(o,c)+2,low:Math.min(o,c)-2,close:c,volume:v,takerBuyVolume:v*(dir>0?.65:.35),closeTime:openTime+ms-1,isClosed:true})}const x=a.at(-1),prior=a.slice(0,-1);x.close=dir>0?Math.max(...prior.slice(-20).map(k=>k.high))+5:Math.min(...prior.slice(-20).map(k=>k.low))-5;x.open=x.close-dir*.3;x.high=Math.max(x.open,x.close)+1;x.low=Math.min(x.open,x.close)-1;a.push({openTime:x.openTime+ms,open:x.close,high:x.close+4,low:x.close-4,close:x.close+1,volume:30,takerBuyVolume:18,closeTime:x.closeTime+ms,isClosed:false});return a}
 function market(){return{eth:{tf15m:bars('15m',3000),tf1h:bars('1h',2900),tf4h:bars('4h',2700)},btc:{tf15m:bars('15m',60000),tf1h:bars('1h',59000),tf4h:bars('4h',57000)},partial:false,succeeded:['eth.tf15m','eth.tf1h','eth.tf4h','btc.tf15m','btc.tf1h','btc.tf4h'],failed:[]}}
@@ -38,7 +44,7 @@ test('同一收盘K线重复刷新不膨胀',()=>{h.dispatch(d);assert.equal(JSO
 test('三个horizon互不覆盖',()=>assert.deepEqual([...new Set(JSON.parse(h.localStorage.getItem(F.FORECAST_LOG_KEY)).map(x=>x.horizon))].sort(),['15m','1h','4h']));
 test('页面日志使用独立key',()=>assert.equal(h.localStorage.getItem('ethAlphaDecisionLogs'),null));
 test('手动观察事件不增加日志',()=>{const before=JSON.parse(h.localStorage.getItem(F.FORECAST_LOG_KEY)).length;h.dispatch({...d,isManual:true,worthBetting:false});assert.equal(JSON.parse(h.localStorage.getItem(F.FORECAST_LOG_KEY)).length,before);assert.match(h.nodes.forecast15m.innerHTML,/手动观察模式/)});
-test('数据失效事件不写有效日志',()=>{const h2=setup();h2.ctx.__lastMarketData=md;h2.dispatch({...d,dataHealth:'invalid'});assert.equal(h2.localStorage.getItem(F.FORECAST_LOG_KEY),null);assert.match(h2.nodes.forecast15m.innerHTML,/数据不足/)});
+test('数据失效事件写三条blocked审计且不写旧预测',()=>{const h2=setup();h2.ctx.__lastMarketData=md;h2.dispatch({...d,dataHealth:'invalid'});const logs=JSON.parse(h2.localStorage.getItem(F.FORECAST_LOG_KEY));assert.equal(logs.length,3);assert.ok(logs.every(x=>x.blocked&&x.status==='blocked'&&x.directionWeights===null&&x.priceRange===null&&x.scenarioTargets===null&&x.mostLikelyPath===null&&x.calibratedProbability===null));assert.match(h2.nodes.forecast15m.innerHTML,/数据不足/)});
 test('整体失效清除旧预测与引用',()=>{h.ctx.invalidateDashboard('模拟断网');assert.equal(h.ctx.__prevForecast,null);for(const id of ['forecast15m','forecast1h','forecast4h'])assert.match(h.nodes[id].textContent,/预测已失效/)});
 test('恢复后预测重建',()=>{h.ctx.__lastMarketData=md;h.dispatch(d);assert.match(h.nodes.forecast15m.innerHTML,/偏多权重/)});
 test('过期预测不残留数字',()=>{const f=F.buildForecast(md,d,null,now);h.ctx.renderForecast(f,Math.max(f.m15.validUntil,f.h1.validUntil,f.h4.validUntil)+1);for(const id of ['forecast15m','forecast1h','forecast4h']){assert.match(h.nodes[id].innerHTML,/预测已过期/);assert.doesNotMatch(h.nodes[id].innerHTML,/偏多权重\s*\d/)}});

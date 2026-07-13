@@ -1,6 +1,6 @@
 # V1_2_CODEX_IMPLEMENTATION_TASK.md — 给 Codex 的 V1.2「走势预测层」实现工单
 
-版本：v1.2-draft-2（随 `V1_2_FORECAST_SPEC.md` v1.2-draft-2 同步修订，修订原因见 `V1_2_FORECAST_SPEC.md` §16 变更记录，本文档不重复展开，只同步接口/签名/接线细节）
+版本：v1.2-draft-3（随 `V1_2_FORECAST_SPEC.md` v1.2-draft-3 同步修订）
 依据：`V1_2_FORECAST_SPEC.md`（算法真相来源，本文档只定义"怎么落地成代码"，不重复定义算法，任何算法细节冲突以该文档为准）+ 现有 `v1-core.js`（V1.1冻结核心，不可修改）。
 角色分工：本文档作者（Claude Code）负责本轮 V1.2 的架构设计与验收规范，**不编写正式业务代码**；Codex 负责实际编码；PROJECT_AUDIT.md / STRATEGY_SPEC.md / ACCEPTANCE_TESTS.md / V1_IMPLEMENTATION_REPORT.md / TEST_RESULTS.md 是 V1.1 的既有交付物，本轮不改动。
 
@@ -47,9 +47,9 @@
 - 因子5（`swingStructure`）missing判定必须是"`swingHighs.length<2` **或** `swingLows.length<2`"（逻辑或，不是draft-1错误的逻辑与），且 `status='ok'` 时必须覆盖 spec §4.4 列出的5类情形（两种单侧混合、单边缺失走missing、完整多头、完整空头），单测按5类各建一个fixture。
 - 因子7（`srDistance`）内部先调用 `C.buildSRZones(snapshot)` 取 `resistanceZones[0]`/`supportZones[0]`，再用 spec §6.0 定义的 `isValidZone(zone, side, confirmedPrice)` 做双边校验（任一侧无效或ATR无效即 `status='missing'`），校验通过后才调用 `C.calcPositionMetrics(confirmedPrice, s0, r0, atr14)`。`isValidZone` 作为模块内部小函数实现，签名与 spec §6.0 一致，同时供步骤4的价格区间/情景目标复用（不得写两份重复实现）。
 - 因子8（`volumeQuality`）签名为 `factorVolumeQuality(rawKlinesForTf, atr14, stateBias)`，`rawKlinesForTf` 取自 `marketData.eth[对应tf]`（该horizon自身周期的原始K线，不是15m），内部调用 `C.calcVolumeQuality(rawKlinesForTf, atr14, stateBias)`。方向判定严格按 spec 问题5的唯一阈值实现：`ratio>=1.2&&sustained===true&&takerBuyRatio>=0.55`→多头，`<=0.45`→空头，`0.45~0.55`或 `ratio<1.2`或 `!sustained`→`range=1`；`label==='unavailable'` 或 `takerBuyRatio===null`→`status='missing'`（不做保守方向猜测）。
-- 因子9（`btcAlignment3tf`）签名为 `factorBtcAlignment3tf(bias, btcSnapshotForHorizon, failedKeys, horizon)`，`failedKeys` 即 `marketData.failed`（真实格式 `'btc.tf15m'`等，见spec §10.4），函数内部按 `horizon` 映射到对应的 `'btc.'+tfKey`，命中则返回 `status='missing', hardMissing:true`，供 `buildHorizonForecast` 识别并触发 spec §5.2 条件3的整horizon降级。
+- 因子9（`btcAlignmentOwnTf`）签名为 `factorBtcAlignmentOwnTf(bias, btcSnapshotForHorizon, failedKeys, horizon)`，中文术语固定为“BTC对应周期联动”；`failedKeys` 即 `marketData.failed`（真实格式 `'btc.tf15m'`等，见spec §10.4），函数内部按 `horizon` 映射到对应的 `'btc.'+tfKey`，命中则返回 `status='missing', hardMissing:true`，供 `buildHorizonForecast` 识别并触发 spec §5.2 条件3的整horizon降级。
 - 因子10（`falseBreakoutRisk`）签名为 `factorFalseBreakoutRisk(ethSnapshotForHorizon, btcSnapshotForHorizon)`，内部直接调用 `C.falseBreakoutTier(ethSnapshotForHorizon, btcSnapshotForHorizon)` 得到该horizon**自己的**tier（不接受外部传入的 `tier` 字符串，防止调用方把15m的 `decision.falseBreakoutTier` 传给1h/4h这类误用——signature本身锁死这条红线）。
-- 因子12（`mtfConflict`）必须以因子1/2/3的**计算结果对象**为输入参数，不接受K线/快照作为输入（强制签名 `factorMtfConflict(f1, f2, f3)`），从函数签名层面锁死"不得重复读取原始数据"的红线。
+- 因子12（`timeframeAgreementProxy`）必须以因子1/2/3的**计算结果对象**为输入参数，不接受K线/快照作为输入（强制签名 `factorTimeframeAgreementProxy(f1, f2, f3)`）；中文术语固定为“三周期规则一致性代理”，明确不是统计准确率。
 - 自测：逐个因子写单元测试，用构造的 `AnalyzedSnapshot` fixture 覆盖"明确方向""震荡""missing"三种情况；因子2/3/5/7/8/9/10 额外覆盖本条目列出的专属边界（TRANSITION_WATCH三分支、swing五类、SR双边、成交量五档、BTC真实key、假突破逐周期）。
 
 ### 步骤3：实现权重表与归一化（spec §4.2、§5）
@@ -67,26 +67,27 @@
   ```
   dataCompleteness = 可用权重总和 / 100        // 0..1
   dominanceMargin   = (top - second) / 100      // 0..1，top/second见spec §5.4
-  agreementFactor   = mtfConflict因子的 (bull或bear或range中最大分量)   // 0..1，越接近1表示三周期越一致
+  agreementFactor   = timeframeAgreementProxy因子的 (bull或bear或range中最大分量) // 0..1，仅表示规则内部一致性代理
   score = round(100 × (dataCompleteness×0.4 + dominanceMargin×0.4 + agreementFactor×0.2))
   score 裁剪到 [0,100]
   label: score>=70→'高'；40<=score<70→'中'；<40→'低'
   ```
-- `explanation` 字段用模板字符串拼出三个分量的具体数值，便于人工审计（例如："数据完整度88%，方向领先优势22分，三周期一致性76%"）。
+- `explanation` 字段用模板字符串拼出三个分量的具体数值，并固定说明“三周期规则一致性代理指标不是统计胜率或预测准确率”。
 
 ### 步骤6：实现安全降级（spec §10 全部6条）与顶层 `buildForecast()` 编排
 - 严格按 spec §14 的"状态/标签优先级总表"实现判定顺序，不得调换。
 - `buildForecast()` 是唯一对外入口，内部按 15m→1h→4h 顺序分别跑一遍步骤2-5的流水线，任何一步的门槛判定失败都在该horizon层面截断，不影响其他horizon。
 
 ### 步骤7：实现预测日志接口（spec §12，已按问题10重写schema）
-- 三个版本号常量，模块顶部定义并导出：`SCHEMA_VERSION='v1.2-log-1'`、`FORECAST_ALGORITHM_VERSION='v1.2-draft-2'`、`FACTOR_WEIGHT_VERSION='v1.2-weights-1'`。后续任何修改 §4.1/§4.2/§5-§9 算法或权重表的提交，必须同步递增对应常量（spec §12.2版本号红线）。
-- `buildForecastLogEntry(forecast, horizonForecast, horizon)` + `saveForecastLog(entry, storage)`（`storage` 参数注入，签名对照 `v1-core.js` 现有 `saveDecisionLog(entry, storage)` 的既有模式），`localStorage` key 用 `ethAlphaForecastLogs`（对照V1.1实际使用的 `ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11`，**必须是不同的key**，避免存储互相覆盖或共用容量上限时互相挤占）。`forecast` 提供顶层字段（`generatedAt`/`blockedByV11`/`executability.worthBetting`），`horizonForecast` 提供该horizon自己的字段（`weights`/`priceRange`/`scenarioTargets`/`factors`/`dataAsOf`/`validUntil`等）。
+- 三个版本号常量，模块顶部定义并导出：`SCHEMA_VERSION='v1.2-log-2'`、`FORECAST_ALGORITHM_VERSION='v1.2-draft-3'`、`FACTOR_WEIGHT_VERSION='v1.2-weights-1'`。后续任何修改 §4.1/§4.2/§5-§9 算法或权重表的提交，必须同步递增对应常量（spec §12.2版本号红线）。
+- `buildForecastLogEntry(forecast, horizonForecast, horizon, options?)` + `saveForecastLog(entry, storage)` 使用独立key `ethAlphaForecastLogs`。正常预测写valid日志；数据不足、陈旧、关键周期缺失、预测失败和过期写blocked审计，并强制清空方向、权重、区间、目标、路径和置信度。blocked审计必须含 `status`/`blocked`/`blockReasons`/`dataHealth`/`dataAsOf`/`horizon`/`algorithmVersion`/`weightVersion`，`calibratedProbability`恒为null。
 - `factorResults` 字段必须完整写入该horizon全部12项 `ForecastFactorResult`（含 `status='missing'` 的因子，逐项 `id/status/bull/bear/range/weightMax/points/evidenceText`），不得只写摘要——这是本轮相对draft-1 `tripleTimeframeFeatures` 摘要式记录的核心修订，保证V2能独立复现当时的方向权重计算过程而不依赖当前代码版本。
 - `outcomeAfter1Bar`/`outcomeAfter4Bars`/`outcomeAfter16Bars` 三个字段**都要**产出结构（值恒为 `null`，等V2回填），字段命名与语义严格遵守 spec §12.1 的唯一定义：**固定15分钟为1个bar**，不随该条日志自身的 `horizon` 变化（`horizon='4h'` 的日志里 `outcomeAfter1Bar` 依然是"15分钟后"而不是"4小时后"）。实现中**不得**出现 `bar单位=horizon周期` 这类换算逻辑。
 - 其余 `brierScoreComponent`/`directionAccuracy`/`rangeCoverage`/`calibrationBucket`/`calibratedProbability` 字段一律写 `null`，**不实现**任何回填逻辑。
 - 手动模式（`decision.isManual===true`）不写日志，与V1.1现有 `if(d.isManual)return` 规则一致；`directionLabel==='数据不足'` 的horizon**仍然写入**日志（详见spec §12.3），不得跳过。
 
 ### 步骤8：UI 接线（不改现有三块脚本）
+- `work/build-v1.js` 的替换链必须通过统一的精确计数函数执行；任一目标或核心占位符缺失、重复时构建失败，并为缺失、重复和正常替换增加自动测试。
 - 在 `eth-dynamic-trading-dashboard.html` 现有 `</section>`（V1.1网格结束标签，具体定位以文件当前实际结构为准，Codex 实现时自行定位不猜测行号）之后，新增：
   ```html
   <section class="grid" id="forecastSection">
@@ -150,8 +151,8 @@
 
 ```js
 // ---- 版本常量（spec §12.2）----
-const SCHEMA_VERSION = 'v1.2-log-1';
-const FORECAST_ALGORITHM_VERSION = 'v1.2-draft-2';
+const SCHEMA_VERSION = 'v1.2-log-2';
+const FORECAST_ALGORITHM_VERSION = 'v1.2-draft-3';
 const FACTOR_WEIGHT_VERSION = 'v1.2-weights-1';
 
 // ---- 因子层（spec §4.1，每个因子一个函数，统一返回 ForecastFactorResult 但不含 weightMax；
@@ -167,10 +168,10 @@ function factorAtrState(snapshot: AnalyzedSnapshot, decisionStateBias: 'up'|'dow
 function isValidZone(zone: {lower:number,upper:number}|null, side: 'support'|'resistance', confirmedPrice: number) -> boolean   // spec §6.0，因子7与§6/§7区间生成共用同一份实现
 function factorSrDistance(snapshot: AnalyzedSnapshot) -> ...   // 内部调用 C.buildSRZones(snapshot) 取 r0/s0，isValidZone 双边校验后再调 C.calcPositionMetrics
 function factorVolumeQuality(rawKlinesForTf: Kline[], atr14: number|null, decisionStateBias: 'up'|'down'|'flat') -> ...   // 内部调用 C.calcVolumeQuality(rawKlinesForTf, atr14, decisionStateBias)，唯一阈值见spec问题5
-function factorBtcAlignment3tf(bias: 'up'|'down'|'flat', btcSnapshotForHorizon: AnalyzedSnapshot, failedKeys: string[], horizon: '15m'|'1h'|'4h') -> ...   // failedKeys 即 marketData.failed 真实格式；命中该horizon对应的 'btc.'+tf 时返回 status='missing', hardMissing:true
+function factorBtcAlignmentOwnTf(bias: 'up'|'down'|'flat', btcSnapshotForHorizon: AnalyzedSnapshot, failedKeys: string[], horizon: '15m'|'1h'|'4h') -> ...
 function factorFalseBreakoutRisk(ethSnapshotForHorizon: AnalyzedSnapshot, btcSnapshotForHorizon: AnalyzedSnapshot) -> ...   // 内部调用 C.falseBreakoutTier(ethSnapshotForHorizon, btcSnapshotForHorizon)，逐horizon独立调用，不接受外部传入的tier字符串
 function factorRangePosition(recentHigh20, recentLow20, confirmedPrice) -> ...
-function factorMtfConflict(f1, f2, f3) -> ...   // 只接受另外三个因子的结果对象，不接受快照
+function factorTimeframeAgreementProxy(f1, f2, f3) -> ...   // 只接受另外三个因子的结果对象，不接受快照
 
 // ---- 权重与归一化（spec §4.2、§5）----
 const FACTOR_WEIGHTS: Record<'15m'|'1h'|'4h', Record<string, number>>
@@ -184,7 +185,7 @@ function pickMostLikelyPath(directionLabel, ethSnapshotForHorizon: AnalyzedSnaps
 function buildInvalidationConditions(directionLabel, mostLikelyPath, snapshot, decision) -> InvalidationCondition[]
 
 // ---- 置信度与证据（spec 概念表#9、§9）----
-function computeConfidence(availableWeight, top, second, mtfConflictFactor) -> ConfidenceScore
+function computeConfidence(availableWeight, top, second, timeframeAgreementProxyFactor) -> ConfidenceScore
 function pickEvidence(directionLabel, factorResults) -> { supportingEvidence: string[], opposingEvidence: string[] }
 
 // ---- 编排（spec §11.2，marketData 是 fetchAllTimeframeKlines() 的原始返回结构，buildForecast 内部自行调用 analyzeKlines 派生 ethSnap/btcSnap）----
@@ -199,8 +200,8 @@ function saveForecastLog(entry: ForecastLogEntry, storage: Storage) -> void
 module.exports = {
   SCHEMA_VERSION, FORECAST_ALGORITHM_VERSION, FACTOR_WEIGHT_VERSION,
   factorTrend4h, factorStructure1h, factorStructure15m, transitionWatchSplit, factorEmaSlopeOwn, factorSwingStructure,
-  factorAtrState, isValidZone, factorSrDistance, factorVolumeQuality, factorBtcAlignment3tf, factorFalseBreakoutRisk,
-  factorRangePosition, factorMtfConflict, FACTOR_WEIGHTS, computeDirectionWeights,
+  factorAtrState, isValidZone, factorSrDistance, factorVolumeQuality, factorBtcAlignmentOwnTf, factorFalseBreakoutRisk,
+  factorRangePosition, factorTimeframeAgreementProxy, FACTOR_WEIGHTS, computeDirectionWeights,
   buildPriceRange, buildScenarioTargets, pickMostLikelyPath, buildInvalidationConditions,
   computeConfidence, pickEvidence, buildHorizonForecast, buildForecast,
   buildForecastLogEntry, saveForecastLog,
@@ -229,9 +230,10 @@ module.exports = {
 5. `V1_2_ACCEPTANCE_TESTS.md` 列出的全部验收用例逐条通过。
 6. 原有5个测试文件（`v1-tests.js`/`v11-tests.js`/`audit-fixes-tests.js`/`v11-ui-tests.js`/`third-review-tests.js`）通过数与 `TEST_RESULTS.md` 记录的101项完全一致，无新增失败。
 7. `node tests/live-rest-test.js` 仍能正常连接 Binance 并输出 `RESULT passed=8 failed=0`（网络环境允许的前提下）。
-8. 手动浏览器验证：正常模式、手动观察模式、模拟数据异常（如断网）三种场景下新面板行为均符合 `V1_2_FORECAST_SPEC.md` §10 的安全降级规则。
-9. 全文搜索 `git diff` 新增内容，不包含"真实概率""胜率XX%""必涨""必跌""稳赚""保证盈利"等禁用措辞（`V1_2_ACCEPTANCE_TESTS.md` T16 覆盖此项自动化检查）。
-10. 四份V1.2文档（本文档 + `V1_2_FORECAST_SPEC.md` + `V1_2_ACCEPTANCE_TESTS.md` + `V1_2_ARCHITECTURE_REVIEW.md`）与最终实现互相一致，字段名、函数名、枚举值逐一对得上。
+8. `node tests/v12-live-rest-test.js` 必须用真实Binance数据走 `fetchAllTimeframeKlines → buildDecision → buildForecast → 三时窗 → 日志写入/去重` 正式生产链，并与V1.1真实REST结果分开统计。
+9. 手动浏览器验证：正常模式、手动观察模式、模拟数据异常（如断网）三种场景下新面板行为均符合 `V1_2_FORECAST_SPEC.md` §10 的安全降级规则。
+10. 全文搜索 `git diff` 新增内容，不包含诱导性概率、必然涨跌或盈利承诺等禁用措辞（`V1_2_ACCEPTANCE_TESTS.md` T16 覆盖此项自动化检查）。
+11. 四份V1.2文档（本文档 + `V1_2_FORECAST_SPEC.md` + `V1_2_ACCEPTANCE_TESTS.md` + `V1_2_ARCHITECTURE_REVIEW.md`）与最终实现互相一致，字段名、函数名、枚举值逐一对得上。
 
 ---
 

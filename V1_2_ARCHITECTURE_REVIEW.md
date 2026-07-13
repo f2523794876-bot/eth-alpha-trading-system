@@ -1,6 +1,6 @@
 # V1_2_ARCHITECTURE_REVIEW.md — V1.2「走势预测层」架构复核与一致性核查
 
-版本：v1.2-draft-2（CEO对draft-1逐项复审后要求修订，本文档随其余三份文档同步重写，见第0节"CEO复审问题逐项关闭记录"）
+版本：v1.2-draft-3（独立复审3项P1与3项P2关闭版）
 角色：本文档是四份V1.2文档中的最后一份，职责是**核对前三份文档（`V1_2_FORECAST_SPEC.md`/`V1_2_CODEX_IMPLEMENTATION_TASK.md`/`V1_2_ACCEPTANCE_TESTS.md`）互相一致**，给出风险清单，并作为交给CEO/董事长复审的入口文档。本文档不新增算法规则，如发现三份文档之间的不一致，以 `V1_2_FORECAST_SPEC.md` 为准并在此记录、回去修正其余文档。
 
 **draft-1复审结论回顾**：CEO对draft-1的原文复审发现 P0 3项、P1 7项、测试问题2项（含测试质量总述），逐项编号1-13，判定"当前规范错误地把传给`C.buildDecision()`的`ethTf`/`btcTf`描述为`AnalyzedSnapshot`对象"等一系列与V1.1真实代码不符或内部不自洽的问题，要求"不写业务代码，只修订现有四份V1.2文档"。本轮（draft-2）逐项关闭，见下方第0节。
@@ -47,10 +47,10 @@
 | `atrState` | ATR波动状态 | ✓ | ✓（`factorAtrState`） | ✓（T8.1直接断言） | 一致 |
 | `srDistance` | 动态支撑压力距离 | ✓（`isValidZone`双边校验，§6.0） | ✓（`factorSrDistance`+`isValidZone`导出） | ✓（T25双边校验专项） | 一致 |
 | `volumeQuality` | 成交量质量 | ✓（唯一阈值，逐周期独立） | ✓（`factorVolumeQuality`，参数为该horizon自身原始K线） | ✓（T7.1/T7.2 + T24五档分周期专项） | 一致 |
-| `btcAlignment3tf` | BTC三周期联动 | ✓（真实failed key格式） | ✓（`factorBtcAlignment3tf`，含`failedKeys`/`horizon`参数） | ✓（T5.1 + T21六key矩阵） | 一致 |
+| `btcAlignmentOwnTf` | BTC对应周期联动 | ✓（真实failed key格式） | ✓（`factorBtcAlignmentOwnTf`，含`failedKeys`/`horizon`参数） | ✓（T5.1 + T21六key矩阵） | 一致，名称不再误示为一次汇总三个BTC周期 |
 | `falseBreakoutRisk` | 假突破风险 | ✓（逐horizon独立调用） | ✓（`factorFalseBreakoutRisk(ethSnap,btcSnap)`，不接受外部tier字符串） | ✓（T6.1 + T22逐周期12用例） | 一致 |
 | `rangePosition` | 区间位置 | ✓ | ✓（`factorRangePosition`） | 隐含于T3.1（区间40%-60%场景） | 一致 |
-| `mtfConflict` | 多周期方向冲突 | ✓ | ✓（`factorMtfConflict`，签名强制只接收因子1/2/3结果对象） | ✓（T4.1直接断言） | 一致 |
+| `timeframeAgreementProxy` | 三周期规则一致性代理 | ✓ | ✓（`factorTimeframeAgreementProxy`，签名强制只接收因子1/2/3结果对象） | ✓（T4.1直接断言） | 一致；代理指标不代表统计胜率或预测准确率 |
 
 ### 1.2 权重表（spec §4.2）纵向求和自查
 
@@ -80,7 +80,8 @@
 | 模块全局变量名 | `window.ETHAlphaCore` | `window.ETHAlphaForecast` | 不冲突 |
 | 自定义DOM事件名 | `v11decision` | 无新增（draft-2已明确：直接监听既有`v11decision`事件即可满足需求，去掉draft-1曾设想的`v12forecast`事件，"不重复造轮子"，见SPEC §11.3末段） | 不冲突（因为根本没有新增） |
 | `window` 上暴露的原始数据引用 | 无（V1.1不暴露原始K线到`window`） | `window.__lastMarketData`（`fetchAllTimeframeKlines()`原始返回值）、`window.__prevForecast`（上一次`ForecastOutput`或`null`） | 不冲突；取代draft-1中不存在的`window.__lastEthTf`/`__lastBtcTf`/`__lastFetchMeta`三变量方案 |
-| 测试文件命名 | `v1-tests.js`/`v11-tests.js`/`audit-fixes-tests.js`/`v11-ui-tests.js`/`third-review-tests.js`/`live-rest-test.js` | `v12-forecast-tests.js`/`v12-ui-tests.js` | 不冲突 |
+| 测试文件命名 | `v1-tests.js`/`v11-tests.js`/`audit-fixes-tests.js`/`v11-ui-tests.js`/`third-review-tests.js`/`live-rest-test.js` | `v12-forecast-tests.js`/`v12-ui-tests.js`/`v12-live-rest-test.js` | 不冲突；V1.2真实REST正式生产链单独统计 |
+| 单文件构建 | 原替换链无失配保护 | `replaceExact`校验每个目标和核心占位符的精确出现次数 | 缺失或重复立即失败，避免静默生成残缺HTML |
 | DOM id 前缀 | 现有约30个既有id（如`price`/`state`/`htf`等，见T19.5） | `forecast15m`/`forecast1h`/`forecast4h`/`forecastDisclaimer`/`forecastBlocked`/`forecastBetting` | 不冲突 |
 | 导出函数名 | `v1-core.js` §H列出的完整导出列表（`buildDecision`/`analyzeKlines`等） | `v1_2-forecast-core.js` 新导出的 `buildForecast`/`factorXxx`/`computeDirectionWeights`等 | 不冲突，且两个模块通过 `require`/`window.ETHAlphaCore` 单向依赖（V1.2依赖V1.1，反向不允许） |
 
