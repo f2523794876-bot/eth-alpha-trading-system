@@ -16,10 +16,13 @@ template=template
   .replace("${x.dataHealth} / ${x.worthBetting?'值得':'不下注'}", "${zhHealth[x.dataHealth]||x.dataHealth} / ${x.worthBetting?'值得':'不下注'}")
   .replace("function render(d){", "function render(d){if(d.dataHealth!=='normal'&&!d.isManual){window.invalidateDashboard?.(d.dataHealth==='delayed'?'数据陈旧或时间不同步':'关键周期缺失或数据失效',d);return;}document.querySelectorAll('.invalidated').forEach(n=>n.classList.remove('invalidated'));")
   .replace("$('score').textContent=d.score.total;", "$('score').textContent=d.score.overriddenByHardRule?'不可执行':d.score.effectiveTotal;")
-  .replace("d.isManual?'手动模式（近似值）：4h/1h不可用，实时建议已阻断。'", "d.isManual?'手动近似模式：4小时和1小时数据不可用，实时建议已阻断；结果只能作为近似参考，不属于实时交易建议。'")
+  .replace("$('worth').textContent=d.worthBetting?'值得（仍需风控）':'不值得';", "$('worth').textContent=d.isManual?'禁止参与':d.worthBetting?'值得（仍需风控）':'不值得';")
+  .replace("$('stop').textContent=fmt(d.stopLoss);$('targets').textContent=d.targets.map(fmt).join(' / ');", "$('stop').textContent=d.isManual?'手动模式不计算':fmt(d.stopLoss);$('targets').textContent=d.isManual?'手动模式不计算':d.targets.map(fmt).join(' / ');")
+  .replace("d.isManual?'手动模式（近似值）：4h/1h不可用，实时建议已阻断。'", "d.isManual?'手动观察模式：数据不完整，仅用于查看近似支撑压力，不生成交易建议。缺少完整K线、ATR、成交量和多周期确认，因此不计算止损、目标、盈亏比、仓位或加仓条件。'")
   .replace("prev={ltf:d.state,mtf:d.mtfState,htf:d.htfState};const log=C.buildDecisionLogEntry(d);d.decisionLogId=log.id;C.saveDecisionLog(log,localStorage);", "if(!d.isManual){prev={ltf:d.state,mtf:d.mtfState,htf:d.htfState};const log=C.buildDecisionLogEntry(d);d.decisionLogId=log.id;C.saveDecisionLog(log,localStorage);}")
   .replace("if(cache.partial)d.warnings.push('部分API失败：'+cache.failed.join(', '));render(d);", "if(cache.partial)throw Error('关键周期缺失：'+cache.failed.join(', '));render(d);")
   .replace("}catch(e){$('health').className='banner invalid';", "}catch(e){window.invalidateDashboard?.(e.message);$('health').className='banner invalid';")
+  .replaceAll('手动近似模式','手动观察模式')
   .replace("showLogs();}function showLogs()", "showLogs();document.dispatchEvent(new CustomEvent('v11decision',{detail:d}));}function showLogs()")
   .replace("showLogs();refresh();setInterval", "window.renderDashboard=render;showLogs();refresh();setInterval");
 const core=fs.readFileSync(path.join(root,'v1-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
