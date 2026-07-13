@@ -10,4 +10,7 @@ test('可见静态文本无新增英文枚举',()=>{const visible=h.replace(/<sc
 test('V1.1事件将决策传给增强界面',()=>assert.match(h,/CustomEvent\('v11decision'/));
 test('原生Canvas且无外部图表依赖',()=>{assert.match(h,/<canvas id="structureChart"/);assert.ok(!/<script[^>]+src=/.test(h));assert.ok(!/WebSocket|new WebSocket/.test(h))});
 test('清除日志绑定确认函数',()=>assert.match(h,/clearDecisionLogs\(localStorage,window\.confirm\)/));
+test('整体失败和部分周期失败统一失效DOM',()=>{assert.match(h,/cache\.partial\)throw Error/);assert.match(h,/catch\(e\)\{window\.invalidateDashboard/);assert.match(h,/d\.dataHealth!==\s*'normal'/);assert.match(h,/图表交易标记已清空/)});
+test('数据恢复移除失效遮罩并重建',()=>{assert.match(h,/querySelectorAll\('\.invalidated'\)/);assert.match(h,/render\(d\)/);assert.match(h,/v11decision/)});
+test('硬性否决界面不展示诱导高分',()=>{assert.match(h,/opportunityScores\.blocked\?'不可执行'/);assert.match(h,/已被硬性规则否决/)});
 console.log(`RESULT passed=${p} failed=${f}`);if(f)process.exitCode=1;
