@@ -14,10 +14,14 @@ template=template
   .replace("d.falseBreakoutTier;$('falseBreakout')", "zhTier[d.falseBreakoutTier]||d.falseBreakoutTier;$('falseBreakout')")
   .replace("`${d.volumeQuality.label} · ${d.volumeQuality.evidence.join(' · ')}`", "`${zhVolume[d.volumeQuality.label]||d.volumeQuality.label} · ${d.volumeQuality.evidence.join(' · ')}`")
   .replace("${x.dataHealth} / ${x.worthBetting?'值得':'不下注'}", "${zhHealth[x.dataHealth]||x.dataHealth} / ${x.worthBetting?'值得':'不下注'}")
-  .replace("function render(d){", "function render(d){if(d.dataHealth!=='normal'){window.invalidateDashboard?.(d.dataHealth==='delayed'?'数据陈旧或时间不同步':'关键周期缺失或数据失效',d);return;}document.querySelectorAll('.invalidated').forEach(n=>n.classList.remove('invalidated'));")
+  .replace("function render(d){", "function render(d){if(d.dataHealth!=='normal'&&!d.isManual){window.invalidateDashboard?.(d.dataHealth==='delayed'?'数据陈旧或时间不同步':'关键周期缺失或数据失效',d);return;}document.querySelectorAll('.invalidated').forEach(n=>n.classList.remove('invalidated'));")
+  .replace("$('score').textContent=d.score.total;", "$('score').textContent=d.score.overriddenByHardRule?'不可执行':d.score.effectiveTotal;")
+  .replace("d.isManual?'手动模式（近似值）：4h/1h不可用，实时建议已阻断。'", "d.isManual?'手动近似模式：4小时和1小时数据不可用，实时建议已阻断；结果只能作为近似参考，不属于实时交易建议。'")
+  .replace("prev={ltf:d.state,mtf:d.mtfState,htf:d.htfState};const log=C.buildDecisionLogEntry(d);d.decisionLogId=log.id;C.saveDecisionLog(log,localStorage);", "if(!d.isManual){prev={ltf:d.state,mtf:d.mtfState,htf:d.htfState};const log=C.buildDecisionLogEntry(d);d.decisionLogId=log.id;C.saveDecisionLog(log,localStorage);}")
   .replace("if(cache.partial)d.warnings.push('部分API失败：'+cache.failed.join(', '));render(d);", "if(cache.partial)throw Error('关键周期缺失：'+cache.failed.join(', '));render(d);")
   .replace("}catch(e){$('health').className='banner invalid';", "}catch(e){window.invalidateDashboard?.(e.message);$('health').className='banner invalid';")
-  .replace("showLogs();}function showLogs()", "showLogs();document.dispatchEvent(new CustomEvent('v11decision',{detail:d}));}function showLogs()");
+  .replace("showLogs();}function showLogs()", "showLogs();document.dispatchEvent(new CustomEvent('v11decision',{detail:d}));}function showLogs()")
+  .replace("showLogs();refresh();setInterval", "window.renderDashboard=render;showLogs();refresh();setInterval");
 const core=fs.readFileSync(path.join(root,'v1-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
 fs.writeFileSync(path.join(root,'eth-dynamic-trading-dashboard.html'),template.replace('/*__CORE__*/',core));
 console.log('built eth-dynamic-trading-dashboard.html');
