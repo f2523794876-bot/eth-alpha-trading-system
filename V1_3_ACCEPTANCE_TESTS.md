@@ -1,6 +1,6 @@
 # V1_3_ACCEPTANCE_TESTS.md — V1.3「模拟交易账户」验收测试规范
 
-版本：v1.3-draft-2（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-2 同步，对应CEO七项决策+三项统一规则）
+版本：v1.3-draft-3（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-3 同步；T1-T27为draft-2既有内容，本轮**零改动**，新增T28-T43对应SPEC §15「建议档案与影子验证」）
 依据：`V1_3_PAPER_TRADING_SPEC.md`（每条用例都标注对应章节）。所有测试**必须用构造好的合成K线/合成决策/合成预测对象跑**，不能只靠人工打开页面观察——沿用 `ACCEPTANCE_TESTS.md`/`V1_2_ACCEPTANCE_TESTS.md` 已确立的"合成数据优先"原则。
 
 **fixture真实性红线**：所有涉及 `decision`/`forecast`/`marketData` 字段的测试fixture，字段名和取值格式必须与 `v1-core.js buildDecision()`/`v1_2-forecast-core.js buildForecast()` 的真实返回结构逐字段一致。**禁止**测试自造一套近似结构让测试通过而生产代码实际收到的数据形状不同。
@@ -12,7 +12,12 @@
 node tests/v13-paper-trading-tests.js
 node tests/v13-ui-tests.js
 node tests/v13-live-rest-test.js
+node tests/v13-signal-archive-tests.js       # draft-3新增
+node tests/v13-signal-archive-ui-tests.js    # draft-3新增
+node tests/v13-signal-archive-live-rest-test.js  # draft-3新增
 ```
+
+**draft-3新增字段红线**：`SignalSnapshot`/`SignalEvent`/`ShadowResult`是全新数据结构，不存在字段重命名问题；但**禁止**测试把`ShadowResult`的`grossR`/`netR`/`realizedPnlDelta`等结果字段断言写入或影响`PaperAccount`/`PaperTrade`任何字段（T38专项验证该隔离红线）。
 
 ---
 
@@ -283,6 +288,177 @@ node work/build-v1.js   # 构建产物逐字节可复现，且新增的/*__PAPER
 
 ---
 
+## T28. 建议档案自动创建（对应SPEC §15.3八条件，draft-3新增）
+
+| 用例 | 断言 |
+|---|---|
+| T28.1 | 构造同时满足SPEC §15.3全部八条件的`decision`/`forecast`/`marketData` fixture，`recordSignalIfEligible`返回`{ok:true, signal}`，`signal`已写入`ethAlphaSignalArchive`，`lifecycleStatus==='RECORDED'`、`userActionStatus==='UNSEEN'`、`acknowledgedAt===null`、`linkedPaperTradeId===null` |
+| T28.2 | 新建`signal`的`decisionSnapshot`/`forecastSnapshot`/`btcStructureSnapshot`字段与传入的`decision`/`forecast`/`marketData.btc`逐字段深度相等（非引用相等，见T31深拷贝专项） |
+| T28.3 | `entryZone`/`triggerConditions`字段值与`decision.triggerPlans[decision.biasDirection]`对应字段完全一致 |
+| T28.4 | `riskRewardGross`/`riskRewardNet`取自`decision.triggerPlans[direction].riskReward.grossValue`/`.netValue`，**不等于**任何影子验证事后计算值（因为此时尚未发生影子验证） |
+| T28.5 | 不产生`SignalSnapshot`时（八条件任一不满足），既有`ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11`写入行为不受影响（draft-2/V1.1既有机制不因Signal Archive存在而改变） |
+
+## T29. 建议不进入正式档案的排除场景（对应SPEC §15.3红线，逐条构造反例）
+
+| 用例 | 断言 |
+|---|---|
+| T29.1 | `decision.opportunityScores.blocked===true`（其余条件均满足）：`recordSignalIfEligible`返回`{ok:false}`，不写入`ethAlphaSignalArchive` |
+| T29.2 | `decision.isManual===true`（手动观察模式）：同上拒绝，理由文案明确提及"手动观察模式" |
+| T29.3 | `decision.dataHealth!=='normal'`：同上拒绝 |
+| T29.4 | `decision.biasDirection==='long_caution'`（降级确信度，非完全可执行）：同上拒绝，理由文案说明"非可执行方向" |
+| T29.5 | `decision.worthBetting===false`：同上拒绝 |
+| T29.6 | `decision.stopLoss`/`decision.targets`/`decision.exitConditions`任一缺失或空数组：同上拒绝 |
+| T29.7 | 扫描`recordSignalIfEligible`函数体源码，断言创建判定表达式不引用`forecast.m15`/`h1`/`h4`/`directionLabel`等V1.2字段（同draft-2 T18.2先例，V1.2只能作快照证据） |
+
+## T30. `signalFingerprint`去重与版本规则（对应SPEC §15.4）
+
+| 用例 | 断言 |
+|---|---|
+| T30.1 | 同一`sourceConfirmedBarTime`、同一`direction`、同一指纹连续两次调用`recordSignalIfEligible`：第二次返回`{ok:true, signal, deduped:true}`，`ethAlphaSignalArchive`长度不变（不产生第二条记录） |
+| T30.2 | 新的已收盘K线到来但计划全部分量（方向/进场区/止损/目标/`riskRuleVersion`/`decisionAlgorithmVersion`）与该方向最新记录指纹相同：不创建新版本，返回已存在记录 |
+| T30.3 | 新的已收盘K线到来且止损或目标发生实质变化：创建新`SignalSnapshot`，`supersedesSignalId`指向被取代的上一条`signalId`，`ethAlphaSignalEvents`新增一条该旧`signalId`名下的`SUPERSEDED`事件 |
+| T30.4 | 构造价格分量因浮点噪声产生极小差异（差异小于`pricePrecision`取整精度）的两次计算：指纹相同，不误判为"实质变化"（验证§15.4取整后再拼接的红线） |
+| T30.5 | 构造`decision.price`（未收盘实时价）在同一根已收盘K线周期内多次跳动、但`sourceConfirmedBarTime`不变的场景：不产生新版本（验证"禁止用未收盘实时价格制造新建议"红线） |
+| T30.6 | 被取代的旧版本若当时仍处于`WAITING_TRIGGER`，其影子验证独立继续进行，最终仍正常判定出`TRIGGERED`/`EXPIRED_UNTRIGGERED`等结果，不因被取代而提前终止或从统计中消失 |
+
+## T31. 建议快照不可变性（对应SPEC §15.2红线）
+
+| 用例 | 断言 |
+|---|---|
+| T31.1 | 创建`signal`后，修改传入的原始`decision`/`forecast`/`marketData`对象某字段，断言`ethAlphaSignalArchive`中已存储的对应`SignalSnapshot`不受影响（同draft-2 T19.1深拷贝先例） |
+| T31.2 | 创建后调用任意生命周期推进/用户行为标记函数（`evaluateShadowSignals`/`markSignalSeen`/`linkSignalToPaperTrade`等），断言`ethAlphaSignalArchive`中该`signalId`对应记录的`lifecycleStatus`/`acknowledgedAt`/`linkedPaperTradeId`/`userActionStatus`四个字段**原始存储值**始终分别保持`'RECORDED'`/`null`/`null`/`'UNSEEN'`不变（红线，验证"投影不回写原始数组"设计） |
+| T31.3 | 同一场景下，`getSignalCurrentView(signalId)`返回的**合并视图**里，以上四个字段确实反映了最新状态（与T31.2的原始存储值形成对照，证明"不可变存储+可变投影"两层机制都工作正常） |
+| T31.4 | `ethAlphaShadowResults`中对应`signalId`的记录**允许**被新的评估结果覆盖更新（验证这是本文档唯一允许覆写的存储，与`ethAlphaSignalArchive`/`ethAlphaSignalEvents`的不可变/追加式约束形成对照） |
+| T31.5 | `verifySignalArchiveIntegrity`对未被篡改的`ethAlphaSignalArchive`返回`{ok:true, mismatches:[]}`；人为篡改测试环境下存储的某条记录后调用，返回该条记录的不一致清单 |
+
+## T32. 建议生命周期状态机全转换覆盖（对应SPEC §15.5）
+
+| 用例 | 断言 |
+|---|---|
+| T32.1 | 逐条覆盖SPEC §15.5转换表列出的**每一行**转换 |
+| T32.2 | 断言纯函数状态机对"当前状态不允许该事件"的组合返回明确拒绝而不是抛出异常或静默忽略 |
+| T32.3 | 断言全部终态（`COMPLETED`/`STOPPED`/`EXPIRED_UNTRIGGERED`/`INVALIDATED_BEFORE_ENTRY`/`CANCELLED_BY_RULE_CHANGE`）不可再转换到任何非终态（红线，CEO原文"不允许完成状态重新变回等待状态"） |
+| T32.4 | `UNRESOLVED_DATA_GAP`离开该状态只能前进到"按回补K线继续判定所得出的状态"，不允许倒退到进入该状态前更早的生命周期阶段 |
+
+## T33. 影子撮合规则：进场区触及、同K线冲突、跳空（对应SPEC §15.6）
+
+| 用例 | 断言 |
+|---|---|
+| T33.1 | **红线**：构造包含`openTime<=sourceConfirmedBarTime`的K线与`isClosed===false`的K线混入待评估数据，断言`evaluateShadowSignals`完全不使用这些K线参与任何判定（防未来数据泄漏专项） |
+| T33.2 | 多头：构造`bar.low<=entryZone.upper`的已收盘K线，断言`lifecycleStatus`转`TRIGGERED`，`entryFillPrice===entryZone.estimatedEntry` |
+| T33.3 | 空头对称验证 |
+| T33.4 | **同一根K线同时触发进场和止损**：构造`bar.low<=entryZone.upper`且同一根`bar.low<=stopLoss`，断言最终`lifecycleStatus==='STOPPED'`（不停留在`TRIGGERED`），CEO"进场后止损"规则专项 |
+| T33.5 | **同一根K线同时触及止损和目标（已处于TRIGGERED之后）**：构造`bar.low<=stopLoss && bar.high>=targets[0]`（多头），断言只产生`STOPPED`结果，不产生`TARGET_1_HIT` |
+| T33.6 | 跳空止损：构造`bar.open`已越过`stopLoss`的K线，断言止损成交基准价为`bar.open`而非原`stopLoss`本身，且叠加不利滑点 |
+| T33.7 | 有利跳空穿过目标位：断言目标成交价仍按计划目标价（扣减滑点）计算，不采用更有利的跳空开盘价 |
+| T33.8 | 未触及进场区但已越过止损（跳空穿过整个进场区与止损）：断言转`INVALIDATED_BEFORE_ENTRY`，不产生任何"进场后止损"的假设成交 |
+
+## T34. 未触发过期与触发前失效（对应SPEC §15.5/§15.11）
+
+| 用例 | 断言 |
+|---|---|
+| T34.1 | 构造有效期内全部已收盘K线均未触及`entryZone`，且最新已收盘K线`closeTime>validUntil`：断言`lifecycleStatus==='EXPIRED_UNTRIGGERED'` |
+| T34.2 | `EXPIRED_UNTRIGGERED`结果**不计算**`grossR`/`netR`/MFE/MAE（均为`null`），且不被`computeSignalAccuracyStats`的触发后胜负率分母计入（与T40互证） |
+| T34.3 | 触发前价格越过`stopLoss`（未触及进场区）：断言`lifecycleStatus==='INVALIDATED_BEFORE_ENTRY'`，同样不计算R值 |
+| T34.4 | **红线**：`validUntil`创建后不因任何后续调用被修改（构造尝试传入"事后调整"的路径，断言不存在这样的函数/参数，或存在也返回拒绝） |
+| T34.5 | `SIGNAL_DEFAULT_VALIDITY_MS`硬编码断言等于`TF_MS['4h']`（14400000），版本校验测试使用独立硬编码基准值，不从运行时对象自证式反算（同draft-2 T14.5/`V1_3_PAPER_TRADING_SPEC.md`§12"不得自证式反算"先例） |
+
+## T35. 目标1/2/3与止损结果判定（对应SPEC §15.5/§15.6）
+
+| 用例 | 断言 |
+|---|---|
+| T35.1 | 依次构造触及`targets[0]`/`targets[1]`/`targets[2]`的已收盘K线序列，断言`lifecycleStatus`依次经过`TRIGGERED→TARGET_1_HIT→TARGET_2_HIT→TARGET_3_HIT→COMPLETED` |
+| T35.2 | **红线**：`TARGET_1_HIT`之后构造一根触及原始`stopLoss`（而非任何"移动止损"价位）的K线，断言转`STOPPED`——专项验证§15.5"不模拟移动止损"设计决定，即使假设性地在同一场景下用draft-2式移动止损价位计算会得出不同结果，本测试断言系统使用的是`SignalSnapshot.stopLoss`原始冻结值 |
+| T35.3 | `TARGET_3_HIT`到`COMPLETED`的转换不需要额外事件，达到`targets[2]`立即为`COMPLETED`终态 |
+
+## T36. MFE/MAE与毛R/净R计算（对应SPEC §15.6公式）
+
+| 用例 | 断言 |
+|---|---|
+| T36.1 | 构造具体数值场景，逐项代入SPEC §15.6公式验证`MFE`/`MAE`计算结果（多头/空头各一组，含浮点误差极小容差） |
+| T36.2 | 逐项代入`grossR = (exitPrice-entryFillPrice)/risk`（多头）验证结果 |
+| T36.3 | 逐项代入净R公式（含`feeAssumption`/`slippageAssumption`双边调整）验证结果，与`grossR`结果比较，断言`netR`严格劣于`grossR`（净值总是因成本假设而变差，同一盈利结果下净R小于毛R；同一亏损结果下净R比毛R更差） |
+| T36.4 | `barsHeld`/`durationMs`按SPEC §15.6公式计算，逐项验证 |
+| T36.5 | `EXPIRED_UNTRIGGERED`/`INVALIDATED_BEFORE_ENTRY`的`grossR`/`netR`/MFE/MAE/`barsHeld`/`durationMs`全部为`null`（与T34.2互证） |
+
+## T37. 影子验证数据缺口（对应SPEC §15.7）
+
+| 用例 | 断言 |
+|---|---|
+| T37.1 | 构造数据失效期间的缺失K线，恢复后完整覆盖缺口（`openTime`序列连续）：断言按§15.6规则逐根顺序回放，`ShadowDataGap.resolvedAt`被设置，`lifecycleStatus`恢复为回放前对应状态并继续判定 |
+| T37.2 | 无法完整回补：`replayAttempts`新增`STILL_GAP`记录，`lifecycleStatus`维持`UNRESOLVED_DATA_GAP`，`ShadowResult.verified===false`，**不产生**任何猜测性的胜负判定 |
+| T37.3 | **红线**：扫描Signal Archive全部导出函数，断言不存在任何"用户确认强制结算/估算收敛"路径（与draft-2`confirmConservativeSettlement`刻意不对称，验证§15.7"没有人工出口"红线） |
+| T37.4 | `UNRESOLVED_DATA_GAP`可以无限期保持（构造超长时间跨度仍未回补的场景），不因超时被强制转为任何终态 |
+
+## T38. 影子验证与模拟账户资金隔离（对应SPEC §15.0红线，本轮最高优先级测试）
+
+| 用例 | 断言 |
+|---|---|
+| T38.1 | 构造一个完整的`TARGET_3_HIT→COMPLETED`盈利影子验证场景，运行前后对比`ethAlphaPaperAccount`（`equity`/`cash`/`marginUsed`/`realizedPnlGross`等全部字段）逐字节不变 |
+| T38.2 | 同上构造一个`STOPPED`亏损影子验证场景，同样验证`PaperAccount`零变化 |
+| T38.3 | 扫描`evaluateShadowSignals`/`computeSignalAccuracyStats`等全部Signal Archive导出函数源码，断言不存在对`ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog`的任何写操作（`localStorage.setItem`/`storage.setItem`调用目标key白名单校验） |
+| T38.4 | 断言`evaluateShadowSignals`不产生任何`PaperPosition`/`PaperFill`对象，不调用`v1_3-paper-trading-core.js`的任何写操作型导出函数（`confirmOpenPosition`等） |
+
+## T39. 用户行为关联与执行对比（对应SPEC §15.9）
+
+| 用例 | 断言 |
+|---|---|
+| T39.1 | `markSignalSeen`后`getSignalCurrentView`返回的`userActionStatus`变为`'SEEN'`，`acknowledgedAt`投影值被设置；原始`ethAlphaSignalArchive`记录不变（与T31.2互证） |
+| T39.2 | 用户点击模拟开仓并携带`signalId`：`confirmOpenPosition`成功后，`ethAlphaSignalEvents`新增`LINKED_PAPER_TRADE`事件，`getSignalCurrentView`返回的`linkedPaperTradeId`等于新建`PaperTrade.tradeId`，`userActionStatus`变为`'ACCEPTED'` |
+| T39.3 | 构造建议进入终态（非`EXPIRED_UNTRIGGERED`）时仍为`UNSEEN`/`SEEN`的场景：断言系统自动追加`MISSED`事件，`userActionStatus`变为`'MISSED'`，且这是唯一不需要用户点击就能改变该字段的路径（专项注释/断言区分于其余需要真实点击的路径） |
+| T39.4 | 用户点击"不采用该建议"：`userActionStatus`变为`'REJECTED'` |
+| T39.5 | 关联后，`getSignalCurrentView`同时暴露`entryZone.estimatedEntry`（建议理论进场价）与关联`PaperTrade.entryPrice`（模拟账户真实成交价）两个独立字段，断言两者不被互相覆盖或平均，即使数值不同 |
+
+## T40. 准确度统计口径与分组（对应SPEC §15.8，分母规则专项）
+
+| 用例 | 断言 |
+|---|---|
+| T40.1 | `computeSignalAccuracyStats`返回对象包含SPEC §15.8表格列出的**全部**独立指标字段，**不**只返回一个笼统的"准确率"字段 |
+| T40.2 | **分母红线1**：构造包含若干`EXPIRED_UNTRIGGERED`记录的数据集，断言"触发后止损率"/"目标123到达率"的分母不包含这些记录（分母仅统计已触发数） |
+| T40.3 | **分母红线2**：构造包含`UNRESOLVED_DATA_GAP`/`verified===false`记录的数据集，断言这些记录不计入任何比率类指标的分子分母，只在"数据缺口导致无法验证的数量"单独出现 |
+| T40.4 | **分母红线3**：混合构造`estimated`概念对应的场景（若关联了draft-2保守结算的`PaperTrade`，Signal Archive层面该signal本身仍以自己的`ShadowResult.verified`为准，不因关联的`PaperTrade.estimated===true`而受影响，两者是独立判定），断言Signal Archive统计口径只依赖自身`ShadowResult.verified`字段 |
+| T40.5 | 多头/空头分组：构造两个方向各若干条记录，断言分组统计数值正确且总和与不分组统计一致 |
+| T40.6 | 按`decisionSnapshot.state`（V1.1市场状态六态）分组统计正确 |
+| T40.7 | 按`forecastSnapshot.m15/h1/h4.directionLabel`分组，`forecastSnapshot===null`的记录归入独立"无预测快照"分组，不丢弃 |
+| T40.8 | 按`decisionSnapshot.btcAlignment`（支持/反对/中性）分组统计正确 |
+| T40.9 | 用户执行/用户错过/用户主动放弃数量按当前`userActionStatus`投影值正确计数 |
+| T40.10 | "系统建议正确但用户错过"数量：构造`userActionStatus==='MISSED'`且`lifecycleStatus`为目标命中类终态的记录，断言被正确计数 |
+| T40.11 | **红线**：`computeSignalAccuracyStats`输出对象包含固定字段`statisticsBasis==='FORWARD_RULE_BASED_SHADOW_EVALUATION'`；扫描相关文案/导出内容，断言不出现"校准""概率""预测准确度保证"等措辞 |
+
+## T41. 存储、迁移、损坏恢复、容量与导出安全（对应SPEC §15.10）
+
+| 用例 | 断言 |
+|---|---|
+| T41.1 | `ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults`任一存储损坏JSON，安全恢复为空数组，不抛出异常 |
+| T41.2 | 容量超限（构造超过2000条记录）：断言只裁剪最旧记录，新记录保留 |
+| T41.3 | `migrateSignalArchive`对未知/过期`schemaVersion`的历史数据按默认值重建并留下可审计记录 |
+| T41.4 | `exportSignalArchiveJSON`产出合法可被`JSON.parse`还原的字符串 |
+| T41.5 | `exportSignalArchiveCSV`对含`=`/`+`/`-`/`@`开头的字段值正确转义，复用`C.csvCell`（同draft-2 T15.2先例） |
+| T41.6 | 导出函数不修改传入的原始数据（纯函数，无副作用） |
+| T41.7 | 删除某`signalId`对应的`SignalSnapshot`后（理论上不应发生，容量裁剪除外），断言`ethAlphaShadowResults`中对应的孤儿记录被一并清理，不残留 |
+
+## T42. 清空建议历史二次确认且不触碰模拟账户（对应SPEC §15.10红线）
+
+| 用例 | 断言 |
+|---|---|
+| T42.1 | 第一次点击只弹出确认，不清空任何数据 |
+| T42.2 | 第二次显式确认后，`ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults`三个key全部清空 |
+| T42.3 | `resetSignalArchive`未提供`idempotencyKey`则拒绝执行 |
+| T42.4 | **红线**：构造一个存在若干`OPEN`/`EXITED`状态`PaperTrade`（含`linkedPaperTradeId`指向它们的`SignalSnapshot`）的场景，调用`resetSignalArchive`确认清空后，断言`ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog`三者逐字节不变，`PaperTrade`记录本身完整保留（只是失去了指向它们的建议档案索引） |
+
+## T43. V1.1/V1.2/V1.3既有测试回归（红线，追加于draft-2 T27，不允许更改被测文件本身）
+
+必须在draft-2 T27既有命令基础上，额外重新执行以下命令，全部保持通过，**不得修改**这些测试文件的既有内容：
+
+```
+node tests/v13-paper-trading-tests.js
+node tests/v13-ui-tests.js
+node tests/v13-live-rest-test.js
+node work/build-v1.js   # 构建产物逐字节可复现，新增的/*__SIGNAL_ARCHIVE_UI__*//*__SIGNAL_ARCHIVE__*/占位符不破坏既有全部占位符替换
+```
+
+---
+
 ## 测试类别数量汇总
 
 | 类别 | 用例组数 |
@@ -314,6 +490,24 @@ node work/build-v1.js   # 构建产物逐字节可复现，且新增的/*__PAPER
 | T25 estimated交易排除于验证统计 | 3 |
 | T26 风险预算恒以当前净值为基准 | 3 |
 | T27 V1.1/V1.2回归（既有测试文件重跑，不计入新增用例数） | 10个既有命令 |
-| **新增用例组合计（T1-T26）** | **118** |
+| **draft-2新增用例组合计（T1-T26）** | **118** |
+| T28 建议档案自动创建 | 5 |
+| T29 建议不进入正式档案的排除场景 | 7 |
+| T30 signalFingerprint去重与版本规则 | 6 |
+| T31 建议快照不可变性 | 5 |
+| T32 建议生命周期状态机全转换覆盖 | 4 |
+| T33 影子撮合规则（进场区/同K线冲突/跳空） | 8 |
+| T34 未触发过期与触发前失效 | 5 |
+| T35 目标1/2/3与止损结果判定 | 3 |
+| T36 MFE/MAE与毛R/净R计算 | 5 |
+| T37 影子验证数据缺口 | 4 |
+| T38 影子验证与模拟账户资金隔离 | 4 |
+| T39 用户行为关联与执行对比 | 5 |
+| T40 准确度统计口径与分组（分母规则） | 11 |
+| T41 存储/迁移/损坏恢复/容量/导出安全 | 7 |
+| T42 清空建议历史二次确认且不触碰模拟账户 | 4 |
+| **draft-3新增用例组合计（T28-T42）** | **83** |
+| T43 V1.1/V1.2/V1.3既有回归（追加于T27，不计入新增用例数） | 4个既有命令 |
+| **累计用例组合计（T1-T42）** | **201** |
 
-（draft-1为85条，draft-2新增/扩展33条，主要来自：T1/T5/T6/T7/T8/T9/T11/T14/T15/T16细化，以及全新的T22-T26。"用例组"指本文档表格中的一行，实际实现时单个用例组可能展开为多条`assert`。）
+（draft-1为85条，draft-2新增/扩展33条（T1-T26合计118条），主要来自：T1/T5/T6/T7/T8/T9/T11/T14/T15/T16细化，以及全新的T22-T26；draft-3新增83条（T28-T42），对应SPEC §15「建议档案与影子验证」，累计201条。"用例组"指本文档表格中的一行，实际实现时单个用例组可能展开为多条`assert`。回归命令（T27/T43）不计入用例组数量，是对既有测试文件的重新执行要求。）

@@ -1,9 +1,10 @@
 # V1_3_PAPER_TRADING_SPEC.md — ETH Alpha V1.3「真实行情模拟交易系统」算法与数据规范
 
-版本：v1.3-draft-2（CEO对draft-1的七项决策+三项统一规则已逐条落地，修订摘要见§14变更记录）
-角色：本文档只做 V1.3「模拟交易账户」的**架构设计与验收规范**，不是实现代码，也不由本文档作者实现正式业务代码。
-基准：main 分支 `v1.2.0` 标签（提交 `0dc1943`），本文档在 V1.1（`v1-core.js`，冻结）与 V1.2（`v1_2-forecast-core.js`，冻结）之上做**纯叠加**，不修改、不重写两者已验收的任何函数或算法。
+版本：v1.3-draft-3（在draft-2「模拟交易账户」基础上，新增CEO本轮需求「建议档案与影子验证」，见§15；draft-2的§0-§14模拟账户规则本轮**零改动**）
+角色：本文档只做 V1.3「模拟交易账户」+「建议档案与影子验证」的**架构设计与验收规范**，不是实现代码，也不由本文档作者实现正式业务代码。
+基准：main 分支 `v1.2.0` 标签（提交 `0dc1943`），本文档在 V1.1（`v1-core.js`，冻结）与 V1.2（`v1_2-forecast-core.js`，冻结）之上做**纯叠加**，不修改、不重写两者已验收的任何函数或算法。draft-3新增内容额外基准提交 `36c45d27efde8efc2fd3004b3889bd9eeda90eb5`（draft-2）。
 唯一算法真相来源声明：本文档是 V1.3 模拟交易算法的唯一 source of truth。`V1_3_CODEX_IMPLEMENTATION_TASK.md` 的函数接口必须实现本文档定义的行为；`V1_3_ACCEPTANCE_TESTS.md` 的用例必须验证本文档定义的规则；`V1_3_ARCHITECTURE_REVIEW.md` 负责核对三者与 V1.1/V1.2/STRATEGY_SPEC.md 的一致性。四份文档如有冲突，以本文档为准。
+**三套系统边界声明（draft-3新增，红线）**：V1.3自本版本起包含三套严格分离的系统——① §2-§8「模拟账户 Paper Trading Account」（只有用户点击确认才建立仓位、才产生账户资金变化）；② §15「建议档案 Signal Archive」（系统给出可执行建议时自动、无条件冻结存档，不需要用户点击）；③ §15.6-§15.8「影子验证 Shadow Evaluation」（使用建议之后的真实已收盘K线客观验证建议表现，**不建立模拟仓位、不使用模拟保证金、不改变500 USDT账户任何字段**）。三者共享同一份V1.1/V1.2只读输入，但存储命名空间、状态机、资金语义完全独立，**任何实现都不得把影子验证产生的假设盈亏写入`PaperAccount`/`PaperTrade`任何字段**。
 
 **常驻免责声明（强制，任何页面状态下都必须可见，见§10）**：`模拟交易，不是真实下单，不连接交易所账户。`
 
@@ -714,3 +715,354 @@ PAPER_ALGORITHM_VERSION = 'v1.3-draft-2'
   8. 当日亏损锁定改为UTC自然日+确定性`dailyStartEquity`重建公式，UI同时显示UTC与本地时间（§5.3）。
   9. 账户会计字段重命名并明确公式：`equity`/`cash`/`availableBalance`（=`equity-marginUsed`，非`cash-marginUsed`）/`marginUsed`/`realizedPnlGross`/`unrealizedPnl`/`feesTotal`/`slippageCostReport`（§2.2）。
   10. 引入统一的`idempotencyKey`机制，覆盖开仓/加仓/减仓/平仓/重置全部五种操作，具备真正的幂等重放语义（§6.11）。
+- v1.3-draft-3（本版本）：新增CEO需求「建议档案与影子验证」（§15）——系统给出可执行建议时无论用户是否点击都自动、不可变地存档（`SignalSnapshot`），并使用建议产生**之后**的真实已收盘K线做只读影子验证，与§2-§8「模拟账户」严格资金隔离。§0-§14「模拟账户」规则本轮零改动，`PAPER_ALGORITHM_VERSION`保持`v1.3-draft-2`不变（理由见§15.14）。
+
+---
+
+## 15. 建议档案与影子验证 Signal Archive & Shadow Evaluation（draft-3新增，CEO本轮需求）
+
+### 15.0 与§2-§8「模拟账户」的边界（红线，逐条对应CEO本轮"一、严格区分三套系统"）
+
+| 系统 | 触发条件 | 是否需要用户点击 | 是否产生账户资金变化 | 存储命名空间 |
+|---|---|---|---|---|
+| ① 建议档案 Signal Archive | 系统给出可执行建议时（§15.3八条件同时满足） | **不需要**——自动记录，用户看没看到都会存档 | 否，无`equity`/`cash`概念 | `ethAlphaSignalArchive`/`ethAlphaSignalEvents`（§15.10） |
+| ② 影子验证 Shadow Evaluation | 建议档案存在后，随后续已收盘K线自动评估 | **不需要**——纯只读评估，不接受任何用户输入来改变评估结果本身 | **否，红线**：不建立`PaperPosition`、不占用`marginUsed`、不产生`PaperFill`、不改变`PaperAccount`任何字段 | `ethAlphaShadowResults`（§15.10） |
+| ③ 模拟账户 Paper Trading Account（§2-§8，draft-2） | 用户点击"确认开仓"等操作 | **需要**——`confirmOpenPosition`等函数要求真实点击事件+`idempotencyKey` | 是——`cash`/`equity`/`marginUsed`按§2.2恒等式变化 | `ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog`（§9） |
+
+**红线**：任何函数如果同时读写`ethAlphaShadowResults`与`ethAlphaPaperAccount`/`ethAlphaPaperTrades`，或把`ShadowResult`的`realizedGrossR`/`realizedNetR`按某种换算写入`PaperAccount.realizedPnlGross`/`cash`等字段，视为违反本节红线，`V1_3_ACCEPTANCE_TESTS.md` T38专项验证资金隔离。三套系统之间唯一允许的合法关联，是§15.9定义的`linkedPaperTradeId`**指针**（只记录"哪条建议对应用户后来点了哪笔模拟交易"，不做任何数值换算或回写）。
+
+### 15.1 新增术语与localStorage命名空间总览
+
+| # | 术语 | 定义 | 归属 |
+|---|---|---|---|
+| 14 | 建议快照 SignalSnapshot | 系统在某一时刻真实给出的可执行建议的不可变存档记录 | draft-3新增，§15.2 |
+| 15 | 建议指纹 signalFingerprint | 用于去重与版本判定的稳定标识 | draft-3新增，§15.4 |
+| 16 | 建议生命周期 SignalLifecycleStatus | 建议从产生到最终结果的状态机 | draft-3新增，§15.5 |
+| 17 | 影子撮合 Shadow Match | 只读地用后续已收盘K线判定建议是否触发进场/止损/目标 | draft-3新增，§15.6 |
+| 18 | 影子结果 ShadowResult | 影子撮合产生的、可能随新K线到来而更新的当前评估投影 | draft-3新增，§15.6/§15.10 |
+| 19 | 建议事件 SignalEvent | 记录建议生命周期变化、用户行为变化、关联关系变化的追加式审计条目 | draft-3新增，§15.10 |
+
+命名空间：
+
+| Key | 内容 | 类型 |
+|---|---|---|
+| `ethAlphaSignalArchive` | `SignalSnapshot[]`（创建后不可变） | Array |
+| `ethAlphaSignalEvents` | `SignalEvent[]`（只能`push`，审计追加式） | Array |
+| `ethAlphaShadowResults` | `ShadowResult[]`（每个`signalId`至多一条，允许被评估流程**覆盖更新**，是唯一允许覆写的存储——因为它是投影/缓存，不是原始记录，见§15.2红线的例外说明） | Array（按`signalId`唯一） |
+
+### 15.2 `SignalSnapshot` 接口与不可变性规则（对应CEO"三、建议快照必须不可变"）
+
+```ts
+interface SignalSnapshot {
+  signalId: string;                  // `SIG-${createdAt}-${随机后缀}`
+  symbol: 'ETHUSDT';                 // V1.3现阶段恒定，字段保留为schema前向兼容
+  direction: 'long' | 'short';       // 恒不含'long_caution'/'neutral'/'none'，见§15.3条件2
+  createdAt: number;                 // 本条记录写入ethAlphaSignalArchive的时间
+  dataAsOf: number;                  // 建议所依据的最后一根已收盘15分钟K线的closeTime（与draft-2 PaperFill.dataAsOf同口径）
+  validFrom: number;                 // = dataAsOf（该确认K线收盘的那一刻起，该建议就已经"存在"，与系统实际写入时间createdAt可能有<30秒差异）
+  validUntil: number;                // = dataAsOf + SIGNAL_DEFAULT_VALIDITY_MS（§15.11，仅约束"等待进场"阶段，见§15.5）
+  lifecycleStatus: 'RECORDED';       // **创建时刻的固定值**，当前生命周期由ShadowResult投影提供，见下方"不可变性与投影"说明
+  entryType: 'IMMEDIATE_ZONE';       // V1.3当前唯一支持的入场类型：基于V1.1 triggerPlans定义的进场区判定"触及"，不是限价单精确成交建模（见§15.6设计说明），字段保留枚举是为未来扩展预留
+  entryZone: { lower: number; upper: number; estimatedEntry: number }; // 冻结自 decision.triggerPlans[direction] 的 triggerZone 边界与 estimatedEntry（v1-core.js buildTriggerPlan）
+  triggerConditions: string[];       // 冻结自 [triggerPlans[direction].triggerCondition, .closeConfirmation, .btcCondition, .volumeCondition]，4条文案
+  invalidation: string[];            // 冻结自 decision.exitConditions（与draft-2 PaperTrade.invalidation同一来源，5条文案，审计/展示用途，见§15.6设计说明——不作为独立于stopLoss的第二个数值触发位）
+  stopLoss: number;                  // 冻结自 decision.stopLoss
+  targets: number[];                 // 冻结自 decision.targets（3元素数组）
+  riskRewardGross: number;           // 冻结自 decision.triggerPlans[direction].riskReward.grossValue（V1.1自己对该进场区计算的**计划阶段**毛盈亏比，不是影子验证事后的已实现值）
+  riskRewardNet: number;             // 冻结自 decision.triggerPlans[direction].riskReward.netValue，同上，计划阶段净盈亏比
+  decisionSnapshot: object;          // deepClone(decision)，完整V1.1决策快照（含signalPermission/opportunityScores/score/state/htfState/mtfState/ltf15m/mtf1h/htf4h等全部字段，ATR/EMA/Swing/成交量/动态支撑压力均已包含在ltf15m/mtf1h/htf4h内，不重复抽取）
+  forecastSnapshot: object | null;   // deepClone(window.__prevForecast)，V1.2三时窗（m15/h1/h4）预测快照，只读存档证据，不参与§15.3创建判定（同draft-2 §7.1红线）
+  btcStructureSnapshot: { tf15m: object; tf1h: object; tf4h: object }; // 只读调用v1-core.js已导出的analyzeKlines()对window.__lastMarketData.btc.{tf15m,tf1h,tf4h}生成的结构快照，deepClone冻结；补充decisionSnapshot本身未展开的BTC结构细节（decisionSnapshot只含btcPrice/btcAlignment摘要）——**只读复用既有导出函数，不重新做多空方向判断**
+  feeAssumption: { takerFeeRate: number; spreadRate: number; slippageRate: number }; // 冻结自v1-core.js COST_DEFAULT，独立于任何PaperAccount.settings（Signal Archive不依赖账户存在）
+  slippageAssumption: number;        // = spreadRate/2 + slippageRate，冻结值，供§15.6净R计算直接使用
+  decisionAlgorithmVersion: string;  // 常量'v1-core@v1.2.0'，标识冻结的v1-core.js基准（v1-core.js本身不可修改，字段为未来受控修订预留可追溯性）
+  forecastAlgorithmVersion: string;  // 常量'v1_2-forecast-core@v1.2.0'，同上理由
+  riskRuleVersion: string;           // = 创建时刻的SIGNAL_ARCHIVE_ALGORITHM_VERSION（§15.14，本文档§15.3/§15.6规则版本，与PAPER_ALGORITHM_VERSION是独立版本号）
+  sourceConfirmedBarTime: number;    // 该建议所依据的已收盘15分钟K线的openTime（用于§15.4指纹与§15.6影子撮合的起点游标）
+  supersedesSignalId: string | null; // draft-3为满足CEO"四、版本规则"新增字段：若本条是同方向、指纹发生实质变化后创建的新版本，指向被取代的上一条signalId；首次创建为null
+  acknowledgedAt: number | null;     // 用户首次在UI"看到"该建议的时间，创建时为null，只能由§15.9事件驱动的投影更新，原始数组元素本身不重写
+  linkedPaperTradeId: string | null; // 用户点击模拟开仓后关联的PaperTrade.tradeId，创建时为null，同上只能由投影更新
+  userActionStatus: 'UNSEEN' | 'SEEN' | 'ACCEPTED' | 'REJECTED' | 'MISSED'; // 创建时固定为'UNSEEN'，当前值由投影提供
+}
+```
+
+**不可变性与"投影"机制（红线，解决CEO"原始字段禁止被之后刷新覆盖或回写修改，后续变化只能追加事件"与字段清单本身含`lifecycleStatus`/`acknowledgedAt`/`linkedPaperTradeId`/`userActionStatus`这类看似会变化的字段之间的表面张力）**：
+
+`ethAlphaSignalArchive`中存储的`SignalSnapshot`对象，**在写入后任何字段都不会被程序原地修改或覆盖**——包括上面列出的`lifecycleStatus`（恒为创建时的`'RECORDED'`）、`acknowledgedAt`/`linkedPaperTradeId`（恒为创建时的`null`）、`userActionStatus`（恒为创建时的`'UNSEEN'`）。这4个字段之所以仍然出现在`SignalSnapshot`接口里（满足CEO"至少保存"清单要求它们存在于快照结构中），是因为它们代表"创建那一刻的默认值"，具备审计意义（证明"这条建议刚创建时确实是未确认/未关联的"）。
+
+**当前的实际值**（供UI展示、供准确度统计使用）由`getSignalCurrentView(signalId)`函数计算：以`ethAlphaSignalArchive`中的原始不可变记录为基底，**折叠**（fold）`ethAlphaSignalEvents`中该`signalId`的全部事件（按`time`升序）与`ethAlphaShadowResults`中该`signalId`的当前投影记录，得到一个"合并视图"对象，供UI渲染与导出使用。这个合并视图**不写回**`ethAlphaSignalArchive`。`ethAlphaShadowResults`本身作为投影缓存**允许**被覆盖更新（每次新的已收盘K线到来重新评估后原地更新该`signalId`对应的一条记录），这不违反不可变性红线，因为它从设计上就是"当前最新计算结果"的缓存，不是"原始建议记录"本身——`V1_3_ACCEPTANCE_TESTS.md` T31专项区分这两类存储的可变性预期。
+
+### 15.3 建议创建条件（对应CEO"二、什么情况下创建建议档案"）
+
+**八条件逻辑与（缺一不可）**，评估频率复用既有30秒`v11decision`事件（不新增定时器）：
+
+| # | CEO条件 | 具体判定表达式 | 来源 |
+|---|---|---|---|
+| 1 | V1.1交易许可允许参与 | `decision.worthBetting === true` | `v1-core.js buildDecision()` |
+| 2 | 方向为可执行多头或可执行空头 | `decision.biasDirection === 'long' \|\| decision.biasDirection === 'short'`（**不含**`'long_caution'`——后者是降级确信度状态，不视为"可执行"，与draft-2 §6.1 `TradeProposal`生成条件的方向白名单完全一致） | `decision.biasDirection` |
+| 3 | 交易计划未被硬性规则blocked | `decision.opportunityScores.blocked === false` | `decision.opportunityScores` |
+| 4 | 数据健康正常 | `decision.dataHealth === 'normal'` | `decision.dataHealth` |
+| 5 | 使用已收盘K线形成正式状态 | 自动满足，无需额外判定——V1.1的`state`/`htfState`/`mtfState`状态机本身恒定基于`confirmedPrice`（已收盘K线），不存在"用未收盘价格形成正式状态"的路径 | v1-core.js `analyzeKlines()`设计不变量 |
+| 6 | 存在确定的进场条件或进场区域 | `decision.triggerPlans[decision.biasDirection]`存在，且其`entryZone`可解析出有限数值的`lower`/`upper`边界 | `decision.triggerPlans` |
+| 7 | 存在失效位、止损位和目标位 | `Number.isFinite(decision.stopLoss) && Array.isArray(decision.targets) && decision.targets.length>=1 && Array.isArray(decision.exitConditions) && decision.exitConditions.length>0` | `decision.stopLoss`/`decision.targets`/`decision.exitConditions` |
+| 8 | 不是手动观察模式 | `decision.isManual === false` | `decision.isManual` |
+
+条件1（`worthBetting`）本身的定义已经把"`!manual && health==='normal' && p.level==='trend_entry_allowed' && rr.status==='ok' && rr.netValue>=1.5`"合并在内（见v1-core.js），因此条件1、3、4、8存在字面重叠，本文档**刻意保留全部字面判定**（而不是只写`worthBetting===true`就够了）：这是为了防止`v1-core.js`未来若合法修订了`worthBetting`内部合成逻辑（红线允许的唯一变更路径），Signal Archive的创建判定不会静默继承一个不再等价的隐藏假设——显式罗列每一条使得任何后续review都能逐条核对，而不必反查`worthBetting`当前内部到底由哪些子条件合成。
+
+**红线（对应CEO"不值得下注、数据异常、观察模式等状态继续由原有决策日志记录，不进入正式可执行建议档案"）**：以上八条件任一不满足，本次tick**不**创建`SignalSnapshot`，该决策继续且只继续写入既有`ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11`（V1.1既有机制，本轮不改动）。**红线**：V1.2预测（`forecastSnapshot`）不得出现在以上八条件的判断表达式里，只能作为快照证据字段（同draft-2 §7.1红线的延伸，`V1_3_ACCEPTANCE_TESTS.md` T29专项验证）。
+
+### 15.4 `signalFingerprint`、去重与版本规则（对应CEO"四、建议去重与版本规则"）
+
+```
+signalFingerprint = [
+  symbol,
+  direction,
+  sourceConfirmedBarTime,
+  round(entryZone.lower, pricePrecision) + '-' + round(entryZone.upper, pricePrecision),
+  round(stopLoss, pricePrecision),
+  targets.map(t => round(t, pricePrecision)).join(','),
+  decisionAlgorithmVersion,
+  riskRuleVersion
+].join('|')
+```
+
+**设计说明**：`signalFingerprint`是本文档定义的**确定性拼接字符串**，不是加密哈希摘要——选择字符串拼接而非哈希函数，是为了保持审计可读性（人工审查`ethAlphaSignalArchive`时可以直接读出指纹的构成，不需要反查哈希算法），且V1.3已有先例（`tradeId`/`fillId`/`signalId`均为模板字符串而非哈希，参见draft-2 §3.2/§3.3）。价格类字段参与拼接前统一按`pricePrecision`取整，避免浮点噪声导致同一根K线同一计划被误判为"发生了实质变化"。
+
+**去重规则（红线）**：
+
+1. **同一已收盘K线、同一方向、同一计划指纹只允许写入一次**：写入前必须在`ethAlphaSignalArchive`中查找是否已存在`sourceConfirmedBarTime`相同、`direction`相同、`signalFingerprint`完全相同的记录；若存在，本次tick**不写入**，直接返回该已存在记录（幂等读，不产生新`SignalSnapshot`也不产生新`SignalEvent`）。
+2. **新版本创建条件**：仅当**同时**满足——(a) 出现了比该方向当前最新一条`SignalSnapshot`的`sourceConfirmedBarTime`更新的已收盘K线，**且**(b) 本次计算出的`signalFingerprint`与该方向当前最新一条记录不同（即方向、进场区、止损、目标或`riskRuleVersion`/`decisionAlgorithmVersion`任一实质分量发生变化）——才创建新的`SignalSnapshot`，其`supersedesSignalId`指向被取代的上一条`signalId`。**红线**：仅新K线收盘但计划各分量均未变化（指纹相同）时，**不得**创建新版本，即使`createdAt`时间戳会自然不同。
+3. **红线（禁止用未收盘实时价格制造新建议）**：判断"是否出现新的已收盘K线"必须使用`sourceConfirmedBarTime`（K线`openTime`）比较，**不得**使用`decision.price`（未收盘实时价）或`Date.now()`触发新版本创建——同一根已收盘K线期间的重复30秒轮询，无论`decision.price`如何跳动，都不产生新记录或新版本。
+4. 若被取代的旧版本（`supersedesSignalId`所指向的记录）当时的生命周期仍处于非终态（`WAITING_TRIGGER`等），创建新版本时必须向`ethAlphaSignalEvents`追加一条`eventType:'SUPERSEDED'`的事件记录在旧`signalId`名下（审计"这条建议后来被新版本取代"），**不得**因为出了新版本就把旧版本从`ethAlphaSignalArchive`中删除或修改其状态字段——旧版本自己的影子验证（§15.6）继续独立进行至其自然终态，两条记录在统计口径上都各自计数（§15.8不因版本取代而消除任何一条的统计权重，除非旧版本被取代前处于`WAITING_TRIGGER`，此时其最终结局仍按§15.5正常判定为`EXPIRED_UNTRIGGERED`/`INVALIDATED_BEFORE_ENTRY`/`TRIGGERED`等，不因"被取代"这件事本身产生一个新的终态)。
+
+### 15.5 建议生命周期状态机 `SignalLifecycleStatus`（对应CEO"五、建议生命周期"）
+
+```
+RECORDED（创建瞬间，立即自动进入下一状态，非持久停留态）
+  → WAITING_TRIGGER
+      → TRIGGERED
+          → TARGET_1_HIT → TARGET_2_HIT → TARGET_3_HIT → COMPLETED（终态）
+          → STOPPED（终态，任一阶段触发原始stopLoss，见§15.6设计说明——不模拟移动止损）
+          → UNRESOLVED_DATA_GAP（非终态，见§15.7）→（恢复后回到取消前状态继续判定，或转入下方终态）
+      → EXPIRED_UNTRIGGERED（终态，validUntil前从未触及entryZone）
+      → INVALIDATED_BEFORE_ENTRY（终态，触发前价格已越过stopLoss，见§15.6判定规则）
+      → UNRESOLVED_DATA_GAP（非终态，见§15.7）
+任意非终态 → CANCELLED_BY_RULE_CHANGE（终态，仅当riskRuleVersion在评估过程中发生不兼容升级，极少发生，见下方说明）
+```
+
+| 当前状态 | 触发事件 | 下一状态 |
+|---|---|---|
+| `RECORDED` | 写入`ethAlphaSignalArchive`后的首次影子评估tick | `WAITING_TRIGGER` |
+| `WAITING_TRIGGER` | 已收盘K线触及`entryZone`（§15.6触发判定） | `TRIGGERED` |
+| `WAITING_TRIGGER` | 已收盘K线触及`entryZone`**且同一根K线**也触及`stopLoss` | `STOPPED`（直接终态，跳过`TRIGGERED`的持久停留，但仍记一次`ENTRY_FILLED`+`STOP_FILLED`事件，见§15.6"同K线进场后止损"规则） |
+| `WAITING_TRIGGER` | 尚未触及`entryZone`，但已收盘K线已越过`stopLoss`（§15.6判定） | `INVALIDATED_BEFORE_ENTRY` |
+| `WAITING_TRIGGER` | 既未触及`entryZone`也未越过`stopLoss`，且最新已收盘K线时间 > `validUntil` | `EXPIRED_UNTRIGGERED` |
+| `WAITING_TRIGGER` | 数据失效且恢复后无法完整回补 | `UNRESOLVED_DATA_GAP` |
+| `TRIGGERED` | 触及`targets[0]` | `TARGET_1_HIT` |
+| `TRIGGERED` | 触及原始`stopLoss` | `STOPPED` |
+| `TARGET_1_HIT` | 触及`targets[1]` | `TARGET_2_HIT` |
+| `TARGET_1_HIT` | 触及原始`stopLoss` | `STOPPED` |
+| `TARGET_2_HIT` | 触及`targets[2]` | `TARGET_3_HIT` |
+| `TARGET_2_HIT` | 触及原始`stopLoss`（理论极端反转场景，保留转换以保证状态机完整性） | `STOPPED` |
+| `TARGET_3_HIT` | 立即 | `COMPLETED` |
+| `TRIGGERED`/`TARGET_1_HIT`/`TARGET_2_HIT` | 数据失效且恢复后无法完整回补 | `UNRESOLVED_DATA_GAP` |
+| `UNRESOLVED_DATA_GAP` | 数据恢复且回补完整（§15.7） | 回到进入该状态前的对应状态，按补齐的K线继续判定 |
+| `UNRESOLVED_DATA_GAP` | 长期无法回补 | 保持`UNRESOLVED_DATA_GAP`，`verified=false`，不强制转终态（与draft-2 Paper Trading的`UNRESOLVED_DATA_GAP`不同，影子验证没有"用户确认保守结算"这个人工出口，因为影子验证本来就不产生真实/模拟资金后果，没有必须"结清"的压力——§15.7详述） |
+| 任意非终态 | `riskRuleVersion`发生不兼容升级（管理员/实现方明确判定旧评估逻辑不适用于新规则，须写入`SignalEvent`说明原因） | `CANCELLED_BY_RULE_CHANGE` |
+
+**红线**：`COMPLETED`/`STOPPED`/`EXPIRED_UNTRIGGERED`/`INVALIDATED_BEFORE_ENTRY`/`CANCELLED_BY_RULE_CHANGE`为终态，**不允许**重新变回`WAITING_TRIGGER`或任何其他非终态（CEO原文"不允许完成状态重新变回等待状态"）。`UNRESOLVED_DATA_GAP`不是终态，但离开该状态只能前进到"回补后按已收盘K线继续判定所得出的状态"，不允许倒退到比进入该状态前更早的生命周期阶段。
+
+**设计说明（不模拟移动止损，红线）**：`TARGET_1_HIT`/`TARGET_2_HIT`之后判断`STOPPED`时，统一使用`SignalSnapshot.stopLoss`**原始冻结值**，**不**模拟draft-2 §6.10"移动止损到保本位"的仓位管理动作。理由：移动止损是Paper Trading账户里用户主动（或系统按规则代为执行）的**仓位管理决策**，而Signal Archive/Shadow Evaluation代表的是"如果完全按V1.1原始建议的止损止盈位置被动持有，结果客观上是什么"这一更纯粹的、不掺杂任何后续仓位管理假设的验证口径；如果引入移动止损假设，就是在事后为V1.1从未做出过的一个具体交易管理动作背书，属于臆造，与CEO"不得后见之明"的精神冲突。`V1_3_ACCEPTANCE_TESTS.md` T35专项验证`TARGET_1_HIT`之后止损判定仍使用原始`stopLoss`而非任何移动值。
+
+**设计说明（"失效位"与"止损位"的数值收敛，红线澄清）**：CEO要求判断"触发进场后先到止损、失效位还是目标位"。经与V1.1现有数据结构核对（`decision.exitConditions`/`triggerPlans[direction].invalidation`均为**文案数组**，v1-core.js未定义独立于`stopLoss`的第二个数值失效价位），本文档**不为"失效位"臆造一个V1.1未定义的数值字段**：进场后的判定实际只需在`stopLoss`与`targets`之间比较先后（与draft-2 §6.7"同一根K线同时触发按止损处理"红线完全一致的收敛结论），`SignalSnapshot.invalidation`字段继续作为文案审计证据保留（供人工阅读该笔建议当时的结构性失效描述），但**不参与**状态机的数值判定。`V1_3_ARCHITECTURE_REVIEW.md`§9.3记录了这一设计判断供CEO复核。
+
+### 15.6 影子撮合与评估规则（对应CEO"六、真实行情影子验证"）
+
+**红线（禁止未来数据泄漏）**：影子撮合**只能**读取`openTime > sourceConfirmedBarTime`（严格晚于建议所依据的确认K线）且`isClosed===true`的15分钟K线，**禁止**使用建议形成之前的K线，也**禁止**使用当前尚未收盘的K线（`isClosed===false`）参与任何触发/止损/目标判定——只能等它收盘后作为下一次评估tick的输入。
+
+**评估顺序（每根新收盘K线，按`openTime`递增顺序，逐根处理，不得跳根批量判断"最终结果"）**：
+
+**A. `WAITING_TRIGGER`阶段（每根新K线依次判断，命中即停止本根K线的后续判断）**：
+
+```
+多头：entryHit  = bar.low  <= entryZone.upper
+      invalidHit = !entryHit && bar.low  <= stopLoss     // 未触及进场区却已跌破止损：整段进场前提落空
+空头：entryHit  = bar.high >= entryZone.lower
+      invalidHit = !entryHit && bar.high >= stopLoss
+```
+
+1. 若`entryHit`：状态转`TRIGGERED`，`entryFillPrice = entryZone.estimatedEntry`（**不**在区间内插值假设更优/更差的具体成交点位——V1.1本身通过`estimatedEntry`已经给出了该进场区唯一的参考入场价，参见v1-core.js `buildTriggerPlan`，本文档只读复用，不新增假设）。
+   - **同一根K线内**继续检查该K线是否也触及`stopLoss`（多头`bar.low<=stopLoss`，空头`bar.high>=stopLoss`）：若是，直接转`STOPPED`（CEO原文"同一根K线同时触发进场和止损，按进场后止损处理"），出场价按§15.6.B跳空规则计算；若同一根K线**也**触及`targets[0]`（无止损触发），视为进场后于同根K线内到达目标一，直接转`TARGET_1_HIT`（本文档为CEO未明确覆盖的"进场+目标同K线（无止损）"场景补充的自然推论，不与CEO任何已写明规则冲突）。
+2. 否则若`invalidHit`：状态转`INVALIDATED_BEFORE_ENTRY`（终态，不计入触发后胜负率，见§15.8）。
+3. 否则若该根K线的`closeTime > validUntil`：状态转`EXPIRED_UNTRIGGERED`（终态，**不算亏损**，见§15.8）。
+4. 否则保持`WAITING_TRIGGER`，处理下一根K线。
+
+**B. `TRIGGERED`及之后阶段（复用draft-2 §6.6-§6.9已验证的保守撮合红线，仅将`currentStop`替换为固定的`SignalSnapshot.stopLoss`，`targets[i]`替换为`SignalSnapshot.targets[i]`）**：
+
+```
+多头：hitStop = bar.low <= stopLoss；hitTarget = bar.high >= 当前生效目标价
+空头：hitStop = bar.high >= stopLoss；hitTarget = bar.low <= 当前生效目标价
+若 hitStop && hitTarget 同时为真 → 只按止损处理（红线，同draft-2 §6.7）
+止损成交价：跳空规则同draft-2 §6.8——gapped = 多头bar.open<stopLoss/空头bar.open>stopLoss，基准价=gapped?bar.open:stopLoss，按§4.4方向表叠加不利滑点（CEO"跳空越过止损，按首个可获得的不利价格"）
+目标成交价：只按计划目标价叠加不利滑点，不因有利跳空改善（同draft-2 §6.9，CEO"有利跳空不能假设获得优于目标位的成交"）
+```
+
+**MFE/MAE 公式**：从`TRIGGERED`那一刻起（含触发当根K线本身），到该建议达到终态（`STOPPED`/`COMPLETED`）为止（若长期未到终态则按当前已扫描到的最新已收盘K线累计计算，`ShadowResult`标记为"评估中"的中间值）：
+
+```
+多头：MFE = max(0, max(bar.high) - entryFillPrice)    // 取该区间全部已扫描K线high的最大值
+      MAE = max(0, entryFillPrice - min(bar.low))     // 取该区间全部已扫描K线low的最小值
+空头：MFE = max(0, entryFillPrice - min(bar.low))
+      MAE = max(0, max(bar.high) - entryFillPrice)
+```
+
+**毛R与净R公式**（`R`以初始风险`|entryFillPrice - stopLoss|`为一个单位，`exitPrice`取该建议最终终态对应的出场成交价——`STOPPED`用止损成交价，`COMPLETED`用`targets[2]`成交价，`TARGET_1_HIT`/`TARGET_2_HIT`若长期停留未到终态则按当前最新已收盘K线的`close`估算一个"若现在了结"的临时净值，`ShadowResult`须明确标注该值是否为最终值）：
+
+```
+risk = |entryFillPrice - stopLoss|
+多头：grossR = (exitPrice - entryFillPrice) / risk
+空头：grossR = (entryFillPrice - exitPrice) / risk
+净R调整（复用draft-2 §4.4方向表，用SignalSnapshot.feeAssumption/slippageAssumption代入，不产生真实资金流，纯算术）：
+  entryPriceNet = 多头买入方向 entryFillPrice × (1 + slippageAssumption)，空头卖出方向 entryFillPrice × (1 - slippageAssumption)
+  exitPriceNet  = 多头卖出方向 exitPrice × (1 - slippageAssumption)，空头买入方向 exitPrice × (1 + slippageAssumption)
+  feeAdjustment = (entryPriceNet + exitPriceNet) × feeAssumption.takerFeeRate     // 双边各收一次手续费的等效价格调整
+  多头：netR = (exitPriceNet - entryPriceNet - feeAdjustment) / risk
+  空头：netR = (entryPriceNet - exitPriceNet - feeAdjustment) / risk
+```
+
+`EXPIRED_UNTRIGGERED`/`INVALIDATED_BEFORE_ENTRY`不计算MFE/MAE/毛R/净R（未发生假设进场，risk基准不存在，`ShadowResult`对应字段为`null`）。
+
+**持有K线数量与持续时间**：`barsHeld = 从TRIGGERED所在K线到出场K线（含两端）的K线根数`，`durationMs = 出场K线closeTime - TRIGGERED所在K线的openTime`。
+
+### 15.7 影子验证的数据缺口规则（对应CEO"九、数据缺口规则"）
+
+复用draft-2 §8的设计精神（优先回补已收盘15分钟K线、按时间顺序重放、无法回补时不猜测胜负），但影子验证的数据缺口是**独立的**`ShadowDataGap`记录（附着在`ShadowResult`上，不是`PaperTrade.dataGap`）：
+
+```ts
+interface ShadowDataGap {
+  startTime: number;
+  missingBarCount: number | null;
+  replayAttempts: { attemptedAt: number; coverageComplete: boolean; outcome: 'RESOLVED' | 'STILL_GAP' }[];
+  resolvedAt: number | null;
+}
+```
+
+- 回补成功（K线`openTime`序列相对缺口连续，判定方式同draft-2 §8.3）：按时间顺序逐根重放§15.6判定，`resolvedAt`记录，继续正常评估。
+- 回补失败：`replayAttempts`追加`STILL_GAP`记录，生命周期状态维持`UNRESOLVED_DATA_GAP`，**不得**假设"大概率是盈利/亏损"而给出任何猜测性结果。
+- **红线**：`ShadowResult.verified`字段在`lifecycleStatus==='UNRESOLVED_DATA_GAP'`期间恒为`false`，该记录**不计入**§15.8已验证准确度统计的任何分子/分母（`estimated`/`verified`语义与draft-2完全对齐，供下游过滤）。
+- **红线（区分于draft-2的保守结算，CEO"不得使用用户确认的保守行政结算冒充真实市场结果"）**：影子验证**没有**类似draft-2 §8.5"用户确认保守结算"的人工出口——因为影子验证不产生真实或模拟资金后果，没有"必须结清账户"的业务压力，`UNRESOLVED_DATA_GAP`可以无限期保持，直到数据某天真正回补完整为止，**不允许**任何函数为影子验证发明一个"管理员/用户确认按估算价强制结算"的路径，那会把"未经验证的猜测"包装成看似客观的验证结果，与本节红线目的（客观检查系统准确度）直接冲突。
+
+### 15.8 准确度统计口径（对应CEO"七、准确度统计口径"）
+
+**红线：不得只显示一个"准确率"**，`computeSignalAccuracyStats(signals, shadowResults)`函数必须至少分别返回以下独立指标（均为只读聚合计算，不修改任何输入数据）：
+
+| 指标 | 计算方式 | 分母说明 |
+|---|---|---|
+| 建议总数 | `count(signals)` | 全部已创建`SignalSnapshot`（含被`supersedesSignalId`取代的旧版本，各自独立计数） |
+| 已触发数 | `count(lifecycleStatus in [TRIGGERED,TARGET_1_HIT,TARGET_2_HIT,TARGET_3_HIT,STOPPED,COMPLETED])` | — |
+| 未触发过期数 | `count(lifecycleStatus===EXPIRED_UNTRIGGERED)` | — |
+| 触发率 | 已触发数 / (建议总数 − 尚处于`WAITING_TRIGGER`/`UNRESOLVED_DATA_GAP`未决的数量) | 分母排除仍在等待中、尚无最终结果的记录 |
+| 触发后止损率 | `count(STOPPED) / 已触发数` | **分母只用已触发数，`EXPIRED_UNTRIGGERED`不计入**（CEO"EXPIRED_UNTRIGGERED不计入触发后胜负率"） |
+| 目标1到达率 | `count(lifecycleStatus in [TARGET_1_HIT,TARGET_2_HIT,TARGET_3_HIT,COMPLETED]) / 已触发数` | 同上 |
+| 目标2到达率 | `count(lifecycleStatus in [TARGET_2_HIT,TARGET_3_HIT,COMPLETED]) / 已触发数` | 同上 |
+| 目标3到达率（=完成率） | `count(lifecycleStatus in [TARGET_3_HIT,COMPLETED]) / 已触发数` | 同上 |
+| 平均毛R | 已到达终态（`STOPPED`/`COMPLETED`）且`verified===true`的记录的`grossR`算术平均 | 见下方分母红线 |
+| 平均净R | 同上，`netR`算术平均 | 同上 |
+| 盈利因子 Profit Factor | `Σ(netR>0的netR) / \|Σ(netR<0的netR)\|` | 同上分母集合 |
+| 平均MFE / 平均MAE | 同分母集合的算术平均 | 同上 |
+| 多头/空头分别表现 | 以上全部指标按`direction`分组各算一遍 | — |
+| 不同V1.1市场状态下表现 | 按`decisionSnapshot.state`（15分钟状态机六态）分组各算一遍以上指标 | — |
+| 15分钟/1小时/4小时预测背景下表现 | 按`forecastSnapshot.m15/h1/h4.directionLabel`分组（`forecastSnapshot`为`null`的记录归入独立的"无预测快照"分组，不丢弃也不计入其他分组） | — |
+| BTC支持/反对/中性时分别表现 | 按`decisionSnapshot.btcAlignment`（`'support'\|'conflict'\|'neutral'`）分组 | — |
+| 用户执行/用户错过/用户主动放弃数量 | 按当前`userActionStatus`投影值（`ACCEPTED`/`MISSED`/`REJECTED`）计数 | — |
+| 系统建议正确但用户错过的数量 | `count(userActionStatus===MISSED && lifecycleStatus in [TARGET_1_HIT,TARGET_2_HIT,TARGET_3_HIT,COMPLETED])` | — |
+| 数据缺口导致无法验证的数量 | `count(lifecycleStatus===UNRESOLVED_DATA_GAP 或 ShadowResult.verified===false)` | 单独展示，不参与上方任何比率的分子分母 |
+
+**分母红线（对应CEO"统计分母规则"）**：
+
+1. `EXPIRED_UNTRIGGERED`**不计入**触发后胜负率（触发后止损率/目标123到达率）的分母——它既不是赢也不是输，是"从未发生"。
+2. `UNRESOLVED_DATA_GAP`（含`ShadowResult.verified===false`的任何记录）**不计入**"已验证准确度"任何分子分母，只在"数据缺口导致无法验证的数量"单独展示。
+3. `estimated===true`或`verified===false`的结果**不得**混入已验证统计——本节所有比率类指标的分母集合定义为`{已到达终态 STOPPED/COMPLETED/TARGET_N_HIT 且 verified===true}`，与`EXPIRED_UNTRIGGERED`/`INVALIDATED_BEFORE_ENTRY`（未发生进场，不适用R值统计）以及`UNRESOLVED_DATA_GAP`/`verified===false`（无法验证）三类互斥排除。
+4. **红线（区分规则型前向验证与历史回测，CEO原文）**：`computeSignalAccuracyStats`的输出对象必须携带固定字段`statisticsBasis: 'FORWARD_RULE_BASED_SHADOW_EVALUATION'`，UI与导出文案必须明确标注"以下统计基于系统在**实际运行时点**给出的建议与其后真实行情表现的规则化影子验证，不是历史数据回测（backtest），不构成对未来准确率的保证或校准概率声明"——**禁止**出现"校准""概率""预测准确度保证"等措辞（同draft-2 §1强制措辞规则的延伸）。
+
+### 15.9 用户行为关联（对应CEO"八、用户行为关联"）
+
+**`userActionStatus`枚举**：`'UNSEEN' | 'SEEN' | 'ACCEPTED' | 'REJECTED' | 'MISSED'`。变化只能通过向`ethAlphaSignalEvents`追加事件驱动`ShadowResult`（或专门的用户行为投影字段）更新，不直接改写`ethAlphaSignalArchive`：
+
+| 事件`eventType` | 触发时机 | 效果 |
+|---|---|---|
+| `SEEN` | 用户在UI打开"历史交易建议与影子验证"区域并且该建议进入可视区域 | `userActionStatus: UNSEEN → SEEN`，`acknowledgedAt`投影值记录首次SEEN时间 |
+| `ACCEPTED` | 用户点击"模拟开仓"且成功关联（见下） | `userActionStatus → ACCEPTED` |
+| `REJECTED` | 用户在UI显式点击"不采用该建议"（新增的可选按钮，供用户主动标记放弃，区别于单纯错过） | `userActionStatus → REJECTED` |
+| `MISSED` | 建议进入终态（`EXPIRED_UNTRIGGERED`外的任何终态）时，若`userActionStatus`仍为`UNSEEN`或`SEEN`（既未确认开仓也未显式拒绝） | 系统自动追加，`userActionStatus → MISSED` |
+
+**红线（对应CEO"用户点击模拟开仓时"）**：
+
+- 用户点击Paper Trading Account的"确认开仓"（draft-2 `confirmOpenPosition`）前，若当前操作界面明确来自某条`SignalSnapshot`（即用户是从"历史交易建议"区域点击"按此建议模拟开仓"，而非从主决策面板独立生成`TradeProposal`），`confirmOpenPosition`调用时必须额外传入`signalId`参数。
+- 成功开仓后，必须向`ethAlphaSignalEvents`追加一条`eventType:'LINKED_PAPER_TRADE'`事件，携带`{signalId, tradeId, linkedAt}`，驱动该`signalId`的`linkedPaperTradeId`投影值更新为该`tradeId`，`userActionStatus`投影值同时更新为`ACCEPTED`。
+- **红线**：`SignalSnapshot`原始记录本身（`ethAlphaSignalArchive`中的那条）不因此被修改——关联关系完全通过`SignalEvent`+投影表达。
+- **红线（分别保存两个价格，不得混淆）**：关联后，`PaperTrade.entryPrice`（模拟账户真实成交价，draft-2定义）与`SignalSnapshot.entryZone.estimatedEntry`（建议理论进场价）是两个独立字段，**不得**互相覆盖或平均——`getSignalCurrentView(signalId)`合并视图必须同时暴露两者，供UI"系统建议表现 vs 用户实际模拟执行表现"对比展示（CEO"可以比较"要求）：前者用§15.6影子撮合逻辑计算（假设完全按建议执行的客观结果），后者读取`linkedPaperTradeId`对应`PaperTrade`的真实`fills`/`realizedPnl`（draft-2既有字段，只读引用，不重新计算）。
+
+### 15.10 存储、迁移、损坏恢复、容量、导出与清空规则（对应CEO"十、存储与审计"）
+
+**Schema版本**：`SIGNAL_ARCHIVE_SCHEMA_VERSION = 'v1.3-signal-1'`（`SignalSnapshot`/`SignalEvent`/`ShadowResult`三者共用一个schema版本号，因为三者总是同批引入、同批演进，拆分成三个版本号号只会增加迁移分支组合复杂度而没有实际收益）。
+
+- **损坏JSON恢复**：`ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults`任一key解析失败，安全恢复为空数组，不抛出异常（同draft-2 §9.2模式）。
+- **容量上限**：`ethAlphaSignalArchive`/`ethAlphaSignalEvents`各自保留最近**2000条**（超出后**只裁剪最旧的**，不做智能采样，避免"看似聪明的裁剪"引入统计偏差——CEO要求的是客观检查系统准确度，如果历史记录本身被有选择性地裁剪，准确度统计就不再客观）；`ethAlphaShadowResults`按`signalId`唯一，容量跟随`ethAlphaSignalArchive`现存记录集合，无需独立上限（不存在的`signalId`对应的`ShadowResult`应随之清理，避免孤儿记录）。
+- **去重**：见§15.4，写入前必须查重。
+- **追加式事件**：`ethAlphaSignalEvents`只能`push`，任何已写入元素不得修改或删除（同draft-2 `PaperFill.fills`不可变约束模式）。
+- **JSON/CSV导出**：`exportSignalArchiveJSON(signals, events, shadowResults)`/`exportSignalArchiveCSV(...)`，CSV导出**必须**复用`v1-core.js`已导出的`csvCell`函数做公式注入转义（同draft-2 §11/T15.2先例，`=`/`+`/`-`/`@`开头字段值转义）。
+- **不可变快照校验**：建议提供一个纯函数`verifySignalArchiveIntegrity(signals)`用于测试/审计，逐条比对当前存储内容与该`signalId`首次写入时的哈希/关键字段是否一致（发现被篡改即返回不一致清单），供`V1_3_ACCEPTANCE_TESTS.md` T31使用。
+- **清空建议历史（红线，对应CEO"清空建议历史必须二次确认，不得顺带重置500 USDT模拟账户"）**：`resetSignalArchive(storage, confirmFn, idempotencyKey)`必须两步确认（同draft-2 §2.4模式），第二次确认文案必须显式包含"将清空全部建议档案、影子验证结果与相关事件记录，且不可恢复"字样，必须携带`idempotencyKey`。**红线**：该函数**只**清空`ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults`三个key，**绝对不得**读写`ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog`——即使某些`SignalSnapshot.linkedPaperTradeId`指向的`PaperTrade`仍然存在于模拟账户里，清空建议历史后这些`PaperTrade`记录必须原样保留不受影响（只是失去了指向它们的建议档案索引，`PaperTrade`本身不记录反向指针，不产生悬空引用问题）。`V1_3_ACCEPTANCE_TESTS.md` T42专项验证该红线。
+
+### 15.11 默认有效期决定（对应CEO"十二、默认有效期"，检查结论与理由详见`V1_3_ARCHITECTURE_REVIEW.md`§9.2）
+
+**检查结论**：V1.1（`v1-core.js`/`buildDecision()`）**没有**任何形式的`validUntil`/`expiry`/TTL字段或等价机制——决策对象只有`updatedAt`时间戳，结构性内容（state/S/R/stop/targets）随每根新15分钟收盘K线整体替换，没有"这份计划还有效多久"的显式声明。V1.2（`buildForecast()`）**有**明确先例：`forecast.{m15,h1,h4}.validUntil = dataAsOf + TF_MS[horizon]`，即每个时间窗预测的有效期恰好等于该时间窗自身的K线周期。
+
+**决定**：`SIGNAL_DEFAULT_VALIDITY_MS = TF_MS['4h'] = 14400000`（4小时，等价16根15分钟K线）。`validUntil = dataAsOf + SIGNAL_DEFAULT_VALIDITY_MS`。
+
+**理由**（详细论证见`V1_3_ARCHITECTURE_REVIEW.md`§9.2）：建议的结构性基础（`decision.htf4h`/`triggerPlans`所依赖的4h/1h/15m结构）以4小时级别的HTF状态为最终定调依据，而V1.2自己对最长预测窗口（`h4`）的有效期定义就是"该时间窗自身周期"（4小时）——V1.3选择与V1.2最长时间窗一致的4小时作为默认值，是复用系统中已经存在、已经过CEO/实现方认可的"有效期=结构所属周期"惯例，而不是发明一个全新的、无先例支撑的数字。该值**确定、可测试、有限**（不会无限等待进场），且实现方式与状态机§15.5的判定逻辑直接对应（第4根K线起才会出现"仍在等待触发"的持续观察，第16根收盘K线之后若仍未触发则强制`EXPIRED_UNTRIGGERED`）。**红线**：`validUntil`只在创建时按上述公式计算并冻结在`SignalSnapshot`里，不允许任何"后见之明"式的事后调整（CEO"不允许后见之明修改有效期"）——`V1_3_ACCEPTANCE_TESTS.md` T34专项验证`validUntil`创建后不可变。
+
+### 15.12 UI 区域字段规范（对应CEO"十一、UI新增区域"）
+
+新增独立`<article class="card span12">`区域，标题"**历史交易建议与影子验证**"，置于§10模拟账户区域下方。**持续显示**（同屏常驻，不因筛选/翻页消失）：
+
+`影子验证使用后续真实行情评估历史建议，不代表真实成交、真实账户收益或未来保证。`
+
+必须显示的字段（逐条对应CEO列出的清单）：建议产生时间(`createdAt`/`dataAsOf`)、方向(`direction`)、进场区域(`entryZone`)、止损和目标(`stopLoss`/`targets`)、有效期(`validFrom`–`validUntil`)、当前生命周期(`lifecycleStatus`投影值)、是否触发(派生自`lifecycleStatus`)、后续真实结果(出场原因/出场价)、毛R与净R(`ShadowResult.grossR`/`netR`)、MFE/MAE、用户是否看到(`userActionStatus`)、是否关联模拟交易(`linkedPaperTradeId`是否非空)、系统建议与用户执行结果对比(entryZone.estimatedEntry路径 vs 关联PaperTrade真实路径并列展示)。**筛选**：按方向/生命周期状态/时间范围。**汇总指标**：§15.8全部统计项。**导出**：JSON/CSV。
+
+### 15.13 函数接口清单（draft-3新增，独立于draft-2 §11既有清单，不修改其中任何一行）
+
+```
+recordSignalIfEligible(decision, forecast, marketData, storage): {ok, signal?, reason?, deduped?}
+loadSignalArchive(storage): SignalSnapshot[]
+loadSignalEvents(storage): SignalEvent[]
+appendSignalEvent(signalId, eventType, payload, storage): {ok, event?}
+getSignalCurrentView(signalId, storage): SignalSnapshot & {当前投影字段}
+evaluateShadowSignals(signals, marketData, storage): {ok, updated: ShadowResult[]}
+calcSignalFingerprint(decision, direction, sourceConfirmedBarTime): string
+computeSignalAccuracyStats(signals, shadowResults, filters?): SignalAccuracyStats
+linkSignalToPaperTrade(signalId, tradeId, storage): {ok, event?}
+markSignalSeen(signalId, storage): {ok}
+markSignalRejected(signalId, storage): {ok}
+resetSignalArchive(storage, confirmFn, idempotencyKey): {ok}
+exportSignalArchiveJSON(signals, events, shadowResults): string
+exportSignalArchiveCSV(signals, events, shadowResults): string
+migrateSignalArchive(raw): SignalSnapshot[]
+verifySignalArchiveIntegrity(signals): {ok, mismatches: string[]}
+```
+
+所有函数均为纯函数或"状态+storage参数注入"风格，不得直接引用全局`window.localStorage`（与draft-2 §11末尾要求一致）。
+
+### 15.14 版本号红线（draft-3新增）
+
+```
+SIGNAL_ARCHIVE_SCHEMA_VERSION = 'v1.3-signal-1'
+SIGNAL_ARCHIVE_ALGORITHM_VERSION = 'v1.3-draft-3'
+```
+
+**红线（与`PAPER_ALGORITHM_VERSION`的独立性说明）**：`PAPER_ALGORITHM_VERSION`（§12）**保持`'v1.3-draft-2'`不变**——本轮draft-3新增的是一套全新的、与§2-§8平行的子系统，§2-§8「模拟账户」自身的账户/风险/撮合规则字面**零改动**，没有理由虚假递增一个描述"模拟账户算法版本"的常量。`SIGNAL_ARCHIVE_ALGORITHM_VERSION`独立维护，任何修改§15.3创建条件、§15.5生命周期状态机、§15.6影子撮合规则、§15.8统计分母规则的未来提交，必须同步递增`SIGNAL_ARCHIVE_ALGORITHM_VERSION`（而不是`PAPER_ALGORITHM_VERSION`），并在`SignalSnapshot.riskRuleVersion`的取值范围与`V1_3_ACCEPTANCE_TESTS.md`新增对应回归用例。
+
+### 15.15 仍需CEO确认的问题（本轮，Signal Archive & Shadow Evaluation）
+
+无。CEO本轮"十二、默认有效期"要求的"若V1.1无正式定义，需自行提出确定、可测试、不会无限等待的默认值并说明理由"已由本文档§15.11给出（4小时，理由见上）。CEO本轮其余十三项要求（一至十四，除十二已单独处理）均已在§15.0-§15.14逐条落地，未发现需要CEO进一步决策的开放问题。若实现阶段（Codex编码）发现本文档未能预见的边界情况，将在`V1_3_IMPLEMENTATION_REPORT.md`中记录并视需要提请CEO补充决策。

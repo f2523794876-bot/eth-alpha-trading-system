@@ -1,7 +1,7 @@
 # V1_3_CODEX_IMPLEMENTATION_TASK.md — 给 Codex 的 V1.3「模拟交易账户」实现工单
 
-版本：v1.3-draft-2（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-2 同步，对应CEO七项决策+三项统一规则，见SPEC §14变更记录）
-依据：`V1_3_PAPER_TRADING_SPEC.md`（算法真相来源，本文档只定义"怎么落地成代码"，不重复定义算法，任何算法细节冲突以该文档为准）+ 现有 `v1-core.js`（V1.1冻结核心）+ `v1_2-forecast-core.js`（V1.2冻结核心），两者**均不可修改**。
+版本：v1.3-draft-3（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-3 同步；§1-§6为draft-2既有内容，本轮**零改动**，新增内容见§7）
+依据：`V1_3_PAPER_TRADING_SPEC.md`（算法真相来源，本文档只定义"怎么落地成代码"，不重复定义算法，任何算法细节冲突以该文档为准，draft-3新增内容对应SPEC §15）+ 现有 `v1-core.js`（V1.1冻结核心）+ `v1_2-forecast-core.js`（V1.2冻结核心），三者**均不可修改**（含draft-2交付的`v1_3-paper-trading-core.js`等——本轮范围内该文件**尚未实现**，不存在"冻结"问题，但§1.3列出的既有前四份文档描述的规则不可回退修改）。
 角色分工：本文档作者（Claude Code）负责本轮 V1.3 的架构设计与验收规范，**不编写正式业务代码**；Codex 负责实际编码；本文档、`V1_3_ACCEPTANCE_TESTS.md`、`V1_3_ARCHITECTURE_REVIEW.md` 与 `V1_3_PAPER_TRADING_SPEC.md` 是本轮交付的全部四份文档，本轮**不交付任何业务代码或测试代码**。
 
 ---
@@ -144,3 +144,108 @@ template = replaceExact(template, '/*__PAPER__*/', paperCore, 1, 'V1.3模拟交�
 - `V1_3_IMPLEMENTATION_REPORT.md`、`V1_3_TEST_RESULTS.md`（对照V1.2交付模式）
 
 本文档（V1.3文档阶段）**不包含**以上任何一项的实际代码，仅作为下一轮实现的工单依据。
+
+---
+
+## 7. draft-3新增：建议档案与影子验证 Signal Archive & Shadow Evaluation（对应`V1_3_PAPER_TRADING_SPEC.md`§15）
+
+角色重申：本节与§1-§6一样，只是给Codex的工单依据，本文档（含本节）不交付任何实际代码。§1-§6描述的「模拟账户」实现工单**零改动**，本节是**追加**的独立子系统工单。
+
+### 7.1 范围重申（红线，本节专用）
+
+- 新增独立模块，**不与**`v1_3-paper-trading-core.js`合并成一个文件——Signal Archive在设计上必须能独立于Paper Trading Account运行（SPEC §15.0：不需要账户存在），合并成一个文件会让"读一个文件就必须理解两套完全不同的资金语义"，增加认知负担且违背§15.0的系统边界声明。
+- 不建立任何`PaperPosition`/`PaperFill`/占用`marginUsed`——Signal Archive/Shadow Evaluation产生的一切数据只读写`ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults`三个key，**禁止**在实现中出现任何路径把`ShadowResult`的字段写入`ethAlphaPaperAccount`/`ethAlphaPaperTrades`（SPEC §15.0红线，`V1_3_ACCEPTANCE_TESTS.md` T38专项测试）。
+- 不为`UNRESOLVED_DATA_GAP`状态的影子验证实现任何"强制结算/估算收敛"出口（SPEC §15.7红线，与draft-2 Paper Trading的`confirmConservativeSettlement`**刻意不对称**，不要照抄§8.5的模式）。
+- 不修改`v1-core.js`/`v1_2-forecast-core.js`/draft-2交付的`v1_3-paper-trading-core.js`（该文件本轮尚未实现，若与本轮Signal Archive实现同批交付，两者只能通过`window.__paperAccount`/`linkedPaperTradeId`等只读指针关联，`v1_3-signal-archive-core.js`**不得**`require`并调用`v1_3-paper-trading-core.js`内部未导出的私有逻辑，只能通过其已导出的函数接口只读交互，若两者需要交叉引用，单向依赖方向为：Signal Archive **不依赖** Paper Trading（Paper Trading的`confirmOpenPosition`在draft-3新增`signalId`可选参数后，可以单向调用Signal Archive导出的`linkSignalToPaperTrade`，反向不允许）。
+
+### 7.2 新增文件规划
+
+| 文件 | 职责 |
+|---|---|
+| `v1_3-signal-archive-core.js` | 纯逻辑核心：建议创建判定/去重/生命周期/影子撮合/统计/存储/导出，`require('./v1-core.js')`（只读，含`analyzeKlines`/`csvCell`等已导出工具函数）与`require('./v1_2-forecast-core.js')`（只读，仅用于快照存档，不参与创建判定），通过`window.ETHAlphaSignalArchive`暴露（浏览器）/`module.exports`（Node测试） |
+| `work/v1-signal-archive.template.html` | 新UI区域"历史交易建议与影子验证"的模板片段，风格参照`work/v1-paper-trading.template.html`（draft-2工单，本轮同批规划） |
+| `tests/v13-signal-archive-tests.js` | 核心逻辑非联网自动化测试，命名对齐`v13-paper-trading-tests.js`模式 |
+| `tests/v13-signal-archive-ui-tests.js` | 单文件构建产物里的UI接线/DOM事件测试 |
+| `tests/v13-signal-archive-live-rest-test.js` | 真实Binance REST生产链测试：真实数据→`buildDecision`→`buildForecast`→`recordSignalIfEligible`→`evaluateShadowSignals`（用完即`resetSignalArchive`撤销/不污染真实localStorage），对齐`v13-live-rest-test.js`/`v12-live-rest-test.js`模式，**必须**真正调用本模块的导出函数，不得只验证V1.1/V1.2（同§2表格已强调的`CLAUDE_CODE_REVIEW_V1_2_FINAL.md`P1-2教训） |
+
+### 7.3 实施步骤顺序（Codex必须按此顺序实现，紧接draft-2工单步骤9之后，不得跳步；若draft-2的`v1_3-paper-trading-core.js`尚未实现，Codex可先独立实现Signal Archive核心逻辑与非UI测试，但"步骤15：用户行为关联"中依赖`linkSignalToPaperTrade`↔`confirmOpenPosition`联动的部分必须等两者都存在后才能完成集成）
+
+**步骤10：建议快照与去重（对应SPEC §15.2-§15.4）**
+
+- 实现`SignalSnapshot`对应的JS对象结构、`loadSignalArchive`/`migrateSignalArchive`/损坏JSON与容量降级路径（**先实现异常路径，同draft-2步骤1的既有历史教训**）。
+- 实现`calcSignalFingerprint(decision, direction, sourceConfirmedBarTime)`：**必须**先对价格类分量按`pricePrecision`取整再拼接，避免浮点噪声误判"实质变化"（SPEC §15.4）。
+- 实现`recordSignalIfEligible(decision, forecast, marketData, storage)`：先做SPEC §15.3八条件AND判定，再做§15.4去重/版本判定，**顺序不能颠倒**（先判定"是否值得存档"，再判定"是否已经存过"，两步职责分离，便于分别测试）。
+
+**步骤11：生命周期状态机（对应SPEC §15.5）**
+
+- 实现纯函数状态机校验（不与影子撮合逻辑耦合，同draft-2步骤2"状态机纯函数单独可测"的既有模式），覆盖SPEC §15.5全部转换表行，**含**"终态不可逆"的显式拒绝校验。
+
+**步骤12：影子撮合与MFE/MAE/毛R净R（对应SPEC §15.6，本轮复杂度最高的实现点，优先编写测试）**
+
+- 实现`evaluateShadowSignals(signals, marketData, storage)`：**必须**先校验只使用`openTime>sourceConfirmedBarTime`且`isClosed===true`的K线（SPEC §15.6"禁止未来数据泄漏"红线），建议在函数入口就做这个过滤而不是散落在判断逻辑各处，便于`V1_3_ACCEPTANCE_TESTS.md` T33.1单独测试这一条过滤本身。
+- `WAITING_TRIGGER`阶段判定与`TRIGGERED`阶段判定分别实现为独立可测的子函数（SPEC §15.6.A/§15.6.B），**不要**为了"复用代码"把两段揉进一个大循环——两段的红线不同（A段是entry/invalid/expire三选一，B段复用draft-2既有的stop/target红线），揉在一起容易在"同一根K线内进场又止损"这个交叉场景上出错（SPEC §15.5转换表已明确要求）。
+- MFE/MAE/毛R/净R公式**逐项**对照SPEC §15.6代入具体数值编写测试（`V1_3_ACCEPTANCE_TESTS.md` T36要求），**每写完一个公式立即补测试，不要写完整个撮合引擎再统一补测试**（同draft-2步骤3的既有要求）。
+
+**步骤13：影子验证数据缺口（对应SPEC §15.7）**
+
+- 实现`ShadowDataGap`回补/重放逻辑，**复用**draft-2 `replayDataGap`的"K线openTime序列连续性判断"这一段核心算法思路（可以抽取成`v1-core.js`风格的共享纯函数供两个模块各自调用，但**不得**让`v1_3-signal-archive-core.js`直接`require`并调用`v1_3-paper-trading-core.js`内部实现——如果需要共享，应该把这段连续性判断逻辑放在双方都能只读依赖的地方，例如作为`v1_3-signal-archive-core.js`自己内部的一份独立实现，代码相似但物理上独立，避免引入两个本应各自独立的子系统之间的强耦合）。
+- **红线**：不实现§8.5式的"用户确认保守结算"出口（SPEC §15.7红线，本节7.1已重申）。
+
+**步骤14：准确度统计（对应SPEC §15.8，分母规则是本步骤最容易出错的地方）**
+
+- 实现`computeSignalAccuracyStats`，**建议**先写一份测试专用的"分母集合断言辅助函数"（类似draft-2 T25.2的"聚合胜率验证契约"模式），在实现每一个比率指标时都先用这个辅助函数验证分母集合是否符合SPEC §15.8"分母红线"四条，再计算比率本身——这类"看起来算对了但分母偷偷混入了不该算的记录"的错误历史上在类似统计口径实现里很常见，值得为分母本身单独测试。
+
+**步骤15：用户行为关联（对应SPEC §15.9）**
+
+- 实现`markSignalSeen`/`markSignalRejected`/`linkSignalToPaperTrade`，以及"建议进入终态且仍为UNSEEN/SEEN时自动追加MISSED事件"的判定（**这是唯一一个不需要用户点击就能改变`userActionStatus`投影值的路径**，实现时需要明确注释/测试标注这一例外，避免与"用户行为关联需要真实点击"的直觉产生混淆——`MISSED`本身就是"用户没有点击"这件事的记录，不是对该红线的违反）。
+- **红线**：`confirmOpenPosition`（draft-2既有函数，本轮**追加**一个可选的`signalId`参数，不改变其既有必填参数顺序与既有行为）成功后若携带了`signalId`，必须调用`linkSignalToPaperTrade`，两者的调用顺序与失败回滚语义需在实现阶段明确（建议：先完成开仓，开仓成功后再关联；若关联步骤本身失败，不回滚已经成功的开仓，只记录关联失败，因为关联关系是审计性质的旁路信息，不应让一个次要的审计写入失败反过来撤销一笔已经成立的模拟交易）。
+
+**步骤16：导出与重置 + UI接线 + 构建脚本接线（对应SPEC §15.10/§15.12）**
+
+- `exportSignalArchiveJSON`/`exportSignalArchiveCSV`：CSV导出复用`v1-core.js`已导出的`csvCell`（同draft-2步骤6模式）。
+- `resetSignalArchive`：两步确认+`idempotencyKey`，**红线**：只清空三个Signal Archive专属key，绝不触碰`ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog`（SPEC §15.10红线，7.1已重申，`V1_3_ACCEPTANCE_TESTS.md` T42专项验证）。
+- UI接线：在`eth-dynamic-trading-dashboard.html`现有§10模拟账户区域`</section>`之后，新增：
+  ```html
+  <section class="grid" id="signalArchiveSection">
+  <!--__SIGNAL_ARCHIVE_UI__-->
+  </section>
+  ```
+  新增`<script data-v13="signal-archive">/*__SIGNAL_ARCHIVE__*/</script>`，紧跟在V1.3模拟账户脚本块`<script data-v13="paper-trading">`之后（**不得**插在V1.1/V1.2/V1.3模拟账户三块脚本中间——事件监听顺序要求见下）。
+- **事件时序要求（对应SPEC §15.3"评估频率复用既有30秒v11decision事件"）**：Signal Archive的`v11decision`监听器必须在构建产物中位于V1.3模拟账户脚本块**之后**——理由：若用户本次点击"确认开仓"关联的是Signal Archive本次tick刚创建的新建议，Paper Trading的`confirmOpenPosition`在同一次点击处理中需要能读到本次tick已经写入`ethAlphaSignalArchive`的`signalId`；但由于Signal Archive的**创建**（`recordSignalIfEligible`）与Paper Trading的**开仓确认**（`confirmOpenPosition`）实际上是两个独立的用户交互时刻（建议先被创建存档，用户之后才点击"按此建议模拟开仓"），严格的执行顺序要求主要是为了保证"同一次30秒刷新tick内，Signal Archive的建议创建判定/影子评估先于Paper Trading读取`window.__paperAccount`等状态完成"，避免出现"Paper Trading某个UI渲染时刻读到的`signalId`列表还没包含本次tick刚创建的记录"这种短暂的时序不一致。
+- 构建脚本接线：`work/build-v1.js`现有`replacements`数组**追加**（不改动既有条目顺序或内容）：
+  ```js
+  ['/*__SIGNAL_ARCHIVE_UI__*/', <v1-signal-archive.template.html中的HTML片段字符串>, 1, 'V1.3建议档案与影子验证UI占位符'],
+  ```
+  以及末尾核心拼接部分，在`/*__PAPER__*/`的`replaceExact`调用**之后**追加：
+  ```js
+  const signalArchiveCore = fs.readFileSync(path.join(root,'v1_3-signal-archive-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
+  template = replaceExact(template, '/*__SIGNAL_ARCHIVE__*/', signalArchiveCore, 1, 'V1.3建议档案与影子验证核心占位符');
+  ```
+  最终产物`<script>`块顺序：V1.1核心 → V1.2预测核心 → V1.3模拟交易核心 → V1.3建议档案核心。
+
+**步骤17：自测与回归**
+
+- 按`V1_3_ACCEPTANCE_TESTS.md` T28-T43全部测试类别自测通过。
+- **必须**重新完整跑一遍draft-2已有的`V1_3_ACCEPTANCE_TESTS.md` T27回归命令列表（含V1.1/V1.2既有测试与`work/build-v1.js`构建产物逐字节可复现校验），确认零回归；若draft-2的Paper Trading代码本轮已经交付，还需额外确认新增的`/*__SIGNAL_ARCHIVE_UI__*/`/`/*__SIGNAL_ARCHIVE__*/`占位符替换不破坏既有`/*__CORE__*/`/`/*__FORECAST__*/`/`/*__PAPER_UI__*/`/`/*__PAPER__*/`替换。
+
+### 7.4 接口冲突检查清单（追加于§5已有表格，风格一致）
+
+| 项 | V1.1 | V1.2 | V1.3模拟账户 | V1.3建议档案（draft-3新增） | 是否冲突 |
+|---|---|---|---|---|---|
+| 模块全局变量名 | `window.ETHAlphaCore` | `window.ETHAlphaForecast` | `window.ETHAlphaPaperTrading` | `window.ETHAlphaSignalArchive` | 不冲突 |
+| 自定义DOM事件名 | `v11decision`（唯一来源） | 监听既有事件 | 监听既有事件 | 监听既有事件，不新增 | 不冲突 |
+| localStorage key | 见§5原表 | 见§5原表 | `ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog` | `ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults` | 不冲突 |
+| `window`暴露的原始引用 | 无 | `window.__lastMarketData`/`window.__prevForecast` | `window.__paperAccount` | 新增`window.__signalArchiveLatest`（供UI渲染层读取本次tick评估后的建议列表，只读，不建议其余模块写入） | 不冲突 |
+| DOM id前缀 | 见§5原表 | 见§5原表 | `paperAccount*`/`paperTrade*`/`paperFill*`/`paperLog*` | `signalArchive*`/`signalEvent*`/`shadowResult*`（具体清单由Codex实现时列出并交叉核对） | 需Codex实现时逐一核对 |
+| 导出函数名 | 见§5原表 | 见§5原表 | `v1_3-paper-trading-core.js`导出列表（SPEC§11） | `v1_3-signal-archive-core.js`导出列表（SPEC§15.13） | 不冲突，依赖方向：Signal Archive与Paper Trading互相**不**依赖对方内部实现，仅通过`signalId`/`tradeId`指针关联，二者都单向依赖V1.1/V1.2 |
+| 测试文件命名 | 见§5原表 | 见§5原表 | `v13-paper-trading-tests.js`等3个 | `v13-signal-archive-tests.js`/`v13-signal-archive-ui-tests.js`/`v13-signal-archive-live-rest-test.js` | 不冲突 |
+
+### 7.5 交付清单（追加，Codex在下一轮实现完成后应交付）
+
+- `v1_3-signal-archive-core.js`
+- `work/v1-signal-archive.template.html`
+- `tests/v13-signal-archive-tests.js`、`tests/v13-signal-archive-ui-tests.js`、`tests/v13-signal-archive-live-rest-test.js`
+- 对`work/build-v1.js`、`work/v1-ui.template.html`（仅新增脚本标签引用位置）、draft-2交付的`v1_3-paper-trading-core.js`（仅新增`confirmOpenPosition`的可选`signalId`参数与对`linkSignalToPaperTrade`的单向调用，不改动其既有必填参数/既有行为）的追加式修改
+- `V1_3_IMPLEMENTATION_REPORT.md`/`V1_3_TEST_RESULTS.md`需同时覆盖模拟账户与建议档案两部分结果（或分别产出两份对应文档，实现阶段自行决定，本文档不强制）
+
+本节（draft-3文档阶段）同样**不包含**以上任何一项的实际代码，仅作为下一轮实现的工单依据。

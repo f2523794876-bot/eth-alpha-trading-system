@@ -1,6 +1,6 @@
 # V1_3_ARCHITECTURE_REVIEW.md — V1.3「模拟交易账户」架构复核与一致性核查
 
-版本：v1.3-draft-2（对应CEO七项决策+三项统一规则，见`V1_3_PAPER_TRADING_SPEC.md`§14变更记录）
+版本：v1.3-draft-3（§1-§8为draft-2内容，对应CEO七项决策+三项统一规则，本轮零改动；§9为draft-3新增，对应CEO本轮「建议档案与影子验证」需求，见`V1_3_PAPER_TRADING_SPEC.md`§15）
 角色：本文档是四份V1.3文档中的最后一份，职责是**核对前三份文档（`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ACCEPTANCE_TESTS.md`）互相一致**，核对与V1.1/V1.2/`STRATEGY_SPEC.md`既有代码接口的一致性，给出风险清单，并作为交给CEO复审的入口文档。
 
 ---
@@ -12,7 +12,9 @@
 | 基准分支 | `main` |
 | 基准标签 | `v1.2.0`（提交 `0dc1943e744f0e997f48c7e2470f71fd80a64c64`） |
 | 工作分支 | `claude/v1.3-paper-trading-spec` |
-| 本轮性质 | draft-1的7项开放问题（`V1_3_PAPER_TRADING_SPEC.md`draft-1 §13）+ 3项统一规则，已由CEO逐条决策，本轮为增量修订，不改变draft-1已确认无争议的部分（撮合方向表、K线扫描顺序、同K线冲突/跳空红线、构建脚本接线方式等） |
+| draft-2基准提交 | `36c45d27efde8efc2fd3004b3889bd9eeda90eb5`（draft-3在此提交之上做增量修订） |
+| 本轮（draft-2）性质 | draft-1的7项开放问题（`V1_3_PAPER_TRADING_SPEC.md`draft-1 §13）+ 3项统一规则，已由CEO逐条决策，为增量修订，不改变draft-1已确认无争议的部分（撮合方向表、K线扫描顺序、同K线冲突/跳空红线、构建脚本接线方式等） |
+| 本轮（draft-3）性质 | CEO新需求「建议档案与影子验证」（`V1_3_PAPER_TRADING_SPEC.md`§15），与draft-2「模拟账户」（§2-§8）严格资金隔离的**新增并行子系统**，不改变draft-2已确认的任何账户/风险/撮合规则本身（§1-§8零改动） |
 
 ---
 
@@ -100,4 +102,94 @@ WebSocket、条件提醒推送、长期运行监控**仍然**不在V1.3范围内
 ## 8. 变更记录
 
 - v1.3-draft-1：首次交付。
-- v1.3-draft-2（本版本）：CEO七项决策+三项统一规则全部核对落地，draft-1开放问题清单归零，新增本轮设计一致性说明（§2）与历史文档修订核查（§5）。
+- v1.3-draft-2：CEO七项决策+三项统一规则全部核对落地，draft-1开放问题清单归零，新增本轮设计一致性说明（§2）与历史文档修订核查（§5）。
+- v1.3-draft-3（本版本）：新增CEO需求「建议档案与影子验证」核对（§9），含默认有效期决定的详细理由（§9.2，CEO要求本决定必须记录在本文档）。§1-§8「模拟账户」核对结论本轮零改动。
+
+---
+
+## 9. 本轮（draft-3）CEO新需求「建议档案与影子验证」核对（对应`V1_3_PAPER_TRADING_SPEC.md`§15）
+
+### 9.1 CEO本轮十四项要求逐条落地核对表
+
+| # | CEO要求要点 | SPEC落地章节 | CODEX_TASK是否同步 | ACCEPTANCE_TESTS是否覆盖 | 状态 |
+|---|---|---|---|---|---|
+| 一 | 严格区分建议档案/影子验证/模拟账户三套系统，禁止影子盈亏写入模拟账户 | §15.0（红线） | §7.1 | T38 | 已关闭 |
+| 二 | 建议档案创建的八条件（AND） | §15.3 | 步骤10 | T28、T29 | 已关闭 |
+| 三 | 建议快照不可变，字段清单 | §15.2 | 步骤10 | T31 | 已关闭 |
+| 四 | `signalFingerprint`去重与版本规则 | §15.4 | 步骤10 | T30 | 已关闭 |
+| 五 | 建议生命周期状态机（12个状态） | §15.5 | 步骤11 | T32 | 已关闭 |
+| 六 | 真实行情影子验证（禁止未来数据泄漏、保守撮合、MFE/MAE/毛R净R） | §15.6 | 步骤12 | T33、T35、T36 | 已关闭 |
+| 七 | 准确度统计口径（不止一个"准确率"，分组维度） | §15.8 | 步骤14 | T40 | 已关闭 |
+| 八 | 用户行为关联（`userActionStatus`/`linkedPaperTradeId`） | §15.9 | 步骤15 | T39 | 已关闭 |
+| 九 | 数据缺口规则（复用UNRESOLVED_DATA_GAP精神，不冒充真实结算） | §15.7 | 步骤13 | T37 | 已关闭 |
+| 十 | 存储与审计（独立命名空间、迁移、导出、清空不触碰模拟账户） | §15.10 | 步骤16 | T41、T42 | 已关闭 |
+| 十一 | UI新增区域"历史交易建议与影子验证" | §15.12 | 步骤16 | — | 已关闭 |
+| 十二 | 默认有效期（先检查V1.1是否已有定义） | §15.11 | — | T34 | 已关闭，详细理由见本节§9.2 |
+| 十三 | 测试要求（至少26项） | — | — | T28-T43全覆盖，见§9.4逐条映射 | 已关闭 |
+| 十四 | 修改范围（只改4份文档，禁止事项） | 全文档 | §7.1 | — | 已关闭，见§9.5 |
+
+**结论**：CEO本轮"一至十四"全部要求，经核对**已在SPEC §15/CODEX_TASK §7/ACCEPTANCE_TESTS T28-T43三份文档中逐条一致落地**，`V1_3_PAPER_TRADING_SPEC.md`§15.15（"仍需CEO确认的问题"）本轮同样归零。
+
+### 9.2 默认有效期决定与详细理由（对应CEO"十二、默认有效期"，本节是CEO要求"必须在ARCHITECTURE_REVIEW中说明选择理由"的落地）
+
+**检查过程**：逐一核对`v1-core.js`全部导出函数与`buildDecision()`返回对象的完整字段列表（`price`/`btcPrice`/`confirmedPrice`/`state`/`previousState`/`stateReason`/`falseBreakoutTier`/`biasDirection`/`advice`/`entryZone`/`addOnCondition`/`stopLoss`/`targets`/`exitConditions`/`riskReward`/`dragonflyText`/`bestInterceptionZone`/`worthBetting`/`btcAlignment`/`warnings`/`signalPermission`/`htf4h`/`mtf1h`/`ltf15m`/`htfState`/`mtfState`/`supportZones`/`resistanceZones`/`volumeQuality`/`score`/`opportunityScores`/`triggerPlans`/`positionMetrics`/`dataHealth`/`decisionLogId`/`isManual`/`manualInputs`/`missingData`/`updatedAt`/`chartModel`），**未发现**任何`validUntil`/`expiry`/`expires`/`TTL`字段或等价机制——`grep -n "validUntil\|expiry\|expires\|TTL" v1-core.js`返回零结果。V1.1的"新鲜度"完全依赖"每30秒重新拉取K线、重新整体计算`buildDecision()`"这一轮询节奏，结构性字段（`state`/S/R/`stopLoss`/`targets`）只在新15分钟K线收盘时才真正变化，两次收盘之间的重复计算得到相同结果，但**没有**一个显式声明"这份计划还有效多久"的字段。
+
+**唯一先例**：V1.2 `buildForecast()`的每个时间窗预测对象（`m15`/`h1`/`h4`）都有明确的`dataAsOf`/`validUntil`字段对，公式为`validUntil = dataAsOf + TF_MS[horizon]`——即"有效期恰好等于该预测所属的时间窗自身周期"。这是代码库里唯一一处对"一份判断还有效多久"给出确定性数值公式的先例。
+
+**决定**：`SIGNAL_DEFAULT_VALIDITY_MS = TF_MS['4h'] = 14400000`（4小时/16根15分钟K线），`SignalSnapshot.validUntil = dataAsOf + SIGNAL_DEFAULT_VALIDITY_MS`。
+
+**选择理由（四点）**：
+
+1. **有先例可循，不是凭空发明**：V1.2已经确立"有效期=该判断所依赖的最长相关时间窗自身周期"这一惯例（`h4`预测的有效期就是4小时）。V1.3建议档案的结构性依据同时来自15分钟/1小时/4小时三个时间窗（`decision.ltf15m`/`mtf1h`/`htf4h`），其中4小时（`htf4h`）是决定整体趋势方向、给`biasDirection`定调的最高层级时间窗（`htfState`/`classifyHtfState()`）。选择与V1.2最长时间窗一致的4小时，是把V1.3的"有效期"概念锚定在系统里已经存在、已经被验证过的语义上，而不是新造一个孤立的数字。
+2. **确定、可测试**：`SIGNAL_DEFAULT_VALIDITY_MS`是硬编码常量，`validUntil`在创建时一次性计算并冻结，`V1_3_ACCEPTANCE_TESTS.md` T34.5用独立硬编码基准值断言，不依赖运行时对象自证式反算。
+3. **不会无限等待进场**：16根15分钟K线（约4小时）足够让"回踩确认"这类交易设置有合理的实现窗口（15分钟结构的回踩通常在几根到十几根K线内完成或失败），同时又不会长到让一个早已过时的结构性判断继续挂在"等待触发"状态数天之久，与CEO"不允许建议永久等待进场"的要求直接对应。
+4. **实现成本低、与既有状态机自然衔接**：`TF_MS`常量在`v1-core.js`/`v1_2-forecast-core.js`中已经重复定义（`{"15m":900000,"1h":3600000,"4h":14400000}`），`v1_3-signal-archive-core.js`只读复用该常量表达式即可，不需要引入新的时间单位换算逻辑。
+
+**未采用的备选方案及排除理由**：曾考虑以15分钟（1根K线，`TF_MS['15m']`）为默认有效期——排除理由：过短，绝大多数回踩型进场区在1根K线内几乎不可能触发，会导致触发率被人为压低，产生"系统建议大量过期"的误导性统计，与CEO"客观检查系统准确度"的初衷相悖。也曾考虑以1小时（`TF_MS['1h']`）为默认——排除理由：1小时是三个时间窗里的中间层级，缺乏像"h4=趋势定调窗口"或"m15=触发确认窗口"那样清晰的语义支撑，选择它更接近任意拍板而非有先例的推导。
+
+### 9.3 关键设计判断记录（本轮新增，供CEO复核的架构判断）
+
+1. **"失效位"与"止损位"的数值收敛**：CEO要求判断"触发进场后先到止损、失效位还是目标位"，但V1.1的`exitConditions`/`triggerPlans.invalidation`是文案数组，没有定义独立于`stopLoss`的第二个数值失效价位。本文档确认这是一次**忠实于现有数据结构的收敛处理**而非遗漏：`SignalSnapshot.invalidation`字段继续保留文案证据（审计用途），但状态机判定只在`stopLoss`与`targets`之间比较先后（SPEC §15.5"设计说明"已注明）。
+2. **不模拟移动止损**：`TARGET_1_HIT`/`TARGET_2_HIT`之后的止损判定统一使用`SignalSnapshot.stopLoss`原始冻结值，不引入draft-2 §6.10式的"移动止损到保本位"假设。理由：移动止损是Paper Trading账户里的主动仓位管理动作，若在Signal Archive里模拟，等同于为V1.1从未做出过的具体交易管理动作背书，与CEO"不得后见之明"的精神冲突。
+3. **`PAPER_ALGORITHM_VERSION`保持不变**：本轮文档整体版本号升级到`v1.3-draft-3`，但`PAPER_ALGORITHM_VERSION`（描述§2-§8模拟账户算法）保持`'v1.3-draft-2'`不变，因为该部分规则字面零改动；新增`SIGNAL_ARCHIVE_ALGORITHM_VERSION='v1.3-draft-3'`独立维护建议档案子系统自己的版本号（SPEC §15.14）。
+4. **Signal Archive与Paper Trading单向依赖**：`v1_3-signal-archive-core.js`（下轮实现）**不得**依赖`v1_3-paper-trading-core.js`内部实现，仅通过`signalId`/`tradeId`指针与`confirmOpenPosition`新增的可选`signalId`参数关联；`v1_3-signal-archive-core.js`可以独立于Paper Trading Account是否已经实现而先行开发与测试（CODEX_TASK §7.1/§7.3已注明）。
+5. **BTC结构快照的只读边界**：`SignalSnapshot.btcStructureSnapshot`通过只读调用`v1-core.js`已导出的`analyzeKlines()`对BTC原始K线（`window.__lastMarketData.btc`）生成，**不**重新做多空方向判断——`biasDirection`/`btcAlignment`等方向性结论仍完全来自V1.1原始决策对象，只是把V1.1内部已经用来计算这些结论的BTC结构原始数据也存档，供未来审计追溯"当时BTC结构具体是什么样"，不违反draft-2 §7.1"V1.3只读消费V1.1，不重新计算"的红线。
+
+### 9.4 CEO"十三、测试要求"逐条映射（对应`V1_3_ACCEPTANCE_TESTS.md` T28-T43）
+
+| CEO测试要求原文 | 对应测试类别 |
+|---|---|
+| 可执行建议自动创建快照 | T28 |
+| blocked建议不进入正式档案 / 手动观察模式不进入正式档案 | T29 |
+| 同一K线同一计划去重 / 新收盘K线但计划无实质变化不重复 / 计划变化创建新版本 | T30 |
+| 快照不能被刷新覆盖 | T31 |
+| 只使用dataAsOf之后K线 | T33.1 |
+| 未触发过期不算亏损 | T34 |
+| 进场与止损同K线按止损 / 止损与目标同K线按止损 / 跳空止损 | T33 |
+| 目标1/2/3 | T35 |
+| MFE/MAE / 毛R与净R | T36 |
+| 数据缺口回补 / 无法回补排除统计 | T37、T40.3 |
+| 影子结果不改变500 USDT账户 | T38 |
+| 用户点击模拟开仓正确关联signalId | T39.2 |
+| 用户错过建议统计 | T39.3、T40.9-T40.10 |
+| 多空与市场状态分组统计 | T40.5-T40.8 |
+| JSON/CSV导出安全 | T41.4-T41.6 |
+| 删除建议历史二次确认 / 删除建议历史不重置模拟账户 | T42 |
+| 旧V1.1/V1.2测试保持通过 | T43（追加于draft-2 T27） |
+
+全部CEO列出的测试要求均已映射到具体测试类别，无遗漏项。
+
+### 9.5 修改范围核查（对应CEO"十四、修改范围"）
+
+本轮实际修改的文件**仅**限于CEO明确列出的四份文档（`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ACCEPTANCE_TESTS.md`/`V1_3_ARCHITECTURE_REVIEW.md`），未新增、未修改任何HTML/JS/构建脚本/既有测试文件，未创建任何正式实现文件（`v1_3-signal-archive-core.js`等均只在CODEX_TASK §7.2作为"下一轮实现规划"列出，本轮未创建）。未自动建立任何`PaperPosition`（本轮为文档设计，无运行时行为；SPEC §15.0/§15.6在设计层面也明确禁止）。未把影子验证写入模拟账户（SPEC §15.0红线，本节§9.1第一项已核对）。
+
+### 9.6 风险清单（本轮新增）
+
+1. **影子撮合的"同一根K线内进场后止损"分支是本轮实现复杂度最高的点**：与draft-2 `calcBreakevenStop`类似，容易在"先算entryFillPrice还是先算stopFillPrice"的顺序上出错。建议实现阶段优先为SPEC §15.6.A的"entryHit且同根K线也触及stopLoss"分支单独编写测试（`V1_3_ACCEPTANCE_TESTS.md` T33.4），在实现主流程之前跑通。
+2. **准确度统计的分组维度较多（方向×市场状态×预测背景×BTC态度×用户行为，共5个独立分组维度），实现时容易出现"某个分组遗漏了应该归入'无数据'桶的边界记录"（例如`forecastSnapshot===null`）而被静默丢弃，导致分组总和与总体统计对不上**。建议`computeSignalAccuracyStats`内部为每个分组维度都做一次"总和校验"（各分组计数之和必须等于分组前的总数），作为该函数自身的内部断言，而不只依赖外部测试。
+3. **`ethAlphaSignalArchive`/`ethAlphaSignalEvents`容量上限（2000条，本文档建议值，非CEO明确决策的数字）与draft-2幂等键环形缓冲（500条）同属"本文档给出的默认建议"性质，实现阶段可以根据实际数据量调整，但调整时需注意`ethAlphaShadowResults`的孤儿记录清理逻辑要与容量裁剪逻辑保持同步（容量裁剪淘汰某条`SignalSnapshot`后，其对应`ShadowResult`也应一并清理，否则会积累无主记录）。
+4. **`SignalSnapshot`与`decisionSnapshot`存在字段重叠但不完全重复的风险**：SPEC §15.2已明确"ATR/EMA/Swing/成交量/动态支撑压力均已包含在`decisionSnapshot.ltf15m/mtf1h/htf4h`内，不重复抽取"，实现阶段需注意不要因为"顶层字段读起来更方便"而擅自在`SignalSnapshot`顶层又抽取一份冗余副本——这会引入两份数据不同步的风险（`decisionSnapshot`是`deepClone`的完整对象，若顶层再单独抽取字段，未来`v1-core.js`若合法修订了`analyzeKlines()`内部字段名，两处会不同步失效）。
+
+### 9.7 仍需CEO决定的问题
+
+无。CEO本轮"十二、默认有效期"要求的自行决策已在§9.2给出并说明理由，CEO本轮其余十三项要求均已在§9.1核对表中确认落地。若实现阶段（Codex编码）发现本文档未能预见的边界情况，将在`V1_3_IMPLEMENTATION_REPORT.md`中记录并视需要提请CEO补充决策，不属于本轮文档范围。
