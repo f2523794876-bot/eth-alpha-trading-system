@@ -1,6 +1,6 @@
 # V1_3_CODEX_IMPLEMENTATION_TASK.md — 给 Codex 的 V1.3「模拟交易账户」实现工单
 
-版本：v1.3-draft-1（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-1 同步）
+版本：v1.3-draft-2（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-2 同步，对应CEO七项决策+三项统一规则，见SPEC §14变更记录）
 依据：`V1_3_PAPER_TRADING_SPEC.md`（算法真相来源，本文档只定义"怎么落地成代码"，不重复定义算法，任何算法细节冲突以该文档为准）+ 现有 `v1-core.js`（V1.1冻结核心）+ `v1_2-forecast-core.js`（V1.2冻结核心），两者**均不可修改**。
 角色分工：本文档作者（Claude Code）负责本轮 V1.3 的架构设计与验收规范，**不编写正式业务代码**；Codex 负责实际编码；本文档、`V1_3_ACCEPTANCE_TESTS.md`、`V1_3_ARCHITECTURE_REVIEW.md` 与 `V1_3_PAPER_TRADING_SPEC.md` 是本轮交付的全部四份文档，本轮**不交付任何业务代码或测试代码**。
 
@@ -23,7 +23,8 @@
 - **不修改** `v1-core.js`、`v1_2-forecast-core.js` 已验收的任何函数体、导出签名或算法常量——只允许以`require`/`window.ETHAlphaCore`/`window.ETHAlphaForecast`只读方式调用两者已导出的函数。
 - 不实现V2历史校准（回放引擎、Brier Score、方向准确率、区间覆盖率、校准曲线）。
 - 不实现V3 WebSocket实时架构、条件提醒推送（`Notification` API）、长期运行监控——`模拟仓位`已从原V3范围拆出（见`V1_3_PAPER_TRADING_SPEC.md`§0.1），但这三项**仍然**不在本轮范围内，提前实现视为范围蔓延。
-- 不实现任何"无用户点击确认的自动模拟开仓/加仓/平仓"路径——`confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose` 四个函数**必须**要求一个只能来自真实UI点击事件的 `proposal`/确认参数，定时器（`setInterval(refresh,30000)`）触发的刷新回调**只允许**调用只读的 `scanClosedBarsForExits`（止损/止盈的自动触发，这是"已有仓位的风控执行"，不是"无人确认的新开仓"，两者性质不同，不得混淆——止损止盈触发是持有仓位期间的既定退出规则自动执行，而不是开立新头寸）。
+- 不实现任何"无用户点击确认的自动模拟开仓/加仓/平仓"路径——`confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose`/`confirmConservativeSettlement`/`resetPaperAccount`/`changeInitialCapital`/`confirmForcedObservationAcknowledgement` 全部要求一个只能来自真实UI点击事件的确认参数 + 稳定的 `idempotencyKey`（SPEC §6.11，CEO决策第10项），定时器（`setInterval(refresh,30000)`）触发的刷新回调**只允许**调用只读的 `scanClosedBarsForExits`/`replayDataGap`（止损/止盈的自动触发与数据缺口回放尝试，这是"已有仓位的风控执行/审计追溯"，不是"无人确认的新开仓"，两者性质不同，不得混淆）。
+- 不实现`UNRESOLVED_DATA_GAP`状态下的任何自动平仓——该状态只能通过用户显式点击"确认保守结算"（`confirmConservativeSettlement`）走出，禁止用定时器或数据恢复回调直接把仓位标记为已平仓（SPEC §8.4-8.5）。
 
 ### 1.3 不修改既有文件（红线，本轮范围边界）
 
@@ -50,28 +51,39 @@
 - 实现 `PaperAccount`/`PaperAccountSettings` 接口对应的 JS 对象结构、`loadPaperAccount`/`savePaperAccount`/`validatePaperAccountSettings`/`migratePaperAccount`。
 - 先把损坏JSON/容量不足/版本不兼容的降级路径（SPEC §9.2）跑通并配上最基础的单测，再进入下一步——这是历史教训：V1.2第一轮曾因为"先写主流程，异常路径留到最后补"而漏掉§12.3红线场景，本轮改为异常路径与主流程同步实现。
 
-### 步骤2：风险预算与状态机（对应SPEC §5、§3.4）
+### 步骤2：会计恒等式、风险预算与状态机（对应SPEC §2.2、§5、§3.4）
 
-- 实现 `calcRiskRegime`/`calcDrawdown`，接入`C.calcRiskBudget`作为核心求解器（SPEC §5.1），不重新发明公式。
-- 实现 `PositionStatus` 状态机与状态转换表（SPEC §3.4）的纯函数校验（给定当前状态+事件，返回允许的下一状态或拒绝原因），单独可测，不与UI耦合。
+- 严格按SPEC §2.2字段命名实现：`equity`/`cash`/`availableBalance`（**必须**是`equity-marginUsed`，不是`cash-marginUsed`，这是draft-2相对draft-1的修正点，实现时要特别注意不要沿用直觉上更常见的"可用=现金-保证金"写法）/`marginUsed`/`realizedPnlGross`/`unrealizedPnl`/`feesTotal`/`slippageCostReport`。
+- 实现 `calcRiskRegime`/`calcDrawdown`（回撤基准为`peakEquity`，只在账户重置时重建，SPEC §5.4）/`calcDailyStartEquity`（SPEC §5.3的"当前净值反减今天已发生已实现盈亏、反加今天已发生手续费"闭式重建公式，**不得**简化成"直接取当前净值"，即使多数正常跨日场景下两者数值相同，也必须实现完整公式以覆盖应用重载/首次启动场景）。
+- 单笔/试仓风险预算求解**只能**传入`equity`（当前净值）作为`C.calcRiskBudget`的`capital`实参（SPEC §5.1红线），代码里建议直接用`equity`命名局部变量传参，不要用`capital`这类容易让人误以为是固定本金的命名，避免后续维护者看错。
+- 实现 `PositionStatus` 状态机与状态转换表（SPEC §3.4，**新增`UNRESOLVED_DATA_GAP`**）的纯函数校验，单独可测，不与UI耦合。
 
 ### 步骤3：撮合引擎（对应SPEC §6）
 
-- 先实现 `buildTradeProposal`（只读，无副作用），再实现 `confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose`（点击型撮合，含§6.11防重复点击的锁与一次性方案消费）。
-- 再实现 `scanClosedBarsForExits`（K线扫描型撮合，含§6.7同K线冲突、§6.8跳空止损、§6.9止盈保守成交、§6.10部分止盈与`calcBreakevenStop`）。
-- **每个撮合函数落地后立即补齐对应的`tests/v13-paper-trading-tests.js`用例，不要把所有撮合规则都写完了再统一补测试**——保守撮合规则细节多，边写边测能更快发现"同一根K线冲突/跳空/精度取整顺序"这类容易犯错的边界。
+- 先实现 `buildTradeProposal`（只读，无副作用），再实现 `confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose`（点击型撮合，含§6.11幂等键机制，见步骤5）。
+- 实现 `calcBreakevenStop`（SPEC §6.10闭式解，多空两个方向分别实现，**必须**包含开仓手续费+预计平仓手续费+实际滑点三项成本，不能只用`entryPrice`简化替代）；实现50/30/20分批止盈（SPEC §6.10，**最后一档必须直接取`trade.quantity`当前剩余全部，不得独立按比例重新计算，以规避取整尾差**）。
+- 实现加仓的统一止损风险校验（SPEC §5.2条件7：加仓后用**唯一的**`currentStop`计算`worstCaseLoss`，与`equity×maxRiskPct`比较），**不要**照抄`STRATEGY_SPEC.md §8.2`原文里"试仓风险+加仓风险分别求和"的旧口径，SPEC §5.2已明确本轮采用统一止损口径，两种口径在多数场景下数值相近但公式不同，必须以`V1_3_PAPER_TRADING_SPEC.md`当前版本为准。
+- 再实现 `scanClosedBarsForExits`（K线扫描型撮合，含§6.7同K线冲突、§6.8跳空止损、§6.9止盈保守成交）。
+- **每个撮合函数落地后立即补齐对应的`tests/v13-paper-trading-tests.js`用例，不要把所有撮合规则都写完了再统一补测试**。
 
-### 步骤4：与V1.1/V1.2联动只读接线（对应SPEC §7）
+### 步骤4：数据缺口检测、回放与保守结算（对应SPEC §8，draft-2新增步骤）
 
-- `deepClone`辅助函数（建议直接用 `JSON.parse(JSON.stringify(x))`，与SPEC §7.2要求一致，不需要引入额外的深拷贝库）。
+- 实现`replayDataGap(trade, marketData, account, storage)`：数据恢复后按SPEC §8.3逐根回放缺失K线，**必须**先判断`fetchAllTimeframeKlines`返回的已收盘K线是否完整覆盖缺口（`openTime`序列是否等间隔连续），完整覆盖才执行回放并解除`UNRESOLVED_DATA_GAP`，否则把`replayAttempt`记录为`STILL_GAP`并保持该状态——**不得**为了让测试更容易通过而简化成"只要拿到新数据就假设覆盖完整"。
+- 实现`confirmConservativeSettlement(trade, account, storage, idempotencyKey)`：只能由用户显式确认触发，成交价取"缺口结束后第一根可获得的已收盘K线的`open`价格"并叠加不利滑点（SPEC §8.5），产生`closeReason='DATA_GAP_CONSERVATIVE'`、`estimated=true`、`verified=false`的最终记录。
+- **红线**：`estimated`/`verified`两个字段必须真实反映交易是否走过保守结算路径，`exportPaperLogsJSON`/`exportPaperLogsCSV`必须原样导出这两个字段，供下游任何统计（含未来V1.4+）过滤估算交易。
+
+### 步骤5：与V1.1/V1.2联动只读接线 + 幂等键机制（对应SPEC §7、§6.11）
+
+- `deepClone`辅助函数（建议直接用 `JSON.parse(JSON.stringify(x))`）。
 - 确认事件监听顺序：V1.3的`v11decision`监听器注册代码必须出现在模板拼接顺序里V1.2监听器**之后**（见§4构建接线）。
+- 实现`account.processedIdempotencyKeys`有界环形缓冲（建议最近500条）+ 幂等重放逻辑（SPEC §6.11）：开仓/加仓/减仓/平仓/重置/改本金/解除强制观察**全部**七类操作必须支持传入`idempotencyKey`，重复的key必须返回上一次的结果而不是报错或重新执行——这是draft-2相对draft-1"一次性方案消费+拒绝重复"更严格的要求，实现时注意区分"幂等重放"（返回原结果）与"简单拒绝"（返回错误）两种不同语义，不要混用。
 
-### 步骤5：导出与重置（对应SPEC §2.4、§11）
+### 步骤6：导出与重置（对应SPEC §2.4、§11）
 
-- `exportPaperLogsJSON`/`exportPaperLogsCSV`：CSV导出必须复用`v1-core.js`已导出的`csvCell`辅助函数做公式注入转义（不得重新发明一套转义规则，`audit-fixes-tests.js`此前已经为CSV公式注入问题写过回归测试，V1.3必须延续同一防护）。
-- `resetPaperAccount`/`changeInitialCapital`二次确认流程。
+- `exportPaperLogsJSON`/`exportPaperLogsCSV`：CSV导出必须复用`v1-core.js`已导出的`csvCell`辅助函数做公式注入转义。
+- `resetPaperAccount`/`changeInitialCapital`二次确认流程，**必须**验证`peakEquity`只在`resetPaperAccount`里被重建，`changeInitialCapital`（即使同时选择"重置账户"选项）也只能通过内部调用同一条重置路径来重建`peakEquity`，不能有第二条独立实现（避免两处实现分叉导致以后只改了一处）。
 
-### 步骤6：UI接线（对应SPEC §10）
+### 步骤7：UI接线（对应SPEC §10）
 
 - 在 `eth-dynamic-trading-dashboard.html` 现有V1.2预测区域 `</section>` 之后（具体定位以文件当前实际结构为准，Codex实现时自行定位不猜测行号，与V1.2实现时的既有做法一致），新增：
   ```html
@@ -81,12 +93,12 @@
   ```
 - 新增 `<script data-v13="paper-trading">/*__PAPER__*/</script>`，紧跟在V1.2的 `<script data-v12="forecast-layer">` 之后（不得插在V1.1/V1.2两块脚本中间）。
 
-### 步骤7：构建脚本接线（对应`work/build-v1.js`已有的`replaceExact`精确计数保护机制，见§4）
+### 步骤8：构建脚本接线（对应`work/build-v1.js`已有的`replaceExact`精确计数保护机制，见§4）
 
-### 步骤8：自测与回归
+### 步骤9：自测与回归
 
 - 按`V1_3_ACCEPTANCE_TESTS.md`全部测试类别自测通过。
-- **必须**重新完整跑一遍V1.1（`v1-tests.js`/`v11-tests.js`/`audit-fixes-tests.js`/`v11-ui-tests.js`/`third-review-tests.js`/`live-rest-test.js`）与V1.2（`v12-forecast-tests.js`/`v12-ui-tests.js`/`v12-live-rest-test.js`）全部既有测试，确认零回归（`V1_3_ACCEPTANCE_TESTS.md`§9列出具体回归要求）。
+- **必须**重新完整跑一遍V1.1（`v1-tests.js`/`v11-tests.js`/`audit-fixes-tests.js`/`v11-ui-tests.js`/`third-review-tests.js`/`live-rest-test.js`）与V1.2（`v12-forecast-tests.js`/`v12-ui-tests.js`/`v12-live-rest-test.js`）全部既有测试，确认零回归（`V1_3_ACCEPTANCE_TESTS.md` T27列出具体回归要求）。
 
 ---
 

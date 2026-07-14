@@ -1,7 +1,7 @@
 # V1_3_ARCHITECTURE_REVIEW.md — V1.3「模拟交易账户」架构复核与一致性核查
 
-版本：v1.3-draft-1
-角色：本文档是四份V1.3文档中的最后一份，职责是**核对前三份文档（`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ACCEPTANCE_TESTS.md`）互相一致**，核对与V1.1/V1.2/`STRATEGY_SPEC.md`既有代码接口的一致性，给出风险清单，并作为交给CEO复审的入口文档。本文档不新增算法规则，如发现三份文档之间的不一致，以`V1_3_PAPER_TRADING_SPEC.md`为准并在此记录。
+版本：v1.3-draft-2（对应CEO七项决策+三项统一规则，见`V1_3_PAPER_TRADING_SPEC.md`§14变更记录）
+角色：本文档是四份V1.3文档中的最后一份，职责是**核对前三份文档（`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ACCEPTANCE_TESTS.md`）互相一致**，核对与V1.1/V1.2/`STRATEGY_SPEC.md`既有代码接口的一致性，给出风险清单，并作为交给CEO复审的入口文档。
 
 ---
 
@@ -12,120 +12,92 @@
 | 基准分支 | `main` |
 | 基准标签 | `v1.2.0`（提交 `0dc1943e744f0e997f48c7e2470f71fd80a64c64`） |
 | 工作分支 | `claude/v1.3-paper-trading-spec` |
-| V1.2预测层确认 | `main`已合并`v1_2-forecast-core.js`/`V1_2_FORECAST_SPEC.md`/`tests/v12-*.js`，`v1-core.js` SHA-256为`0a4d9e712859d79ecae592aacffe371abfba29a2c6b7b76119a68c49e0471a97`（V1.1冻结），本轮基于此基准展开设计，未修改任何既有文件 |
+| 本轮性质 | draft-1的7项开放问题（`V1_3_PAPER_TRADING_SPEC.md`draft-1 §13）+ 3项统一规则，已由CEO逐条决策，本轮为增量修订，不改变draft-1已确认无争议的部分（撮合方向表、K线扫描顺序、同K线冲突/跳空红线、构建脚本接线方式等） |
 
 ---
 
-## 1. 三份V1.3文档一致性核对表
+## 1. CEO七项决策+三项统一规则的逐条落地核对表
 
-| 概念 | SPEC定义章节 | CODEX_TASK是否落地 | ACCEPTANCE_TESTS是否覆盖 | 一致？ |
-|---|---|---|---|---|
-| `PaperAccount`/`PaperAccountSettings`接口 | §2.1 | 步骤1 | T1 | 一致 |
-| 会计恒等式 | §2.2 | 步骤1 | T1.2-T1.5 | 一致 |
-| "模拟USDT本位合约"边界（不做强平） | §2.3 | 1.2禁止清单隐含（未新增强平逻辑） | 无专项用例（因为是"不做什么"，用T1/T2/T3的正常流程间接印证没有强平字段出现） | 一致，建议实现时对`PaperTrade`接口做一次"字段黑名单"扫描（不出现`liquidationPrice`等字段），本文档在此补充为验收隐含要求 |
-| 初始本金修改/重置二次确认 | §2.4 | 步骤5 | T1.6-T1.9、T16 | 一致 |
-| 持仓并发范围（单方向） | §3.1 | 步骤2状态机 | T21（间接：已有反方向持仓时新开仓应被状态机拒绝，建议在实现时把这条也纳入T21用例，本文档标注为待补） | **需在实现阶段于T21补充一条"反向持仓拒绝"用例**，见§4风险清单 |
-| `PaperTrade`/`PaperFill`接口 | §3.2-§3.3 | 步骤1/3 | T2、T3、T19 | 一致 |
-| 状态机 | §3.4 | 步骤2 | T21 | 一致 |
-| 未实现/已实现盈亏公式 | §4.1-4.2 | 步骤3 | T2.6、T3.5 | 一致 |
-| 加权平均建仓价 | §4.3 | 步骤3 | T6.2 | 一致 |
-| 手续费/滑点公式 | §4.4 | 步骤3 | T4 | 一致 |
-| 单笔/试仓风险预算 | §5.1 | 步骤2 | 间接覆盖于T6.3（加仓风险预算测试同时验证了`calcRiskBudget`调用方式），建议实现阶段为T2/T3补充独立的"试仓风险预算金额=净值×0.5%"数值断言 | **建议实现阶段补充独立数值断言**，见§4风险清单 |
-| 加仓风险预算（STRATEGY_SPEC §8.2实现） | §5.2 | 步骤2/3 | T6、T7 | 一致 |
-| 当日亏损锁定 | §5.3 | 步骤2 | T8 | 一致 |
-| 总回撤强制观察 | §5.4 | 步骤2 | T9 | 一致 |
-| 杠杆边界（不进入风险预算公式） | §5.5 | 步骤2/3 | 无专项用例（当前T6.3等隐含验证了风险预算公式不含杠杆项），建议补充一条"改变杠杆不改变`maxLossAmount`"的显式回归用例 | **建议实现阶段补充**，见§4风险清单 |
-| 交易方案生成 | §6.1 | 步骤3 | T2.1、T17、T18 | 一致 |
-| 参考价/撮合时间/陈旧禁止成交 | §6.2 | 步骤3 | T10 | 一致 |
-| 滑点方向/手续费 | §6.3-6.4 | 步骤3 | T4 | 一致 |
-| REST轮询复用（不新增） | §6.5 | 步骤4（事件时序） | 无专项自动化用例（属于"没有新增网络调用"这类反向断言，建议在`v13-live-rest-test.js`里加一条"整个测试过程中fetch调用次数不超过V1.1本身产生的次数"的计数断言） | **建议实现阶段补充**，见§4风险清单 |
-| K线OHLC扫描止损止盈 | §6.6 | 步骤3 | T2.4/T2.5、T3.3/T3.4 | 一致 |
-| 同K线冲突 | §6.7 | 步骤3 | T12 | 一致 |
-| 跳空止损/止盈保守成交 | §6.8-6.9 | 步骤3 | T13 | 一致 |
-| 部分止盈/移动止损 | §6.10 | 步骤3 | T5 | 一致 |
-| 防重复点击 | §6.11 | 步骤3 | T11 | 一致 |
-| 精度/最小名义价值 | §6.12 | 步骤3 | T20 | 一致 |
-| V1.1/V1.2权限边界 | §7.1 | 步骤4 | T17、T18 | 一致 |
-| 建仓快照冻结（深拷贝） | §7.2 | 步骤4 | T19 | 一致 |
-| 事件时序（V1.3监听器在V1.2之后） | §7.3 | 步骤6/构建接线§4 | 无专项自动化用例（建议`v13-ui-tests.js`对构建产物做正则断言，确认`data-v13`脚本块在`data-v12`脚本块之后出现） | **建议实现阶段补充**，见§4风险清单 |
-| 数据失败展示/恢复重扫 | §8 | 步骤3/4 | T10、（数据恢复重扫的完整链路）建议补充专项"断连后K线积压逐根扫描"用例 | **建议实现阶段补充**，见§4风险清单 |
-| localStorage schema/迁移 | §9 | 步骤1 | T14 | 一致 |
-| UI字段与文案 | §10 | 步骤6 | 建议`v13-ui-tests.js`对照`v12-ui-tests.js`已有的"禁用交易宣传措辞"/"常驻免责声明"正则扫描模式，逐条覆盖 | 一致（具体实现阶段落地） |
-| 函数接口清单 | §11 | 步骤1-5 | 覆盖于T1-T20全部功能测试 | 一致 |
-| 版本号红线 | §12 | 未在步骤中单列，建议补充为步骤1的一部分 | 无专项用例，建议比照`V1_2_FORECAST_SPEC.md`checksum模式补充一条"版本号常量与算法变化同步"回归用例 | **建议实现阶段补充**，见§4风险清单 |
+| # | CEO决策要点 | SPEC落地章节 | CODEX_TASK是否同步 | ACCEPTANCE_TESTS是否覆盖 | 状态 |
+|---|---|---|---|---|---|
+| 1 | 总回撤基准=`peakEquity`（历史最高净值），公式`(peakEquity-currentEquity)/peakEquity`，只在重置时重置 | §5.4、§2.4 | 步骤2/6 | T9、T1.8、T9.5、T16.2 | 已关闭 |
+| 2 | 单笔1%/试仓0.5%风险预算恒以当前净值为基准，禁止用名义本金/杠杆后资金/固定500 | §5.1（红线） | 步骤2 | T26 | 已关闭 |
+| 3 | 每笔交易最多加仓1次 | §5.2条件5 | 步骤3 | T7.5 | 已关闭 |
+| 4 | 加仓七项前置条件（浮盈/V1.1许可/专业条件/成本保本位/统一止损1%/二次确认/禁止摊平） | §5.2、§6.10（`calcBreakevenStop`闭式解） | 步骤2、3 | T6、T7.6、T7.7 | 已关闭 |
+| 5 | 50/30/20分批止盈，处理精度尾差，最后一次清空全部剩余 | §6.10 | 步骤3 | T5 | 已关闭 |
+| 6 | 新增`UNRESOLVED_DATA_GAP`状态+回放+保守结算+`estimated`/`verified` | §3.4、§8 | 步骤4 | T21.3、T22、T23、T24、T25 | 已关闭 |
+| 7 | 修正历史文档"模拟仓位=V3"过时措辞 | §0.1 | — | — | 已关闭（见§5本文档独立核查表） |
+| 8 | 当日亏损用UTC自然日，UI同时显示UTC与本地时间，缺快照时确定性回退 | §5.3 | 步骤2 | T8 | 已关闭 |
+| 9 | 账户会计字段区分：`equity`/`cash`/`availableBalance`/`marginUsed`/`realizedPnlGross`/`unrealizedPnl`/`feesTotal`/`slippageCostReport`，`availableBalance=equity-marginUsed` | §2.2 | 步骤2 | T1.3、T1.4 | 已关闭 |
+| 10 | 统一`idempotencyKey`机制，覆盖开仓/加仓/减仓/平仓/重置 | §6.11 | 步骤5 | T11、T6.7、T16.4 | 已关闭 |
 
-**结论**：三份文档核心概念覆盖完整、互相引用一致；本节标记的"建议实现阶段补充"共6项，均为**测试覆盖粒度的加强建议**，不是设计矛盾或缺口，将在下一轮`V1_3_CODEX_IMPLEMENTATION_TASK.md`执行时一并转化为`V1_3_ACCEPTANCE_TESTS.md`的具体新增用例（不在本轮文档交付范围内修改测试文档本身，因为本轮不产出可执行代码，用例的精确断言写法最好等实现阶段结合真实函数签名一起定稿，避免文档阶段就把断言写死导致与实现细节脱节）。
+**结论**：draft-1遗留的全部7项开放问题与本轮新增的3项统一规则，经核对**已在SPEC/CODEX_TASK/ACCEPTANCE_TESTS三份文档中逐条一致落地**，`V1_3_PAPER_TRADING_SPEC.md`§13（"需要CEO确认的问题"）本轮归零。
 
 ---
 
-## 2. 与既有代码接口的核对表（对照V1.2文档同款"因子对照表"风格）
+## 2. 关键设计一致性说明（本轮修订中值得记录的架构判断）
 
-| V1.3读取的字段 | 来源 | 真实存在？（本次复核方式） | 用途 |
-|---|---|---|---|
-| `decision.biasDirection` | `v1-core.js buildDecision` | 存在（`d.biasDirection=ad.biasDirection`） | 开仓方向门禁 |
-| `decision.worthBetting` | 同上 | 存在（`worthBetting=!manual&&health==='normal'&&p.level==='trend_entry_allowed'&&...`） | 开仓门禁 |
-| `decision.opportunityScores.blocked` | 同上，经`calcOpportunityScores`/`assessHardBlocks` | 存在 | 硬性否决门禁 |
-| `decision.signalPermission.addOnAllowed` | 同上，经`computeSignalPermission` | 存在（仅`full_aligned`为true） | 加仓结构性条件 |
-| `decision.stopLoss`/`decision.targets` | 同上，经`buildStopAndTargets` | 存在 | 建仓止损/目标来源 |
-| `decision.exitConditions` | 同上，经`buildExitConditions` | 存在 | `invalidation`快照字段来源 |
-| `decision.dataHealth` | 同上，经`assessOverallHealth` | 存在，取值`'normal'/'delayed'/'invalid'` | 陈旧/失效门禁 |
-| `decision.isManual` | 同上 | 存在 | 手动模式门禁 |
-| `decision.price`/`decision.confirmedPrice` | 同上（`e15.price`/`e15.confirmedPrice`） | 存在，两者语义不同（本文档已在SPEC §4.1明确区分用途） | 估值用`price`，判定用已收盘K线 |
-| `C.calcRiskBudget(entry,stop,settings,cost)` | `v1-core.js`已导出 | 存在（含`maxLossAmount`/`suggestedNotional`/`suggestedMargin`/`totalRisk`/`projectedAddOnRisk`/`addOnWithinBudget`） | V1.3风险预算核心复用 |
-| `C.csvCell` | `v1-core.js`已导出 | 存在 | V1.3 CSV导出转义复用 |
-| `C.validateRiskSettings`风格 | `v1-core.js`已导出（虽是V1.1自己的设置校验，V1.3参照其风格自建`validatePaperAccountSettings`，不直接复用同一函数因为字段集合不同） | 存在，仅作风格参照 | 一致性参照 |
-| `window.__lastMarketData` | V1.1既有（`work/v1-ui.template.html`：`cache=await C.fetchAllTimeframeKlines();window.__lastMarketData=cache;`） | 存在 | V1.3撮合与K线扫描的数据来源 |
-| `window.__prevForecast` | V1.2既有 | 存在 | `forecastSnapshot`来源 |
-| `v11decision`自定义事件 | V1.1既有（`document.dispatchEvent(new CustomEvent('v11decision',{detail:d}))`） | 存在 | V1.3驱动估值刷新与K线扫描的唯一事件源 |
-| `window.invalidateDashboard`钩子链 | V1.1既有，V1.2已包装 | 存在（V1.2已在其基础上追加`clearForecast`），V1.3将在该包装链末尾**再次追加**（不覆盖V1.2的包装），实现方式与V1.2包装V1.1的手法一致 | 数据失败展示 |
-| `assessDataQuality`的`isStale`阈值 | `v1-core.js` | 存在（`max(2×TF_MS[timeframe],1800000)`） | V1.3陈旧判定直接复用，不新定义 |
-
-**结论**：本文档引用的全部V1.1/V1.2字段与函数经复核确认真实存在于当前`main`分支代码中，命名与实际导出完全一致，未出现"臆想接口"问题（这正是`V1_2_ARCHITECTURE_REVIEW.md`draft-1阶段曾经犯过、后来在draft-2修正的错误类型，本轮从设计之初就已核对源码，不是先写文档再核对）。
+1. **加仓风险口径从"分段求和"改为"统一止损"，反而更贴合既有schema**：draft-1曾照搬`STRATEGY_SPEC.md §8.2`原文"试仓风险+加仓风险分别求和"的表述，但`PaperTrade`接口本身只有**一个**`currentStop`字段（不是每个tranche各自的止损），分段求和口径在实现层面缺少对应的数据结构支撑。CEO决策第4项给出的"加仓后用统一止损计算最坏损失，与当前净值1%比较"口径与`PaperTrade`的单一`currentStop`字段完全对应，本次复核确认这是一次**澄清而非冲突**：新口径更容易正确实现，且不违背`STRATEGY_SPEC.md §8.2`"总风险不能超过预设风险预算"的原始意图，只是用更适合V1.3实际数据结构的方式落地。
+2. **`calcBreakevenStop`闭式解已给出完整推导**（SPEC§6.10），包含开仓手续费、预计平仓手续费、实际滑点三项成本，且在零成本假设下正确退化为`S=E`（验证过数学一致性）。这是本轮修订中复杂度最高的公式，`V1_3_ACCEPTANCE_TESTS.md` T5.1要求测试代入具体数值核对，是本文档认为的**最高实现风险点**（详见§4风险清单第1条）。
+3. **`availableBalance`公式的修正是CEO主动指出的架构调整**（`equity-marginUsed`取代draft-1的`cash-marginUsed`），本质是把V1.3的保证金记账模型从"仅现金视角"调整为更贴近真实交易所"全仓保证金"语义的"净值视角"（浮动盈亏同步影响可用余额）——本次复核确认这个改动**只影响`availableBalance`一个字段的计算方式**，不影响`cash`/`equity`/`marginUsed`任何一个字段自身的定义或恒等式，改动范围可控。
+4. **`dailyStartEquity`重建公式统一覆盖"正常跨日"与"应用重载/首次启动"两种场景**，避免了draft-1原先"跨日用一个规则、启动缺快照另想办法"的潜在口径分裂风险——本次复核确认单一公式（`equity_当前 - 今日已实现盈亏 + 今日手续费`）在正常跨日场景下会自然退化为等价于"直接用当前净值"，因此不需要为两种场景写两套逻辑，降低了实现出现口径不一致的风险。
+5. **`idempotencyKey`机制从"一次性方案消费"升级为"真正的幂等重放"**：draft-1的设计更接近"防止重复提交"（第二次调用报错），CEO决策第10项要求的是"同一个key重复调用返回同一个结果"（真正的幂等语义）。本次复核确认这一升级对`resetPaperAccount`尤其重要——因为"重复点击重置按钮"如果按draft-1的"报错"语义处理，用户会看到一个奇怪的错误提示（"重置失败"），而按新语义处理则会正确地"什么都不做，因为已经重置过了"，用户体验更合理。
 
 ---
 
-## 3. 命名空间与localStorage冲突核查
+## 3. 与既有代码接口的核对表（无变化部分从draft-1原样保留，仅新增本轮涉及的部分）
 
-| 命名空间类型 | V1.1 | V1.2 | V1.3 | 冲突？ |
-|---|---|---|---|---|
-| localStorage key | `ethAlphaDecisionLogs`/`ethAlphaRiskSettings` | `ethAlphaForecastLogs` | `ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog` | 不冲突 |
-| `window`全局对象 | `ETHAlphaCore` | `ETHAlphaForecast` | `ETHAlphaPaperTrading` | 不冲突 |
-| `window`原始引用 | 无 | `__lastMarketData`/`__prevForecast` | 新增`__paperAccount`（只读展示用） | 不冲突 |
-| 自定义DOM事件 | `v11decision`（唯一来源） | 监听既有，不新增 | 监听既有，不新增 | 不冲突 |
-| 测试文件命名 | 6个既有文件 | `v12-*.js`三个 | `v13-*.js`三个 | 不冲突 |
-| 构建占位符 | `/*__CORE__*/` | `/*__FORECAST__*/` | `/*__PAPER__*/`、`/*__PAPER_UI__*/`（新增） | 不冲突，且顺序要求见SPEC§7.3 |
+| V1.3读取/复用的字段或函数 | 来源 | 本轮新增用途 |
+|---|---|---|
+| `C.calcRiskBudget` | `v1-core.js` | 调用时实参`capital`位置传入`equity`（当前净值），命名上容易被后来实现者混淆为字面"资本金"，`V1_3_CODEX_IMPLEMENTATION_TASK.md`步骤2已特别提醒 |
+| `decision.signalPermission.addOnAllowed` | `v1-core.js`，经`computeSignalPermission` | 加仓条件2/3之一，未变 |
+| `assessDataQuality`的`isStale`阈值 | `v1-core.js` | 数据缺口检测的判定基础之一（结合`fetchAllTimeframeKlines`固定窗口大小判断能否完整回补），未变 |
 
----
-
-## 4. 风险清单
-
-1. **测试覆盖粒度待加强项（6项，见§1表格标注）**：均为"建议在实现阶段补充更细粒度断言"，不是设计缺口，风险等级低，已逐条列出，转交`V1_3_CODEX_IMPLEMENTATION_TASK.md`执行时处理。
-2. **历史文档措辞过时（不在本轮范围内修改）**：`CODEX_IMPLEMENTATION_TASK.md`第54/145/217/272行、`STRATEGY_SPEC.md`第936-938行、`V1_2_CODEX_IMPLEMENTATION_TASK.md`第30/247行仍把"模拟仓位"描述为V3范围或一个简化的"标注+outcome字段"概念，与本轮V1.3的实际范围和数据结构不再一致。本轮按任务要求只新增四份V1.3文档、不回填修改历史文档，此项需要CEO决定是否在下一轮追加一次"历史文档措辞对齐"的小改动（性质类似`V1_2`收尾时的`docs(v1.2): align factor terms and test numbering`提交）。
-3. **`calcRiskBudget`复用的字段冗余**：`v1-core.js calcRiskBudget(entry,stop,settings,cost)`的`settings`参数本身携带`takerFeeRate`/`spreadRate`/`slippageRate`字段，但函数体实际只使用单独传入的`cost`参数计算成本率（`settings`里的同名字段在该函数内被忽略）——这是V1.1既有代码的实现细节（不属于V1.3引入的问题），V1.3调用时必须显式传入`cost`参数而不能假设"把值放进`settings`就会生效"，`V1_3_CODEX_IMPLEMENTATION_TASK.md`步骤2实现时需要注意这个既有陷阱，本文档在此提前预警，避免重蹈"看接口签名以为参数会被使用，实际被忽略"的实现错误。
-4. **`equityHighWaterMark`回撤基准选择**（SPEC§5.4/§13问题1）与**风险预算基准选择**（SPEC§5.1/§13问题2）：均已在SPEC文档中明确标注为需要CEO确认的开放问题，本文档不重复展开，只提醒这两项一旦CEO给出不同选择，只需替换SPEC中对应的一个变量引用（`equityHighWaterMark`→`initialCapital`，或`account_equity`→`account.initialCapital`），不影响文档其余部分的设计完整性，改动成本低。
-5. **`calcBreakevenStop`的实现复杂度**（SPEC§6.10）：是本轮设计中数学上最复杂的一个纯函数（需要联立已实现盈亏、剩余仓位止损价三者的等式求解），`V1_3_CODEX_IMPLEMENTATION_TASK.md`已要求将其拆成独立可单测的纯函数，但仍建议实现阶段优先为这个函数编写测试（已在`V1_3_ACCEPTANCE_TESTS.md` T5.1中列出），因为它是"移动止损保护规则"能否真正达到"保本"效果的唯一保障点，如果实现有误，会在用户不知情的情况下让"移动到保本"变成"移动到一个仍然会小幅亏损的价位"。
-6. **数据长时间中断后的不可恢复缺口**（SPEC§8.3第3点）：属于极端场景（长时间断网/页面挂起后恢复），SPEC已给出"保守假设已触发止损"的降级策略并标注为需要CEO确认的问题（§13问题6），风险等级低但发生时影响直接（可能让一笔实际仍然浮盈的仓位被误判为已止损），建议CEO在下一轮明确是否接受这个保守假设，或要求改为"标记为不确定状态，需要用户人工核实"而不是系统自动判定。
+其余核对表项与draft-1一致，未重复列出，详见提交历史中draft-1版本的本节内容。
 
 ---
 
-## 5. V3边界重申
+## 4. 风险清单（本轮新增/更新）
 
-WebSocket、条件提醒推送（`Notification`主动推送）、长期运行监控均**未**在本轮四份V1.3文档中出现任何实现要求，`V1_3_CODEX_IMPLEMENTATION_TASK.md`§1.2显式列为"本轮禁止实现"。"模拟仓位追踪"本身已从原V3范围正式拆出并入V1.3（见`V1_3_PAPER_TRADING_SPEC.md`§0.1），这是本轮唯一的范围调整，不代表WebSocket/提醒/监控三项也一并提前。
-
----
-
-## 6. 需要CEO确认的问题（汇总自`V1_3_PAPER_TRADING_SPEC.md`§13，供本轮对话结尾统一呈现）
-
-1. 总回撤10%锁定基准：净值历史最高点（默认）vs 固定初始本金500 USDT？
-2. 单笔/试仓风险预算基准：当前账户净值（默认）vs 固定初始本金？
-3. 加仓次数上限：是否限定V1.3最多1次加仓（默认）？
-4. 加仓前是否强制要求止损已移动到保本价（默认要求）？
-5. 部分止盈默认比例50%/30%/20%与移动止损档位是否符合预期？
-6. 数据长时间中断且历史K线不足以完整回补时，是否认可"保守假设已触发止损"的默认降级处理？
-7.（本文档§4第2点新增）是否需要在下一轮追加一次历史文档措辞对齐（`CODEX_IMPLEMENTATION_TASK.md`/`STRATEGY_SPEC.md`/`V1_2_CODEX_IMPLEMENTATION_TASK.md`中"模拟仓位=V3范围"的过时措辞）？
+1. **`calcBreakevenStop`闭式解是本轮复杂度最高的实现点**：公式涉及"已实现盈亏-手续费"反推目标止损价，再考虑该止损价触发时自身也会产生新的滑点和手续费（自指性，公式推导已经处理，见SPEC§6.10），但实现时容易出现"忘记对`stopFillPrice`本身也要扣手续费"这类以为已经代入过就够了的错误。`V1_3_ACCEPTANCE_TESTS.md` T5.1要求逐项代入具体数值核对，建议实现阶段**优先**为这个函数编写测试（在实现主流程之前），因为它是加仓前置条件4的判定基础，如果算错会让"以为已经保本"的仓位其实仍在承担隐藏风险。
+2. **`UNRESOLVED_DATA_GAP`的"完整覆盖"判定依赖K线`openTime`序列连续性检查**：需要实现方对`fetchAllTimeframeKlines`固定窗口大小（当前约120根）有准确认知——如果断线时长导致所需回补的K线数量超过该窗口能覆盖的范围，必须正确判定为"不完整"而进入`UNRESOLVED_DATA_GAP`，不能因为"拿到了一些新数据看起来能凑合用"就误判为完整覆盖。这是draft-1风险清单已经点出、本轮通过引入显式状态和`coverageComplete`布尔字段进一步强化了可测试性的问题，风险等级从"中"降为"低"，但仍需实现阶段仔细处理边界（缺口长度恰好等于/略超过窗口大小的临界情况）。
+3. **`dailyStartEquity`重建公式依赖准确统计"今天（UTC）已经发生的全部`PaperFill`"**：需要遍历全部`PaperTrade.fills`按`fill.time`筛选UTC当天范围，实现时需注意`fill.time`是本地时间戳（`Date.now()`的毫秒数，与时区无关，本身不需要转换），只是"属于哪个UTC自然日"的判定需要用`new Date(fill.time).toISOString().slice(0,10)`这类UTC口径转换，不能用`toLocaleDateString`等本地时区口径，否则会与`dailyAnchorDateUTC`的UTC口径不一致产生边界错位（例如本地时区为UTC+8时，本地午夜与UTC午夜相差8小时，用错口径会导致同一笔交易被错误归入前一天或后一天）。
+4. **幂等键有界环形缓冲的容量选择（建议500条）是本文档给出的默认建议，不是CEO明确决策的数字**：如果实际使用中用户操作频率远超预期（不太可能，因为都是需要人工点击确认的操作），环形缓冲可能在极端场景下过早淘汰掉一个仍可能被重放的旧key，导致该key的"重放"退化为"重新执行"（对开仓/加仓等操作而言，重新执行等价于绕开了幂等保护）。风险等级低（人工点击频率不可能高到触发500条环形缓冲耗尽），但实现阶段可以考虑改为"只保留最近N分钟内的key"而不是"固定条数"，两种策略本文档不强制指定，留给实现阶段权衡。
 
 ---
 
-## 7. 变更记录
+## 5. 历史文档"模拟仓位=V3"过时措辞修订核查（CEO决策第7项）
 
-- v1.3-draft-1（本版本）：首次交付，基于`main`分支`v1.2.0`标签独立设计。
+本轮已对以下8份历史文档的相关措辞做了**追加说明式**修订（只在原文后追加"v1.3范围调整说明"括注，不删除、不改写原有历史记录本身，不改变V1.1/V1.2任何已验收的规范或代码）：
+
+| 文档 | 修订位置 | 修订方式 |
+|---|---|---|
+| `PROJECT_AUDIT.md` | 第9/11节各一处 | 追加说明模拟仓位已拆出至V1.3 |
+| `V1_2_ARCHITECTURE_REVIEW.md` | 第4节V3边界一处 | 同上 |
+| `V1_IMPLEMENTATION_REPORT.md` | 范围合规一处 | 同上 |
+| `ACCEPTANCE_TESTS.md` | 验收清单一处 | 同上 |
+| `CODEX_IMPLEMENTATION_TASK.md` | §1.4标题与正文、代码注释、§6禁止事项、验收清单，共7处 | 同上，其中§1.4标题额外调整为"V3：WebSocket、条件提醒与长期运行监控"（移除"模拟仓位"字样）并追加完整说明段落 |
+| `STRATEGY_SPEC.md` | 第20节前V2/V3范围代码块一处 | 同上，代码块标题同步调整 |
+| `V1_2_CODEX_IMPLEMENTATION_TASK.md` | §1.2禁止清单、§6禁止事项，共2处 | 同上 |
+| `V1_CHECKLIST.md` | 约束条一处 | 同上 |
+
+**核查结论**：全部修订均为"追加括注说明"，未删除任何历史陈述、未改变这些文档所描述的V1/V1.2阶段范围本身（V1/V1.2在当时确实没有实现模拟仓位，这一历史事实保持不变），只是澄清"模拟仓位从今往后不再属于V3范围"这一面向未来的分类调整。WebSocket、条件提醒推送、长期运行监控三项在全部8份文档中均**保持**归属V3不变。
+
+---
+
+## 6. V3边界重申
+
+WebSocket、条件提醒推送、长期运行监控**仍然**不在V1.3范围内。"模拟仓位追踪"已正式确立为V1.3范围（本文档§0.1/§5）。
+
+---
+
+## 7. 仍需CEO决定的问题
+
+无。draft-1列出的7项开放问题已全部由CEO在本轮决策关闭（见§1对照表）。本轮新增的3项统一规则同样已全部落地，未产生新的待决策开放问题。若实现阶段（Codex编码）过程中发现本文档未能预见的边界情况，将在`V1_3_IMPLEMENTATION_REPORT.md`中记录并视需要提请CEO补充决策，不属于本轮文档范围。
+
+---
+
+## 8. 变更记录
+
+- v1.3-draft-1：首次交付。
+- v1.3-draft-2（本版本）：CEO七项决策+三项统一规则全部核对落地，draft-1开放问题清单归零，新增本轮设计一致性说明（§2）与历史文档修订核查（§5）。
