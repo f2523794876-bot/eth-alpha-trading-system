@@ -1,6 +1,6 @@
 # V1_3_CODEX_IMPLEMENTATION_TASK.md — 给 Codex 的 V1.3「模拟交易账户」实现工单
 
-版本：v1.3-draft-3（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-3 同步；§1-§6为draft-2既有内容，本轮**零改动**，新增内容见§7）
+版本：v1.3-draft-4（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-4 同步；§1-§6为draft-2既有内容，draft-4对其中"逐笔点击确认"相关条款做了**原地改写**（见下方§1.2/§3标注与SPEC §17扫描记录），§7为draft-3新增内容不变，新增§8为draft-4「自动模拟交易引擎」实现工单）
 依据：`V1_3_PAPER_TRADING_SPEC.md`（算法真相来源，本文档只定义"怎么落地成代码"，不重复定义算法，任何算法细节冲突以该文档为准，draft-3新增内容对应SPEC §15）+ 现有 `v1-core.js`（V1.1冻结核心）+ `v1_2-forecast-core.js`（V1.2冻结核心），三者**均不可修改**（含draft-2交付的`v1_3-paper-trading-core.js`等——本轮范围内该文件**尚未实现**，不存在"冻结"问题，但§1.3列出的既有前四份文档描述的规则不可回退修改）。
 角色分工：本文档作者（Claude Code）负责本轮 V1.3 的架构设计与验收规范，**不编写正式业务代码**；Codex 负责实际编码；本文档、`V1_3_ACCEPTANCE_TESTS.md`、`V1_3_ARCHITECTURE_REVIEW.md` 与 `V1_3_PAPER_TRADING_SPEC.md` 是本轮交付的全部四份文档，本轮**不交付任何业务代码或测试代码**。
 
@@ -23,8 +23,11 @@
 - **不修改** `v1-core.js`、`v1_2-forecast-core.js` 已验收的任何函数体、导出签名或算法常量——只允许以`require`/`window.ETHAlphaCore`/`window.ETHAlphaForecast`只读方式调用两者已导出的函数。
 - 不实现V2历史校准（回放引擎、Brier Score、方向准确率、区间覆盖率、校准曲线）。
 - 不实现V3 WebSocket实时架构、条件提醒推送（`Notification` API）、长期运行监控——`模拟仓位`已从原V3范围拆出（见`V1_3_PAPER_TRADING_SPEC.md`§0.1），但这三项**仍然**不在本轮范围内，提前实现视为范围蔓延。
-- 不实现任何"无用户点击确认的自动模拟开仓/加仓/平仓"路径——`confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose`/`confirmConservativeSettlement`/`resetPaperAccount`/`changeInitialCapital`/`confirmForcedObservationAcknowledgement` 全部要求一个只能来自真实UI点击事件的确认参数 + 稳定的 `idempotencyKey`（SPEC §6.11，CEO决策第10项），定时器（`setInterval(refresh,30000)`）触发的刷新回调**只允许**调用只读的 `scanClosedBarsForExits`/`replayDataGap`（止损/止盈的自动触发与数据缺口回放尝试，这是"已有仓位的风控执行/审计追溯"，不是"无人确认的新开仓"，两者性质不同，不得混淆）。
-- 不实现`UNRESOLVED_DATA_GAP`状态下的任何自动平仓——该状态只能通过用户显式点击"确认保守结算"（`confirmConservativeSettlement`）走出，禁止用定时器或数据恢复回调直接把仓位标记为已平仓（SPEC §8.4-8.5）。
+- **（draft-4撤销，见SPEC §17）** ~~不实现任何"无用户点击确认的自动模拟开仓/加仓/平仓"路径——全部要求一个只能来自真实UI点击事件的确认参数。~~ **CEO本轮已正式撤销这一条：V1.3的核心产品定义就是自动开仓/加仓/减仓/止损/分批止盈/移动保护/平仓（SPEC §16），本节禁止清单改为以下三条真正不可逾越的红线：**
+  - 不自动下真实订单，不读取/存储/校验任何交易所API密钥，不连接/不模拟连接用户真实交易所账户（SPEC §16.0核心红线，唯一不受本轮授权模型变化影响的部分）。
+  - `autoEngineOpenPosition`/`autoEngineAddOn`（自动开仓/加仓，SPEC §16.10）由引擎在`AutoEngineState.engineState==='AUTO_PAPER_RUNNING'`且SPEC §16.2十四项条件全部满足时自动调用，`idempotencyKey`由引擎按SPEC §16.8确定性规则生成，**不要求**用户点击；定时器（`setInterval(refresh,30000)`）触发的`v11decision`事件回调**允许**调用这两个函数以及只读的`scanClosedBarsForExits`/`replayDataGap`——这是draft-4相对draft-2/draft-3最根本的实现差异，不要沿用旧版本"定时器只能调只读函数"的假设。
+  - `emergencyClosePosition`（唯一保留的人工介入操作，SPEC §16.6）以及`resetPaperAccount`/`changeInitialCapital`/`confirmForcedObservationAcknowledgement`/引擎开启-暂停-恢复-禁止新开仓-关闭（SPEC §16.1）**仍然**要求一个只能来自真实UI点击事件的确认参数+稳定的`idempotencyKey`——这部分红线保留，只是适用范围从"全部五种交易操作"收窄为"宏观控制+异常人工介入+账户级设置"。
+- **（draft-4撤销，见SPEC §17）** ~~不实现UNRESOLVED_DATA_GAP状态下的任何自动平仓——该状态只能通过用户显式点击"确认保守结算"（confirmConservativeSettlement）走出。~~ **这一条部分保留**：`UNRESOLVED_DATA_GAP`状态下仍然**不允许**任何定时器/数据恢复回调自动把仓位标记为已平仓；但走出该状态的操作已从独立函数`confirmConservativeSettlement`**并入**`emergencyClosePosition`（SPEC §8.5/§16.6）——用户点击"紧急模拟平仓"时，若`trade.status==='UNRESOLVED_DATA_GAP'`，函数内部自动切换为保守结算成交规则，仍然是"只能由用户显式点击触发"，只是不再是一个专门的按钮/函数。
 
 ### 1.3 不修改既有文件（红线，本轮范围边界）
 
@@ -40,7 +43,7 @@
 | `work/v1-paper-trading.template.html` | 新UI区域的模板片段（HTML+内联`<script data-v13="paper-trading">`），供构建脚本拼接进最终产物，参照 `work/v1-ui.template.html` 中V1.2部分的既有写法风格 |
 | `tests/v13-paper-trading-tests.js` | 核心逻辑非联网自动化测试（对应`V1_3_ACCEPTANCE_TESTS.md`大部分用例），命名对齐`v12-forecast-tests.js`模式 |
 | `tests/v13-ui-tests.js` | 单文件构建产物里的UI接线/DOM事件测试，对齐`v12-ui-tests.js`模式 |
-| `tests/v13-live-rest-test.js` | 真实Binance REST生产链测试：真实数据→`buildDecision`→`buildForecast`→`buildTradeProposal`→`confirmOpenPosition`（用完即撤销/reset，不污染任何真实localStorage）→`scanClosedBarsForExits`，对齐`v12-live-rest-test.js`模式（**不得**只测试V1.1/V1.2而不真正调用V1.3函数——这正是`CLAUDE_CODE_REVIEW_V1_2_FINAL.md`P1-2关闭的模式，必须原样复制到V1.3） |
+| `tests/v13-live-rest-test.js` | 真实Binance REST生产链测试：真实数据→`buildDecision`→`buildForecast`→`buildTradeProposal`→`autoEngineOpenPosition`（用完即撤销/reset，不污染任何真实localStorage）→`scanClosedBarsForExits`，对齐`v12-live-rest-test.js`模式（**不得**只测试V1.1/V1.2而不真正调用V1.3函数——这正是`CLAUDE_CODE_REVIEW_V1_2_FINAL.md`P1-2关闭的模式，必须原样复制到V1.3） |
 
 ---
 
@@ -58,18 +61,18 @@
 - 单笔/试仓风险预算求解**只能**传入`equity`（当前净值）作为`C.calcRiskBudget`的`capital`实参（SPEC §5.1红线），代码里建议直接用`equity`命名局部变量传参，不要用`capital`这类容易让人误以为是固定本金的命名，避免后续维护者看错。
 - 实现 `PositionStatus` 状态机与状态转换表（SPEC §3.4，**新增`UNRESOLVED_DATA_GAP`**）的纯函数校验，单独可测，不与UI耦合。
 
-### 步骤3：撮合引擎（对应SPEC §6）
+### 步骤3：撮合引擎（对应SPEC §6，**draft-4更新：开仓/加仓改为引擎自动调用，`confirmReduce`已移除，见SPEC §17/本文档§8**）
 
-- 先实现 `buildTradeProposal`（只读，无副作用），再实现 `confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose`（点击型撮合，含§6.11幂等键机制，见步骤5）。
+- 先实现 `buildTradeProposal`（只读，无副作用，draft-4起角色变为引擎内部消费+UI"下一自动动作"预览，见SPEC §16.5），再实现 `emergencyClosePosition`（唯一保留的人工介入型撮合，含§6.11/§16.8幂等键机制，见步骤5）。**不实现**`confirmReduce`（已整体移除）。`autoEngineOpenPosition`/`autoEngineAddOn`（自动开仓/加仓）的实现顺序与要求见本文档§8步骤，依赖本步骤先实现好的`calcBreakevenStop`/50-30-20分批止盈/`scanClosedBarsForExits`等底层撮合函数，但函数本身属于§8范畴，不在本步骤实现。
 - 实现 `calcBreakevenStop`（SPEC §6.10闭式解，多空两个方向分别实现，**必须**包含开仓手续费+预计平仓手续费+实际滑点三项成本，不能只用`entryPrice`简化替代）；实现50/30/20分批止盈（SPEC §6.10，**最后一档必须直接取`trade.quantity`当前剩余全部，不得独立按比例重新计算，以规避取整尾差**）。
 - 实现加仓的统一止损风险校验（SPEC §5.2条件7：加仓后用**唯一的**`currentStop`计算`worstCaseLoss`，与`equity×maxRiskPct`比较），**不要**照抄`STRATEGY_SPEC.md §8.2`原文里"试仓风险+加仓风险分别求和"的旧口径，SPEC §5.2已明确本轮采用统一止损口径，两种口径在多数场景下数值相近但公式不同，必须以`V1_3_PAPER_TRADING_SPEC.md`当前版本为准。
 - 再实现 `scanClosedBarsForExits`（K线扫描型撮合，含§6.7同K线冲突、§6.8跳空止损、§6.9止盈保守成交）。
 - **每个撮合函数落地后立即补齐对应的`tests/v13-paper-trading-tests.js`用例，不要把所有撮合规则都写完了再统一补测试**。
 
-### 步骤4：数据缺口检测、回放与保守结算（对应SPEC §8，draft-2新增步骤）
+### 步骤4：数据缺口检测、回放与紧急平仓（对应SPEC §8，draft-2新增步骤；**draft-4更新：`confirmConservativeSettlement`已并入`emergencyClosePosition`**）
 
 - 实现`replayDataGap(trade, marketData, account, storage)`：数据恢复后按SPEC §8.3逐根回放缺失K线，**必须**先判断`fetchAllTimeframeKlines`返回的已收盘K线是否完整覆盖缺口（`openTime`序列是否等间隔连续），完整覆盖才执行回放并解除`UNRESOLVED_DATA_GAP`，否则把`replayAttempt`记录为`STILL_GAP`并保持该状态——**不得**为了让测试更容易通过而简化成"只要拿到新数据就假设覆盖完整"。
-- 实现`confirmConservativeSettlement(trade, account, storage, idempotencyKey)`：只能由用户显式确认触发，成交价取"缺口结束后第一根可获得的已收盘K线的`open`价格"并叠加不利滑点（SPEC §8.5），产生`closeReason='DATA_GAP_CONSERVATIVE'`、`estimated=true`、`verified=false`的最终记录。
+- 实现`emergencyClosePosition(trade, decision, account, storage, idempotencyKey)`：只能由用户显式点击触发，**内部分支**——若`trade.status==='UNRESOLVED_DATA_GAP'`，成交价取"缺口结束后第一根可获得的已收盘K线的`open`价格"并叠加不利滑点（SPEC §8.5保守结算规则），产生`closeReason='DATA_GAP_CONSERVATIVE'`、`estimated=true`、`verified=false`；否则（`OPEN`/`PARTIALLY_CLOSED`）按当前`markPrice`+常规不利滑点成交，`estimated=false`、`verified=true`。**不要**把这两条路径实现成两个独立导出函数——CEO本轮已明确合并，保留两个函数会与SPEC §16.10/§17产生不一致。
 - **红线**：`estimated`/`verified`两个字段必须真实反映交易是否走过保守结算路径，`exportPaperLogsJSON`/`exportPaperLogsCSV`必须原样导出这两个字段，供下游任何统计（含未来V1.4+）过滤估算交易。
 
 ### 步骤5：与V1.1/V1.2联动只读接线 + 幂等键机制（对应SPEC §7、§6.11）
@@ -155,8 +158,8 @@ template = replaceExact(template, '/*__PAPER__*/', paperCore, 1, 'V1.3模拟交�
 
 - 新增独立模块，**不与**`v1_3-paper-trading-core.js`合并成一个文件——Signal Archive在设计上必须能独立于Paper Trading Account运行（SPEC §15.0：不需要账户存在），合并成一个文件会让"读一个文件就必须理解两套完全不同的资金语义"，增加认知负担且违背§15.0的系统边界声明。
 - 不建立任何`PaperPosition`/`PaperFill`/占用`marginUsed`——Signal Archive/Shadow Evaluation产生的一切数据只读写`ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults`三个key，**禁止**在实现中出现任何路径把`ShadowResult`的字段写入`ethAlphaPaperAccount`/`ethAlphaPaperTrades`（SPEC §15.0红线，`V1_3_ACCEPTANCE_TESTS.md` T38专项测试）。
-- 不为`UNRESOLVED_DATA_GAP`状态的影子验证实现任何"强制结算/估算收敛"出口（SPEC §15.7红线，与draft-2 Paper Trading的`confirmConservativeSettlement`**刻意不对称**，不要照抄§8.5的模式）。
-- 不修改`v1-core.js`/`v1_2-forecast-core.js`/draft-2交付的`v1_3-paper-trading-core.js`（该文件本轮尚未实现，若与本轮Signal Archive实现同批交付，两者只能通过`window.__paperAccount`/`linkedPaperTradeId`等只读指针关联，`v1_3-signal-archive-core.js`**不得**`require`并调用`v1_3-paper-trading-core.js`内部未导出的私有逻辑，只能通过其已导出的函数接口只读交互，若两者需要交叉引用，单向依赖方向为：Signal Archive **不依赖** Paper Trading（Paper Trading的`confirmOpenPosition`在draft-3新增`signalId`可选参数后，可以单向调用Signal Archive导出的`linkSignalToPaperTrade`，反向不允许）。
+- 不为`UNRESOLVED_DATA_GAP`状态的影子验证实现任何"强制结算/估算收敛"出口（SPEC §15.7红线，与draft-4 Paper Trading的`emergencyClosePosition`保守结算分支**刻意不对称**——Paper Trading有真实资金/仓位，需要一个人工出口来"结清"；Shadow Evaluation没有真实后果，可以无限期`UNRESOLVED_DATA_GAP`下去，不要照抄§8.5的模式）。
+- 不修改`v1-core.js`/`v1_2-forecast-core.js`/draft-2交付的`v1_3-paper-trading-core.js`（该文件本轮尚未实现，若与本轮Signal Archive实现同批交付，两者只能通过`window.__paperAccount`/`linkedPaperTradeId`等只读指针关联，`v1_3-signal-archive-core.js`**不得**`require`并调用`v1_3-paper-trading-core.js`内部未导出的私有逻辑，只能通过其已导出的函数接口只读交互，若两者需要交叉引用，单向依赖方向为：Signal Archive **不依赖** Paper Trading（Paper Trading/Auto Engine的`autoEngineOpenPosition`（以`signal`为必填入参，SPEC §16.10）可以单向调用Signal Archive导出的`linkSignalToPaperTrade`，反向不允许）。
 
 ### 7.2 新增文件规划
 
@@ -168,7 +171,7 @@ template = replaceExact(template, '/*__PAPER__*/', paperCore, 1, 'V1.3模拟交�
 | `tests/v13-signal-archive-ui-tests.js` | 单文件构建产物里的UI接线/DOM事件测试 |
 | `tests/v13-signal-archive-live-rest-test.js` | 真实Binance REST生产链测试：真实数据→`buildDecision`→`buildForecast`→`recordSignalIfEligible`→`evaluateShadowSignals`（用完即`resetSignalArchive`撤销/不污染真实localStorage），对齐`v13-live-rest-test.js`/`v12-live-rest-test.js`模式，**必须**真正调用本模块的导出函数，不得只验证V1.1/V1.2（同§2表格已强调的`CLAUDE_CODE_REVIEW_V1_2_FINAL.md`P1-2教训） |
 
-### 7.3 实施步骤顺序（Codex必须按此顺序实现，紧接draft-2工单步骤9之后，不得跳步；若draft-2的`v1_3-paper-trading-core.js`尚未实现，Codex可先独立实现Signal Archive核心逻辑与非UI测试，但"步骤15：用户行为关联"中依赖`linkSignalToPaperTrade`↔`confirmOpenPosition`联动的部分必须等两者都存在后才能完成集成）
+### 7.3 实施步骤顺序（Codex必须按此顺序实现，紧接draft-2工单步骤9之后，不得跳步；若draft-2的`v1_3-paper-trading-core.js`尚未实现，Codex可先独立实现Signal Archive核心逻辑与非UI测试，但"步骤15：用户行为关联"中依赖`linkSignalToPaperTrade`↔`autoEngineOpenPosition`联动的部分必须等两者都存在后才能完成集成）
 
 **步骤10：建议快照与去重（对应SPEC §15.2-§15.4）**
 
@@ -197,8 +200,8 @@ template = replaceExact(template, '/*__PAPER__*/', paperCore, 1, 'V1.3模拟交�
 
 **步骤15：用户行为关联（对应SPEC §15.9）**
 
-- 实现`markSignalSeen`/`markSignalRejected`/`linkSignalToPaperTrade`，以及"建议进入终态且仍为UNSEEN/SEEN时自动追加MISSED事件"的判定（**这是唯一一个不需要用户点击就能改变`userActionStatus`投影值的路径**，实现时需要明确注释/测试标注这一例外，避免与"用户行为关联需要真实点击"的直觉产生混淆——`MISSED`本身就是"用户没有点击"这件事的记录，不是对该红线的违反）。
-- **红线**：`confirmOpenPosition`（draft-2既有函数，本轮**追加**一个可选的`signalId`参数，不改变其既有必填参数顺序与既有行为）成功后若携带了`signalId`，必须调用`linkSignalToPaperTrade`，两者的调用顺序与失败回滚语义需在实现阶段明确（建议：先完成开仓，开仓成功后再关联；若关联步骤本身失败，不回滚已经成功的开仓，只记录关联失败，因为关联关系是审计性质的旁路信息，不应让一个次要的审计写入失败反过来撤销一笔已经成立的模拟交易）。
+- **（draft-4更新，见SPEC §15.9/§17）** 实现`markSignalSeen`/`linkSignalToPaperTrade`，以及"建议进入终态时按SPEC §15.9事件表自动追加`AUTO_EXECUTED`/`AUTO_BLOCKED_BY_RISK`/`AUTO_BLOCKED_BY_POSITION`/`AUTO_MISSED_ENGINE_OFF`/`AUTO_MISSED_DATA_GAP`之一"的判定。**不实现**`markSignalRejected`（draft-3遗留函数，draft-4已撤销`REJECTED`枚举值，见SPEC §17）。draft-4起`SEEN`是**唯一**仍需要真实用户点击才触发的`userActionStatus`事件，其余五个`AUTO_*`事件全部由引擎自动判定追加，实现时不需要再像draft-3那样为"哪个事件不需要点击"做特殊注释区分——这是draft-4的默认情况，只有`SEEN`是例外。
+- **红线（draft-4更新：`autoEngineOpenPosition`是draft-4新定义的自动开仓函数，本身就以`signal`为第一入参，见SPEC §16.10，不是"给draft-2旧函数追加可选参数"）**：`autoEngineOpenPosition`成功后**必须**调用`linkSignalToPaperTrade`，两者的调用顺序与失败回滚语义需在实现阶段明确（建议：先完成开仓，开仓成功后再关联；若关联步骤本身失败，不回滚已经成功的开仓，只记录关联失败，因为关联关系是审计性质的旁路信息，不应让一个次要的审计写入失败反过来撤销一笔已经成立的模拟交易）。
 
 **步骤16：导出与重置 + UI接线 + 构建脚本接线（对应SPEC §15.10/§15.12）**
 
@@ -211,7 +214,7 @@ template = replaceExact(template, '/*__PAPER__*/', paperCore, 1, 'V1.3模拟交�
   </section>
   ```
   新增`<script data-v13="signal-archive">/*__SIGNAL_ARCHIVE__*/</script>`，紧跟在V1.3模拟账户脚本块`<script data-v13="paper-trading">`之后（**不得**插在V1.1/V1.2/V1.3模拟账户三块脚本中间——事件监听顺序要求见下）。
-- **事件时序要求（对应SPEC §15.3"评估频率复用既有30秒v11decision事件"）**：Signal Archive的`v11decision`监听器必须在构建产物中位于V1.3模拟账户脚本块**之后**——理由：若用户本次点击"确认开仓"关联的是Signal Archive本次tick刚创建的新建议，Paper Trading的`confirmOpenPosition`在同一次点击处理中需要能读到本次tick已经写入`ethAlphaSignalArchive`的`signalId`；但由于Signal Archive的**创建**（`recordSignalIfEligible`）与Paper Trading的**开仓确认**（`confirmOpenPosition`）实际上是两个独立的用户交互时刻（建议先被创建存档，用户之后才点击"按此建议模拟开仓"），严格的执行顺序要求主要是为了保证"同一次30秒刷新tick内，Signal Archive的建议创建判定/影子评估先于Paper Trading读取`window.__paperAccount`等状态完成"，避免出现"Paper Trading某个UI渲染时刻读到的`signalId`列表还没包含本次tick刚创建的记录"这种短暂的时序不一致。
+- **事件时序要求（对应SPEC §15.3"评估频率复用既有30秒v11decision事件"，**draft-4更新理由**）**：Signal Archive的`v11decision`监听器必须在构建产物中位于V1.3模拟账户脚本块**之后**——理由：draft-4起，Signal Archive的建议创建（`recordSignalIfEligible`）与Shadow Evaluation的触发判定（`evaluateShadowSignals`）必须先于Auto Engine的自动开仓判定（`tickAutoEngine`内部调用`autoEngineOpenPosition`，SPEC §16.10）在**同一次**tick内完成，因为`autoEngineOpenPosition`依赖本次tick"某个signal是否恰好完成`WAITING_TRIGGER→TRIGGERED`转换"这一判定结果（SPEC §16.2条件6）——如果脚本顺序颠倒，Auto Engine会读到上一次tick的陈旧`signal`生命周期状态，导致开仓判定延迟一整个刷新周期（约30秒），不是正确性错误但会造成"引擎慢一拍"的体验问题，仍应避免。
 - 构建脚本接线：`work/build-v1.js`现有`replacements`数组**追加**（不改动既有条目顺序或内容）：
   ```js
   ['/*__SIGNAL_ARCHIVE_UI__*/', <v1-signal-archive.template.html中的HTML片段字符串>, 1, 'V1.3建议档案与影子验证UI占位符'],
@@ -245,7 +248,116 @@ template = replaceExact(template, '/*__PAPER__*/', paperCore, 1, 'V1.3模拟交�
 - `v1_3-signal-archive-core.js`
 - `work/v1-signal-archive.template.html`
 - `tests/v13-signal-archive-tests.js`、`tests/v13-signal-archive-ui-tests.js`、`tests/v13-signal-archive-live-rest-test.js`
-- 对`work/build-v1.js`、`work/v1-ui.template.html`（仅新增脚本标签引用位置）、draft-2交付的`v1_3-paper-trading-core.js`（仅新增`confirmOpenPosition`的可选`signalId`参数与对`linkSignalToPaperTrade`的单向调用，不改动其既有必填参数/既有行为）的追加式修改
+- 对`work/build-v1.js`、`work/v1-ui.template.html`（仅新增脚本标签引用位置）的追加式修改（**draft-4更新**：`autoEngineOpenPosition`成功后对`linkSignalToPaperTrade`的单向调用属于Auto Engine自身实现的一部分，见本文档§8，不再是"给draft-2旧函数追加可选参数"这种事后修补模式）
 - `V1_3_IMPLEMENTATION_REPORT.md`/`V1_3_TEST_RESULTS.md`需同时覆盖模拟账户与建议档案两部分结果（或分别产出两份对应文档，实现阶段自行决定，本文档不强制）
 
 本节（draft-3文档阶段）同样**不包含**以上任何一项的实际代码，仅作为下一轮实现的工单依据。
+
+---
+
+## 8. draft-4新增：真实行情自动模拟交易引擎 Auto Paper Trading Engine（对应`V1_3_PAPER_TRADING_SPEC.md`§16）
+
+角色重申：本节与§1-§7一样，只是给Codex的工单依据，本文档（含本节）不交付任何实际代码。§1-§6「模拟账户」的账户/风险/撮合**公式**零改动；§7「建议档案与影子验证」零改动；本节新增的是"引擎如何自动调用这些既有公式"这一层，以及§1.2/§3已原地改写的授权模型变化的具体落地。
+
+### 8.1 范围重申（红线，本节专用）
+
+- 不自动下真实订单，不读取/存储/校验任何交易所API密钥，不连接/不模拟连接用户真实交易所账户——三条红线与draft-2/draft-3完全一致，是唯一不受本轮授权模型撤销影响的部分（SPEC §16.0）。
+- `PENDING_ENTRY`/`CANCELLED`/`BLOCKED`三个`PositionStatus`**不实现**（SPEC §3.4/§17已撤销）；`confirmReduce`**不实现**（已整体移除）；`confirmConservativeSettlement`**不实现为独立函数**（并入`emergencyClosePosition`）。
+- `autoEngineOpenPosition`/`autoEngineAddOn`**必须**由`tickAutoEngine`（每次`v11decision`事件调用）内部触发，**不得**要求任何来自UI点击事件的确认参数——这与§1.2原有红线方向相反，是draft-4最容易在实现阶段"想当然地抄draft-2旧模式"出错的地方，Codex实现前应先完整阅读SPEC §16.0撤销声明。
+- `emergencyClosePosition`、引擎开启/暂停/恢复/禁止新开仓/关闭、`resetPaperAccount`/`changeInitialCapital`/`confirmForcedObservationAcknowledgement`**仍然**要求真实UI点击事件+`idempotencyKey`，且这些操作**不得**被`tickAutoEngine`自动调用（红线：引擎自动循环可以"做"的事仅限于开仓/加仓/止损/止盈/分批止盈/移动保护——用户宏观控制与紧急人工介入必须永远来自真实点击，不存在"引擎自己暂停自己"这种设计）。
+
+### 8.2 新增文件规划
+
+| 文件 | 职责 |
+|---|---|
+| `v1_3-auto-engine-core.js` | 纯逻辑核心：`AutoEngineState`状态机、§16.2十四项自动开仓条件判定、§16.4反向信号冷却期、§16.7心跳/离线回放触发、§16.8幂等key生成。`require('./v1-core.js')`/`require('./v1_2-forecast-core.js')`/`require('./v1_3-paper-trading-core.js')`/`require('./v1_3-signal-archive-core.js')`四者只读依赖（单向：Auto Engine依赖Paper Trading与Signal Archive，反向不允许，与CODEX_TASK §5接口冲突检查表一致），通过`window.ETHAlphaAutoEngine`暴露（浏览器）/`module.exports`（Node测试） |
+| `work/v1-auto-engine.template.html` | "500 USDT真实行情自动模拟交易"UI区域模板片段（SPEC §16.9），取代`work/v1-paper-trading.template.html`中"开仓/加仓/减仓/平仓按钮"部分，两个模板文件如何合并/共存由Codex实现阶段决定（建议：`v1-paper-trading.template.html`保留账户字段展示部分，控制面板部分移到本文件，避免同一批HTML片段职责混杂） |
+| `tests/v13-auto-engine-tests.js` | 核心逻辑非联网自动化测试（对应`V1_3_ACCEPTANCE_TESTS.md` T44+），命名对齐`v13-signal-archive-tests.js`模式 |
+| `tests/v13-auto-engine-ui-tests.js` | 单文件构建产物里的UI接线/DOM事件测试（暂停/恢复/禁止新开仓/紧急平仓按钮、总开关二次确认流程） |
+| `tests/v13-auto-engine-live-rest-test.js` | 真实Binance REST生产链测试：真实数据→`buildDecision`→`buildForecast`→`recordSignalIfEligible`→`evaluateShadowSignals`→`tickAutoEngine`（含`autoEngineOpenPosition`真实调用，用完即`disarmAutoEngine`+`resetPaperAccount`+`resetSignalArchive`撤销，不污染任何真实localStorage），对齐既有`v13-*-live-rest-test.js`模式，**不得**只测试到Signal Archive而不真正触发Auto Engine的自动开仓路径 |
+
+### 8.3 实施步骤顺序（Codex必须按此顺序实现，紧接§7工单步骤17之后，不得跳步；依赖draft-2 `v1_3-paper-trading-core.js`与draft-3 `v1_3-signal-archive-core.js`均已实现完毕才能开始本节，因为Auto Engine是二者的消费方）
+
+**步骤18：引擎状态机（对应SPEC §16.1）**
+
+- 实现`AutoEngineState`对应JS对象结构、`armAutoEngine`/`pauseAutoEngine`/`resumeAutoEngine`/`setAllowNewEntries`/`disarmAutoEngine`，覆盖SPEC §16.1完整状态转换表，纯函数校验单独可测（同既有状态机实现模式）。
+- **先实现`AUTO_PAPER_DATA_BLOCKED`的`preDataBlockedState`记录/恢复逻辑并配测试**，这是本步骤最容易遗漏边界的地方——历史教训同draft-2步骤1/draft-3步骤10"异常路径与主流程同步实现"的一贯要求。
+
+**步骤19：自动开仓十四项条件与`autoEngineOpenPosition`（对应SPEC §16.2）**
+
+- **红线**：条件6（进场区真实触发）**直接读取**Signal Archive的`ShadowResult`/`SignalSnapshot.lifecycleStatus`投影值判断本次tick是否恰好完成`WAITING_TRIGGER→TRIGGERED`转换，**不重新实现**一遍entryZone触及判定——如果实现时发现"好像重新写一遍判断更方便"，说明对SPEC §16.2的架构决定理解有误，应回头重读SPEC原文而不是绕过它。
+- 十四项条件建议按SPEC §16.2列出的顺序逐条实现为独立可测的子判断函数（或至少独立的具名布尔变量），**不要**写成一个大的`&&`链导致某一条判断失败时无法定位是哪一条——这直接影响到`userActionStatus`要精确映射到`AUTO_BLOCKED_BY_RISK`/`AUTO_BLOCKED_BY_POSITION`/`AUTO_MISSED_ENGINE_OFF`/`AUTO_MISSED_DATA_GAP`四个不同值中的哪一个（SPEC §15.9事件表），条件判断本身若不分离会导致无法正确归类。
+- `autoEngineOpenPosition`内部调用`buildTradeProposal`得到方案数据后立即执行开仓，`idempotencyKey`按`AUTO-OPEN-${signalId}`规则构造（SPEC §16.8）。
+- 开仓成功后**必须**调用Signal Archive的`linkSignalToPaperTrade`（见§7.3步骤15既有实现，本步骤只是从"等待被Paper Trading手动触发"变为"被Auto Engine自动触发"）。
+
+**步骤20：自动加仓`autoEngineAddOn`（对应SPEC §5.2/§16.3）**
+
+- 复用draft-2已实现的§5.2条件1-7判定逻辑（该逻辑本轮零改动，只是调用方从"UI点击事件处理器"变为"`tickAutoEngine`内部循环"），`idempotencyKey`按`AUTO-ADDON-${tradeId}`规则构造。
+
+**步骤21：反向信号冷却期（对应SPEC §16.4，draft-4全新规则，无draft-2先例可复用）**
+
+- 实现`PaperAccount`新增字段`lastPositionClosedAt`/`lastPositionClosedDirection`/`lastPositionClosedBarOpenTime`的更新时机——**必须**在`scanClosedBarsForExits`或`emergencyClosePosition`产生`EXITED`结果的**同一个事务/调用**内更新，不要作为一个独立的、可能被跳过的后续步骤，否则会出现"仓位已平但冷却期字段未更新"的不一致状态。
+- 实现`checkReverseSignalCooldown`，**红线**：该函数只在候选`signal.direction !== lastPositionClosedDirection`时才生效拦截，同方向新信号不受本函数影响（SPEC §16.4已明确范围限定于反向）。
+- **红线**：不允许在检测到"应平仓"的同一个`tickAutoEngine`调用内，同一tick又立即为反向信号调用`autoEngineOpenPosition`——`scanClosedBarsForExits`产生`EXITED`结果后，本次`tickAutoEngine`调用应该到此为止，反向开仓判定留给**下一次**tick（SPEC §16.4条件1），实现时注意函数调用顺序不要把两者串在同一次循环里"顺手"执行。
+
+**步骤22：真实市场模拟成交术语与浏览器心跳/离线回放（对应SPEC §16.5/§16.7）**
+
+- 心跳/离线检测本身不需要新的定时器——复用既有30秒`v11decision`事件，每次成功处理完一个tick更新`lastEngineHeartbeat`/`lastProcessedBarTime`（SPEC §16.7）。
+- 页面加载/`visibilitychange`恢复可见时的回补重放逻辑`replayEngineOfflineGap`，**复用**draft-2`replayDataGap`的K线连续性判断算法（同§7.3步骤13"共享连续性判断逻辑，物理上独立实现"的既有模式，避免与Signal Archive的`replayDataGap`风格实现产生跨模块强依赖），新增`gapCause='ENGINE_OFFLINE'`标记。
+
+**步骤23：幂等键生成规则（对应SPEC §16.8）**
+
+- 实现§16.8全部6类key构造规则的辅助函数（例如`buildAutoIdempotencyKey(kind, ...ids)`），**不要**在每个调用点手写字符串拼接——同一套构造规则被`autoEngineOpenPosition`/`autoEngineAddOn`/自动止损止盈/数据缺口回放补记多处复用，集中实现可以避免某一处拼错格式导致幂等失效。
+
+**步骤24：UI接线（对应SPEC §16.9）**
+
+- 在`eth-dynamic-trading-dashboard.html`现有Signal Archive区域`</section>`之后（draft-3已接线的`signalArchiveSection`之后），新增：
+  ```html
+  <section class="grid" id="autoEngineSection">
+  <!--__AUTO_ENGINE_UI__-->
+  </section>
+  ```
+  新增`<script data-v13="auto-engine">/*__AUTO_ENGINE__*/</script>`，紧跟在V1.3建议档案脚本块`<script data-v13="signal-archive">`之后。
+- **事件时序**：Auto Engine的`v11decision`监听器必须在构建产物中位于Signal Archive脚本块**之后**（原因见§7.3步骤16"事件时序要求"draft-4更新说明）。
+
+**步骤25：构建脚本接线**
+
+- `work/build-v1.js`追加（不改动既有条目顺序/内容）：
+  ```js
+  ['/*__AUTO_ENGINE_UI__*/', <v1-auto-engine.template.html中的HTML片段字符串>, 1, 'V1.3自动模拟交易引擎UI占位符'],
+  ```
+  末尾核心拼接部分，在`/*__SIGNAL_ARCHIVE__*/`的`replaceExact`调用**之后**追加：
+  ```js
+  const autoEngineCore = fs.readFileSync(path.join(root,'v1_3-auto-engine-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
+  template = replaceExact(template, '/*__AUTO_ENGINE__*/', autoEngineCore, 1, 'V1.3自动模拟交易引擎核心占位符');
+  ```
+  最终产物`<script>`块顺序：V1.1核心 → V1.2预测核心 → V1.3模拟交易核心 → V1.3建议档案核心 → V1.3自动引擎核心。
+
+**步骤26：自测与回归**
+
+- 按`V1_3_ACCEPTANCE_TESTS.md` T44+全部测试类别自测通过。
+- **必须**重新完整跑一遍`V1_3_ACCEPTANCE_TESTS.md` T27+T43既有回归命令列表，确认零回归；`work/build-v1.js`构建产物逐字节可复现校验需额外确认新增的`/*__AUTO_ENGINE_UI__*/`/`/*__AUTO_ENGINE__*/`占位符替换不破坏既有全部占位符替换。
+
+### 8.4 接口冲突检查清单（追加于§5/§7.4已有表格，风格一致）
+
+| 项 | V1.1 | V1.2 | V1.3模拟账户 | V1.3建议档案 | V1.3自动引擎（draft-4新增） | 是否冲突 |
+|---|---|---|---|---|---|---|
+| 模块全局变量名 | `window.ETHAlphaCore` | `window.ETHAlphaForecast` | `window.ETHAlphaPaperTrading` | `window.ETHAlphaSignalArchive` | `window.ETHAlphaAutoEngine` | 不冲突 |
+| 自定义DOM事件名 | `v11decision`（唯一来源） | 监听既有事件 | 监听既有事件 | 监听既有事件 | 监听既有事件，不新增 | 不冲突 |
+| localStorage key | 见§5原表 | 见§5原表 | `ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog`（draft-4新增`AutoEngineState`字段落在`ethAlphaPaperAccount`内，不新增key） | `ethAlphaSignalArchive`/`ethAlphaSignalEvents`/`ethAlphaShadowResults` | 不新增key，读写上述既有key | 不冲突 |
+| `window`暴露的原始引用 | 无 | `window.__lastMarketData`/`window.__prevForecast` | `window.__paperAccount` | `window.__signalArchiveLatest` | 只读消费以上，不新增全局引用 | 不冲突 |
+| DOM id前缀 | 见§5原表 | 见§5原表 | `paperAccount*`/`paperTrade*`/`paperFill*`/`paperLog*` | `signalArchive*`/`signalEvent*`/`shadowResult*` | `autoEngine*`（引擎状态/控制按钮），复用`paperAccount*`前缀展示账户字段（SPEC §16.9大量字段"复用§10"） | 需Codex实现时逐一核对 |
+| 导出函数名 | 见§5原表 | 见§5原表 | `v1_3-paper-trading-core.js`（draft-4更新：移除`autoOpenPosition`/`autoAddOn`/`confirmReduce`/`confirmConservativeSettlement`，新增`autoEngineOpenPosition`/`autoEngineAddOn`见下） | `v1_3-signal-archive-core.js`导出列表（SPEC§15.13，`markSignalRejected`已移除） | `v1_3-auto-engine-core.js`导出列表（SPEC§16.10） | 不冲突，依赖方向：Auto Engine依赖Paper Trading与Signal Archive，二者互相不依赖，全部单向依赖V1.1/V1.2 |
+| 测试文件命名 | 见§5原表 | 见§5原表 | `v13-paper-trading-tests.js`等3个 | `v13-signal-archive-tests.js`等3个 | `v13-auto-engine-tests.js`/`v13-auto-engine-ui-tests.js`/`v13-auto-engine-live-rest-test.js` | 不冲突 |
+
+### 8.5 交付清单（Codex在下一轮实现完成后应交付）
+
+- `v1_3-auto-engine-core.js`
+- `work/v1-auto-engine.template.html`
+- `tests/v13-auto-engine-tests.js`、`tests/v13-auto-engine-ui-tests.js`、`tests/v13-auto-engine-live-rest-test.js`
+- 对`work/build-v1.js`、`work/v1-ui.template.html`（仅新增脚本标签引用位置）的追加式修改
+- 对draft-2交付的`v1_3-paper-trading-core.js`的**修改**（非追加）：移除`autoOpenPosition`/`autoAddOn`/`confirmReduce`/`confirmConservativeSettlement`四个导出函数，新增`autoEngineOpenPosition`/`autoEngineAddOn`/`emergencyClosePosition`（含保守结算分支）——**这是本轮唯一允许对已交付V1.3代码做非追加式修改的例外**，因为SPEC本身已经正式撤销了这几个函数的存在依据，保留死代码会造成"文档说没有但代码里还在"的不一致，风险高于修改本身；`PaperAccount`/`PaperTrade`新增字段（`AutoEngineState`全部字段、`linkedSignalId`、`dataGap.gapCause`）按SPEC §16.11迁移规则实现
+- 对draft-3交付的`v1_3-signal-archive-core.js`的**修改**：移除`markSignalRejected`，`userActionStatus`枚举更新为draft-4五值集合
+- `V1_3_IMPLEMENTATION_REPORT.md`/`V1_3_TEST_RESULTS.md`需同时覆盖模拟账户、建议档案、自动引擎三部分结果
+
+本节（draft-4文档阶段）同样**不包含**以上任何一项的实际代码，仅作为下一轮实现的工单依据。
