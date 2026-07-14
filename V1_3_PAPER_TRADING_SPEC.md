@@ -1,6 +1,6 @@
 # V1_3_PAPER_TRADING_SPEC.md — ETH Alpha V1.3「真实行情模拟交易系统」算法与数据规范
 
-版本：v1.3-draft-4（CEO正式撤销draft-2/draft-3"用户必须逐笔点击确认才建立模拟仓位"的授权模型，改为§16「真实行情自动模拟交易引擎」——用户只需一次性开启"自动模拟交易总开关"，之后系统按V1.1正式规则自行虚拟开仓/加仓/减仓/止损/分批止盈/移动保护/平仓；§15「建议档案与影子验证」保持不变；§0-§14中断言"逐笔点击"的具体条款已被本轮**原地改写**，§16.13/§17为完整的冲突旧定义扫描与撤销记录）
+版本：v1.3-draft-4-final（CEO正式撤销draft-2/draft-3"用户必须逐笔点击确认才建立模拟仓位"的授权模型，改为§16「真实行情自动模拟交易引擎」——用户只需一次性开启"自动模拟交易总开关"，之后系统按V1.1正式规则自行虚拟开仓/加仓/减仓/止损/分批止盈/移动保护/平仓；§15「建议档案与影子验证」保持不变；§0-§14中断言"逐笔点击"的具体条款已被本轮**原地改写**，§16.13/§17为完整的冲突旧定义扫描与撤销记录；**draft-4-final是对draft-4首版的最终一致性修正**：①有持仓时禁止关闭引擎（§16.1）②紧急平仓与数据缺口保守结算拆分为两个独立命令（§16.6a/§16.6b）③测试编号/数量口径统一（见ACCEPTANCE_TESTS）④T1-T27旧函数名全部替换为最终接口名（§17.6））
 角色：本文档只做 V1.3「自动模拟交易引擎」+「建议档案与影子验证」的**架构设计与验收规范**，不是实现代码，也不由本文档作者实现正式业务代码。
 基准：main 分支 `v1.2.0` 标签（提交 `0dc1943`），本文档在 V1.1（`v1-core.js`，冻结）与 V1.2（`v1_2-forecast-core.js`，冻结）之上做**纯叠加**，不修改、不重写两者已验收的任何函数或算法。draft-3新增内容额外基准提交 `36c45d27efde8efc2fd3004b3889bd9eeda90eb5`；draft-4额外基准提交 `484f95a8a2676d55c4c2d4a44deea1fe2e6b38ea`（draft-3）。
 唯一算法真相来源声明：本文档是 V1.3 模拟交易算法的唯一 source of truth。`V1_3_CODEX_IMPLEMENTATION_TASK.md` 的函数接口必须实现本文档定义的行为；`V1_3_ACCEPTANCE_TESTS.md` 的用例必须验证本文档定义的规则；`V1_3_ARCHITECTURE_REVIEW.md` 负责核对三者与 V1.1/V1.2/STRATEGY_SPEC.md 的一致性。四份文档如有冲突，以本文档为准。
@@ -577,22 +577,21 @@ V1.3的`v11decision`监听器必须在构建产物中位于V1.2预测脚本块**
 ### 8.4 `UNRESOLVED_DATA_GAP`状态下的行为限制
 
 - 不接受加仓、普通减仓、普通平仓——因为一旦无法确认缺口期间是否已经发生真实成交，"当前quantity/entryPrice/currentStop"这些字段本身的正确性已经存疑，任何"部分平仓"操作都需要先假设这些字段仍然可信，这与"不得伪造成交顺序"的精神矛盾。
-- 唯一允许的操作是§8.5"紧急模拟平仓（保守结算模式）"。
+- 唯一允许的操作是§8.5/§16.6b"数据缺口保守结算"（`confirmDataGapConservativeSettlement`）。
 - 每次新的`v11decision`事件到来时，仍然尝试§8.3的回放（万一后续又有新的历史窗口数据能覆盖，虽然实际上`fetchAllTimeframeKlines`固定窗口向前滑动通常不会让更早的缺口重新变得可获取，但不排除未来实现变化，此项检查保留作为兜底，不作为主要解决路径）。
 
-### 8.5 用户点击"紧急模拟平仓"以保守结算走出`UNRESOLVED_DATA_GAP`（唯一走出该状态的路径；draft-4起并入`emergencyClosePosition`，不再是独立函数`confirmConservativeSettlement`，见§16.6/§17）
+### 8.5 用户确认"数据缺口保守结算"走出`UNRESOLVED_DATA_GAP`（唯一走出该状态的路径；**draft-4-final：独立函数`confirmDataGapConservativeSettlement`，与`emergencyClosePosition`是两个业务语义不同的上层命令，仅共享底层成交写入函数，见§16.6a/§16.6b/§17**）
 
 ```
-emergencyClosePosition(trade, account, storage, idempotencyKey): {ok, trade?, reason?}
-// trade.status==='UNRESOLVED_DATA_GAP'时，函数内部自动切换为本节定义的保守结算成交规则；
-// 其余状态（OPEN/PARTIALLY_CLOSED）下按§16.6的常规"紧急模拟平仓"规则（当前markPrice+不利滑点）成交
+confirmDataGapConservativeSettlement(trade, account, storage, idempotencyKey): {ok, trade?, reason?}
+// 仅适用于trade.status==='UNRESOLVED_DATA_GAP'；其余状态直接拒绝，不与emergencyClosePosition共享入口
 ```
 
-- 只能由用户在UI显式点击"紧急模拟平仓"触发（`UNRESOLVED_DATA_GAP`状态下UI必须明确提示这是保守结算模式），文案必须包含"数据缺口无法完整回补，本次平仓按缺口后首个可获得的不利价格结算，结果仅为估算，不代表真实应得盈亏"。
+- 只能由用户在UI显式二次确认"数据缺口保守结算"触发（第一次点击弹出确认对话说明这是估算结算，第二次显式确认后才执行，见§16.6b两步确认要求——**不是**`emergencyClosePosition`式的单次点击），文案必须包含"数据缺口无法完整回补，本次平仓按缺口后首个可获得的不利价格结算，结果仅为估算，不代表真实应得盈亏"。
 - 成交价：`fillPrice`取"缺口结束后**第一根**可获得的已收盘K线"的`open`价格（即"首个可获得的价格"），再按§4.4方向应用不利滑点——多单按SELL方向向下不利滑点，空单按BUY方向向上不利滑点。
-- `fillType='CONSERVATIVE_SETTLEMENT'`，`closeReason='DATA_GAP_CONSERVATIVE'`。
+- `fillType='CONSERVATIVE_SETTLEMENT'`，`closeReason='DATA_GAP_CONSERVATIVE'`（**红线，与`emergencyClosePosition`产生的`closeReason='USER_EMERGENCY_CLOSE'`严格区分，不得混用**）。
 - 平仓后该笔`PaperTrade`：`status='EXITED'`、`estimated=true`、`verified=false`、`dataGap.conservativeSettlementConfirmedAt=Date.now()`。
-- **红线**：任何当前或未来（V1.4+）在V1.3日志基础上计算的策略胜率、平均盈亏比、预测准确率等统计，**必须**先过滤掉`estimated===true`的交易，不得混入——V1.3自身当前不计算任何此类统计，但导出的`PaperTrade`记录必须让下游消费者能够依据`estimated`/`verified`两个字段可靠地做这个过滤，这是这两个字段存在的唯一目的。
+- **红线**：任何当前或未来（V1.4+）在V1.3日志基础上计算的策略胜率、平均盈亏比、预测准确率等统计，**必须**先过滤掉`estimated===true`的交易，不得混入——V1.3自身当前不计算任何此类统计，但导出的`PaperTrade`记录必须让下游消费者能够依据`estimated`/`verified`两个字段可靠地做这个过滤，这是这两个字段存在的唯一目的。**该笔成交仍然正常计入`cash`/`equity`账面余额变化（§2.2恒等式不允许例外），但UI与导出报表必须把它与`estimated===false`的成交分区展示（见§16.9），不得混入不加区分的汇总数字**。
 - 审计日志（`ethAlphaPaperLog`）必须为该笔交易保留：`dataGap.startTime`（缺口起点）、`dataGap.replayAttempts`（全部回补尝试，含时间与结果）、`dataGap.conservativeSettlementConfirmedAt`（用户确认时间）——三者缺一不可，供事后核查"这不是系统随便决定的，而是完整记录了不可抗力+用户知情确认"。
 
 ---
@@ -639,7 +638,7 @@ emergencyClosePosition(trade, account, storage, idempotencyKey): {ok, trade?, re
 | 当日/回撤时间边界 | 当日基准：{UTC日期} 00:00 UTC（本地时间 {本地时间}） | §5.3，**必须同时显示UTC与本地时间** |
 | 最大回撤 | 最大回撤（历史净值峰值口径） | `drawdown`（§5.4，基准为`peakEquity`） |
 | 当前风险状态 | 风险状态：正常 / 当日亏损已锁定 / 强制观察中 | `account.riskRegime` |
-| 当前模拟仓位 | 当前模拟仓位（含"数据缺口待处理"状态提示） | `PaperTrade`，`status==='UNRESOLVED_DATA_GAP'`时需醒目提示，唯一操作为§16.6"紧急模拟平仓"（`emergencyClosePosition`，此状态下自动采用保守结算成交规则） |
+| 当前模拟仓位 | 当前模拟仓位（含"数据缺口待处理"状态提示） | `PaperTrade`，`status==='UNRESOLVED_DATA_GAP'`时需醒目提示，唯一操作为§16.6b"数据缺口保守结算"（`confirmDataGapConservativeSettlement`，独立于`emergencyClosePosition`） |
 | ~~开仓/加仓/减仓/平仓按钮~~ | ~~生成方案 / 确认开仓 / 确认加仓 / 减仓 / 平仓 / 确认保守结算~~ | **已作废（draft-4撤销，见§16.0/§17）**：不再有逐笔点击按钮，改为§16.9的自动交易总开关/暂停/恢复/禁止新开仓/紧急模拟平仓控制面板 |
 | 风险预算计算 | 本次风险预算（基于当前净值） | `calcRiskBudget`结果，UI必须显式标注"基于当前净值计算，非固定初始本金" |
 | 模拟成交记录 | 模拟成交记录 | `PaperTrade.fills` |
@@ -663,9 +662,9 @@ changeInitialCapital(storage, newCapital, confirmFn, alsoReset, idempotencyKey):
 buildTradeProposal(decision, account, direction): TradeProposal | {ok:false, reason}                       // 保留，但角色改变：不再是"等待用户点击确认"的对象，改为引擎内部消费+UI"下一自动动作"只读预览，见§16.5
 autoOpenPosition(proposal, decision, forecast, account, storage, idempotencyKey): {ok, trade?, reason?}    // 【已废弃，被§16.10 autoEngineOpenPosition取代】此签名是draft-3对draft-2confirmOpenPosition的字面改名，未反映"不再需要点击"这一本质变化
 autoAddOn(trade, decision, account, storage, idempotencyKey): {ok, trade?, reason?}                        // 【已废弃，被§16.10 autoEngineAddOn取代】同上
-confirmReduce(trade, quantity, decision, account, storage, idempotencyKey): {ok, trade?, reason?}          // 【已废弃，整体移除】CEO本轮明确不再保留手动部分减仓概念，分批止盈完全自动化（scanClosedBarsForExits既有机制），唯一保留的手动仓位操作是emergencyClosePosition
-emergencyClosePosition(trade, decision, account, storage, idempotencyKey): {ok, trade?, reason?}           // 【保留但语义收窄】draft-2的"手动全部平仓"改为draft-4唯一保留的手动仓位操作——"紧急模拟平仓"（异常/风险时的人工介入，非常规操作），若trade.status==='UNRESOLVED_DATA_GAP'自动采用§8.5保守结算成交规则，见§16.6
-confirmConservativeSettlement(trade, account, storage, idempotencyKey): {ok, trade?, reason?}              // 【已废弃，并入emergencyClosePosition】不再是独立函数，见上一行
+confirmReduce(trade, quantity, decision, account, storage, idempotencyKey): {ok, trade?, reason?}          // 【已废弃，整体移除】CEO本轮明确不再保留手动部分减仓概念，分批止盈完全自动化（scanClosedBarsForExits既有机制），保留的手动仓位操作是emergencyClosePosition与confirmDataGapConservativeSettlement两个
+emergencyClosePosition(trade, decision, account, storage, idempotencyKey): {ok, trade?, reason?}           // 【保留但语义收窄】draft-2的"手动全部平仓"改为draft-4-final的"普通紧急模拟平仓"，**仅适用于**OPEN/PARTIALLY_CLOSED，UNRESOLVED_DATA_GAP状态下直接拒绝并引导使用confirmDataGapConservativeSettlement，见§16.6a
+confirmConservativeSettlement(trade, account, storage, idempotencyKey): {ok, trade?, reason?}              // 【历史名称，不得实现】draft-4-final恢复为独立函数`confirmDataGapConservativeSettlement`（签名相同，改名以避免与draft-2原名混淆），见§16.6b/§16.10最终清单
 confirmForcedObservationAcknowledgement(account, storage, idempotencyKey): {ok, account?, reason?}         // 保留，账户级风险确认操作
 
 scanClosedBarsForExits(trade, newClosedBars, account, storage): {ok, trade?, fills?}
@@ -719,7 +718,8 @@ PAPER_ALGORITHM_VERSION = 'v1.3-draft-2'
   9. 账户会计字段重命名并明确公式：`equity`/`cash`/`availableBalance`（=`equity-marginUsed`，非`cash-marginUsed`）/`marginUsed`/`realizedPnlGross`/`unrealizedPnl`/`feesTotal`/`slippageCostReport`（§2.2）。
   10. 引入统一的`idempotencyKey`机制，覆盖开仓/加仓/减仓/平仓/重置全部五种操作，具备真正的幂等重放语义（§6.11）。
 - v1.3-draft-3：新增CEO需求「建议档案与影子验证」（§15）——系统给出可执行建议时无论用户是否点击都自动、不可变地存档（`SignalSnapshot`），并使用建议产生**之后**的真实已收盘K线做只读影子验证，与§2-§8「模拟账户」严格资金隔离。§0-§14「模拟账户」规则本轮零改动，`PAPER_ALGORITHM_VERSION`保持`v1.3-draft-2`不变（理由见§15.14）。
-- v1.3-draft-4（本版本）：CEO**正式撤销**draft-2/draft-3"模拟账户需要用户逐笔点击确认才生效"的授权模型，新增「真实行情自动模拟交易引擎」（§16）——用户只需一次性开启"自动模拟交易总开关"并二次确认，之后系统根据V1.1正式规则自动开仓/加仓/减仓/止损/50-30-20分批止盈/移动保护/平仓；新增引擎宏观状态机（`AUTO_PAPER_OFF/ARMED/RUNNING/PAUSED/RISK_LOCKED/DATA_BLOCKED`，§16.1）、自动开仓十四项条件（§16.2）、反向信号冷却期规则（§16.4）、真实市场模拟成交术语澄清（§16.5）、与建议档案的自动关联+五个新`userActionStatus`枚举（§15.9/§16.6）、浏览器心跳/离线回放机制（§16.7）、引擎自动幂等键生成规则（§16.8）。§0-§15中断言"用户点击才生效"的具体条款已**原地改写**（不是新增旁注），完整扫描/撤销记录见§17；`PENDING_ENTRY`/`CANCELLED`/`BLOCKED`三个状态与`confirmReduce`函数整体移除，`confirmConservativeSettlement`并入`emergencyClosePosition`；`PAPER_ALGORITHM_VERSION`/`SIGNAL_ARCHIVE_ALGORITHM_VERSION`均递增为`v1.3-draft-4`（§16.11）。§2/§4/§5.1/§5.3/§5.4/§5.5/§6.6-§6.10的账户会计恒等式、手续费滑点公式、风险预算/加仓/日亏损/回撤/杠杆数值与公式、K线扫描撮合红线**全部零改动**，仅触发方式改变。
+- v1.3-draft-4：CEO**正式撤销**draft-2/draft-3"模拟账户需要用户逐笔点击确认才生效"的授权模型，新增「真实行情自动模拟交易引擎」（§16）——用户只需一次性开启"自动模拟交易总开关"并二次确认，之后系统根据V1.1正式规则自动开仓/加仓/减仓/止损/50-30-20分批止盈/移动保护/平仓；新增引擎宏观状态机（`AUTO_PAPER_OFF/ARMED/RUNNING/PAUSED/RISK_LOCKED/DATA_BLOCKED`，§16.1）、自动开仓十四项条件（§16.2）、反向信号冷却期规则（§16.4）、真实市场模拟成交术语澄清（§16.5）、与建议档案的自动关联+五个新`userActionStatus`枚举（§15.9/§16.6）、浏览器心跳/离线回放机制（§16.7）、引擎自动幂等键生成规则（§16.8）。§0-§15中断言"用户点击才生效"的具体条款已**原地改写**（不是新增旁注），完整扫描/撤销记录见§17；`PENDING_ENTRY`/`CANCELLED`/`BLOCKED`三个状态与`confirmReduce`函数整体移除，`confirmConservativeSettlement`并入`emergencyClosePosition`；`PAPER_ALGORITHM_VERSION`/`SIGNAL_ARCHIVE_ALGORITHM_VERSION`均递增为`v1.3-draft-4`（§16.11）。§2/§4/§5.1/§5.3/§5.4/§5.5/§6.6-§6.10的账户会计恒等式、手续费滑点公式、风险预算/加仓/日亏损/回撤/杠杆数值与公式、K线扫描撮合红线**全部零改动**，仅触发方式改变。
+- v1.3-draft-4-final（本版本）：CEO"最终一致性修正"轮，关闭四项问题：①**修正测试编号/数量口径**——明确区分功能测试类别数量、具体测试用例数量、回归命令数量三个独立指标，四份文档使用统一数字（详见`V1_3_ACCEPTANCE_TESTS.md`口径说明）；②**禁止有持仓时直接关闭自动引擎**——`disarmAutoEngine`新增前置校验，账户存在任何非终态`PaperTrade`时拒绝OFF转换并显示固定提示文案，`AUTO_PAPER_PAUSED`/`AUTO_PAPER_RISK_LOCKED`继续保护已有仓位的止损/止盈/失效离场规则从"设计判断"确认为正式规则，`AUTO_PAPER_DATA_BLOCKED`期间不伪造成交的红线单独重申（§16.1）；③**拆分紧急平仓与数据缺口保守结算**——`emergencyClosePosition`（仅`OPEN`/`PARTIALLY_CLOSED`，`closeReason='USER_EMERGENCY_CLOSE'`，`estimated=false`/`verified=true`，正常计入统计）与`confirmDataGapConservativeSettlement`（仅`UNRESOLVED_DATA_GAP`，要求独立两步确认，`closeReason='DATA_GAP_CONSERVATIVE'`，`estimated=true`/`verified=false`，排除出已验证统计，报表分区展示）恢复为两个独立上层命令，仅共享底层`executeManualCloseFill`（§16.6a/§16.6b/§8.5）；④**清理旧函数名**——`V1_3_ACCEPTANCE_TESTS.md` T1-T27中的`autoOpenPosition`/`autoAddOn`已逐条替换为最终接口名`autoEngineOpenPosition`/`autoEngineAddOn`，四份文档重新执行全文冲突扫描（§17.6），确认零残留。
 
 ---
 
@@ -1072,7 +1072,7 @@ SIGNAL_ARCHIVE_ALGORITHM_VERSION = 'v1.3-draft-3'
 
 **红线（与`PAPER_ALGORITHM_VERSION`的独立性说明，draft-3时点原文，**draft-4已更新见下方标注**）**：`PAPER_ALGORITHM_VERSION`（§12）**保持`'v1.3-draft-2'`不变**——本轮draft-3新增的是一套全新的、与§2-§8平行的子系统，§2-§8「模拟账户」自身的账户/风险/撮合规则字面**零改动**，没有理由虚假递增一个描述"模拟账户算法版本"的常量。`SIGNAL_ARCHIVE_ALGORITHM_VERSION`独立维护，任何修改§15.3创建条件、§15.5生命周期状态机、§15.6影子撮合规则、§15.8统计分母规则的未来提交，必须同步递增`SIGNAL_ARCHIVE_ALGORITHM_VERSION`（而不是`PAPER_ALGORITHM_VERSION`），并在`SignalSnapshot.riskRuleVersion`的取值范围与`V1_3_ACCEPTANCE_TESTS.md`新增对应回归用例。
 
-**draft-4更新**：与draft-3不同，draft-4**确实**改变了§2-§8「模拟账户」本身的授权模型与部分函数接口（撤销`PENDING_ENTRY`/`CANCELLED`/`BLOCKED`状态、撤销`confirmReduce`、合并`confirmConservativeSettlement`进`emergencyClosePosition`、`idempotencyKey`生成方式改变），因此`PAPER_ALGORITHM_VERSION`本轮**递增为`'v1.3-draft-4'`**（不再保持`v1.3-draft-2`），`SIGNAL_ARCHIVE_ALGORITHM_VERSION`本身的创建/生命周期/撮合/统计规则未变，但其依赖的账户交互面变了，故一并递增为`'v1.3-draft-4'`，二者本轮再次统一（详见§16.11）。
+**draft-4更新**：与draft-3不同，draft-4**确实**改变了§2-§8「模拟账户」本身的授权模型与部分函数接口（撤销`PENDING_ENTRY`/`CANCELLED`/`BLOCKED`状态、撤销`confirmReduce`、`idempotencyKey`生成方式改变），因此`PAPER_ALGORITHM_VERSION`本轮**递增为`'v1.3-draft-4'`**（不再保持`v1.3-draft-2`），`SIGNAL_ARCHIVE_ALGORITHM_VERSION`本身的创建/生命周期/撮合/统计规则未变，但其依赖的账户交互面变了，故一并递增为`'v1.3-draft-4'`，二者本轮再次统一（详见§16.11）。**draft-4-final更新**：`confirmClose`/`confirmConservativeSettlement`最终拆分为`emergencyClosePosition`/`confirmDataGapConservativeSettlement`两个独立上层命令（§16.6a/§16.6b），新增`disarmAutoEngine`前置仓位校验（§16.1），版本号继续为`'v1.3-draft-4-final'`（§16.11已同步更新），不再单独递增数字版本，因为这是对同一轮draft-4设计的一致性修正，不是新一轮功能增补。
 
 ### 15.15 仍需CEO确认的问题（本轮，Signal Archive & Shadow Evaluation）
 
@@ -1116,11 +1116,22 @@ interface AutoEngineState {
 | `AUTO_PAPER_RISK_LOCKED` | 日亏损次日UTC自动解锁（若未同时触发总回撤锁定），或用户完成`confirmForcedObservationAcknowledgement`（§5.4既有机制） | `AUTO_PAPER_RUNNING` |
 | `AUTO_PAPER_RUNNING`/`AUTO_PAPER_PAUSED`/`AUTO_PAPER_RISK_LOCKED` | `decision.dataHealth!=='normal'` | `AUTO_PAPER_DATA_BLOCKED`（`preDataBlockedState`记录进入前状态） |
 | `AUTO_PAPER_DATA_BLOCKED` | `decision.dataHealth==='normal'`恢复 | 回到`preDataBlockedState`记录的状态 |
-| 任意非`AUTO_PAPER_OFF`状态 | 用户点击"关闭自动模拟交易"（二次确认+`idempotencyKey`） | `AUTO_PAPER_OFF` |
+| 任意非`AUTO_PAPER_OFF`状态，**且账户当前不存在任何非终态`PaperTrade`**（`OPEN`/`PARTIALLY_CLOSED`/`UNRESOLVED_DATA_GAP`均视为非终态） | 用户点击"关闭自动模拟交易"（二次确认+`idempotencyKey`） | `AUTO_PAPER_OFF` |
+| 任意非`AUTO_PAPER_OFF`状态，**且账户存在至少一笔非终态`PaperTrade`** | 用户点击"关闭自动模拟交易" | **拒绝，`engineState`不变**（红线，见下方"OFF前置仓位校验"） |
+
+**OFF前置仓位校验（红线，CEO本轮新增，修正"任意非OFF状态可直接关闭"的保护失效风险）**：`disarmAutoEngine`在执行二次确认关闭流程**之前**，必须先检查`ethAlphaPaperTrades`中是否存在任何`status`为`OPEN`/`PARTIALLY_CLOSED`/`UNRESOLVED_DATA_GAP`的记录——存在则**直接拒绝**（连第一次确认弹窗都不弹出），UI显示固定文案：
+
+```
+当前存在模拟仓位，请先平仓；如只想停止新交易，请使用暂停或禁止新开仓。
+```
+
+用户若坚持要完全退出自动模拟交易，唯一路径是：先对该笔仓位执行§16.6"紧急模拟平仓"（`emergencyClosePosition`，使`status`变为终态`EXITED`）或（若处于`UNRESOLVED_DATA_GAP`）执行§16.6b"数据缺口保守结算"（`confirmDataGapConservativeSettlement`），仓位归零后再点击"关闭自动模拟交易"才会被接受。**这条校验独立于`engineState`当前具体是`RUNNING`/`PAUSED`/`RISK_LOCKED`/`DATA_BLOCKED`中的哪一个**——不存在"某个状态下可以带仓位关闭"的例外，红线覆盖全部非OFF状态。`V1_3_ACCEPTANCE_TESTS.md` T44.9-T44.11专项验证。
 
 **`allowNewEntries`独立开关的设计说明（对应CEO"禁止新开仓"这一独立于暂停之外的动作）**：`allowNewEntries`不是`engineState`枚举的第七个值，而是一个可以在`AUTO_PAPER_RUNNING`状态下单独置为`false`的布尔标志，效果是"引擎继续正常运行、继续对已有仓位执行自动止损/止盈/移动保护/分批止盈（保护已有资金），但不再自动开立新仓位或加仓"，`engineState`本身仍显示`AUTO_PAPER_RUNNING`。这与`AUTO_PAPER_PAUSED`的区别是：**`AUTO_PAPER_PAUSED`同样保留对已有仓位的自动止损/止盈/移动保护**（设计判断，理由见下方），"暂停"与"禁止新开仓"在"是否开新仓"这一点上效果相同，区别在于`AUTO_PAPER_PAUSED`是更重的顶层状态切换（通常搭配用户即将调整设置等更大范围的意图），`allowNewEntries=false`是更轻量、可与"继续显示为运行中"共存的精细开关。
 
-**设计判断（红线，为什么`AUTO_PAPER_PAUSED`/`AUTO_PAPER_RISK_LOCKED`/`AUTO_PAPER_DATA_BLOCKED`都不停止已有仓位的自动止损/止盈保护）**：这三个状态都只禁止"新开仓/新加仓"，**不禁止**`scanClosedBarsForExits`对已有仓位的自动止损/止盈/移动保护/分批止盈继续执行——与draft-2既有先例（`DAILY_LOSS_LOCKED`/`FORCED_OBSERVATION`状态下T8.2/T9.4已确立"减仓/平仓/止损止盈自动触发仍正常工作"）保持一致。理由：用户暂停/引擎被风控锁定/数据异常，都不代表用户希望放弃对已经投入的模拟资金的风险保护——若"暂停"意味着连已有仓位的止损都停止执行，会制造一个"点了暂停结果亏得更多"的反直觉、且与整个系统"风险控制优先"精神相悖的陷阱。唯一会让仓位真正处于"无保护"状态的操作是用户主动点击"紧急模拟平仓"立即了结，这是显式、可见的动作，不是暂停的隐藏副作用。
+**设计判断（红线，为什么`AUTO_PAPER_PAUSED`/`AUTO_PAPER_RISK_LOCKED`/`AUTO_PAPER_DATA_BLOCKED`都不停止已有仓位的自动止损/止盈保护，CEO本轮已确认为正式规则而非仅"设计判断"）**：这三个状态都**必须继续**执行已有仓位的止损、止盈、失效离场与风险保护（`scanClosedBarsForExits`），**只禁止**"新开仓/新加仓"——与draft-2既有先例（`DAILY_LOSS_LOCKED`/`FORCED_OBSERVATION`状态下T8.2/T9.4已确立"减仓/平仓/止损止盈自动触发仍正常工作"）保持一致。理由：用户暂停/引擎被风控锁定/数据异常，都不代表用户希望放弃对已经投入的模拟资金的风险保护——若"暂停"意味着连已有仓位的止损都停止执行，会制造一个"点了暂停结果亏得更多"的反直觉、且与整个系统"风险控制优先"精神相悖的陷阱，也会使上方"OFF前置仓位校验"红线失去意义（若仓位在`PAUSED`期间本就不受保护，强制要求"先平仓再OFF"就只是延迟了风险敞口，而不是真正保护了它）。唯一会让仓位真正处于"无保护/主动了结"状态的操作是用户主动点击"紧急模拟平仓"或"数据缺口保守结算"立即了结，这是显式、可见的动作，不是暂停/锁定/数据阻断的隐藏副作用。
+
+**`AUTO_PAPER_DATA_BLOCKED`期间的红线（不得伪造成交）**：该状态下`scanClosedBarsForExits`**不产生**任何基于臆测价格的成交——数据本身不健康意味着没有可信的已收盘K线可供扫描，因此"继续保护已有仓位"在此状态下的实际含义是"待数据恢复后立即按§16.7/§8.3的K线回放机制补齐扫描"，而不是"用陈旧或臆测的价格强行判定止损/止盈"。若数据长期不恢复导致回补窗口耗尽，按§8.3-§8.4既有规则转入`UNRESOLVED_DATA_GAP`（`gapCause`视触发原因分别标记，见§16.7）。
 
 ### 16.2 自动开仓的十四项条件（对应CEO"三、自动建仓条件"，逻辑与，缺一不可）
 
@@ -1215,15 +1226,33 @@ interface PaperAccount {
 - **红线（延续§15.0，本轮重申）**：影子结果（`ShadowResult.grossR`/`netR`/`realizedGrossR`/`realizedNetR`等）**不得**进入500 USDT账户——即使某条`signal`最终被引擎实际执行（`AUTO_EXECUTED`），该`signal`自己的Shadow Evaluation计算仍然独立进行、独立存储在`ethAlphaShadowResults`，与`PaperTrade`的真实`fills`/`realizedPnl`是两条平行的、可以事后比较但绝不合并计算的数据流。
 - **红线（对应CEO"自动账户结果也不得回写修改原始SignalSnapshot"）**：已在§15.9末尾红线明确，`PaperTrade`任何后续状态变化不得回写`SignalSnapshot`原始字段。
 
-**`emergencyClosePosition`（唯一保留的手动仓位操作，对应CEO"紧急模拟平仓"）**：
+### 16.6a `emergencyClosePosition`（普通紧急模拟平仓，对应CEO"紧急模拟平仓"，仅适用于`OPEN`/`PARTIALLY_CLOSED`）
+
+**（CEO本轮修正，红线）**：`emergencyClosePosition`与§16.6b"数据缺口保守结算"是**两个独立的上层命令**，业务动作、确认文案、审计字段、统计口径**互不混淆**；两者只在最底层共享同一个成交写入函数（`executeManualCloseFill`，见§16.10），**不得**因为共用底层实现就把两者的业务语义合并成一个函数或一个分支判断。
 
 ```
 emergencyClosePosition(trade, decision, account, storage, idempotencyKey): {ok, trade?, reason?}
 ```
 
-- 任意时刻，只要存在非终态`PaperTrade`，用户均可点击"紧急模拟平仓"立即触发，无需满足任何前置条件（这是有意设计的例外——紧急情况下不应该被自动化规则本身挡住手动退出的路径）。
-- `trade.status==='UNRESOLVED_DATA_GAP'`时，自动切换为§8.5定义的保守结算成交规则（缺口结束后第一根可获得K线的`open`价+不利滑点）；其余状态下按当前`markPrice`+§4.4常规不利滑点成交。
-- `idempotencyKey`由UI在用户点击瞬间生成随机串，与draft-2既有模式一致（这是仍然真实需要"用户点击"的少数操作之一）。
+- **红线（适用范围）**：只适用于`trade.status ∈ {'OPEN','PARTIALLY_CLOSED'}`。若`trade.status==='UNRESOLVED_DATA_GAP'`，`emergencyClosePosition`**直接拒绝**，返回明确提示"该仓位处于数据缺口状态，请使用'数据缺口保守结算'"（引导用户走§16.6b）——**不再**像本文档更早版本那样在内部自动切换到保守结算规则，两条路径完全分离，不共享入口函数。
+- 任意时刻，只要存在`OPEN`/`PARTIALLY_CLOSED`的`PaperTrade`，用户均可点击"紧急模拟平仓"立即触发，无需满足§16.2任何前置条件（这是有意设计的例外——紧急情况下不应该被自动化规则本身挡住手动退出的路径）。
+- **成交价与数据健康前置检查（红线）**：必须先检查`decision.dataHealth==='normal'`且能够取得可验证的当前`markPrice`；若数据在点击瞬间恰好不健康（罕见的竞态：仓位尚未被引擎转入`UNRESOLVED_DATA_GAP`，但最新一次估值已经不可信），`emergencyClosePosition`**拒绝执行**并提示"当前行情数据暂不可验证，无法以紧急平仓方式了结，请稍候或等待数据恢复"——**不允许**用不可验证的价格伪造一笔"已验证"的成交。数据健康时，按当前`markPrice`+§4.4常规不利滑点成交。
+- **审计字段（红线）**：`closeReason='USER_EMERGENCY_CLOSE'`（**不是**`DATA_GAP_CONSERVATIVE`）、`estimated=false`、`verified=true`。
+- **统计口径**：正常计入模拟账户全部统计（已实现盈亏、胜率、平均R等），**不**被§8.5/T25/T40类"过滤`estimated===true`"的红线排除——因为这是一笔数据健康、价格可验证的真实（模拟）成交，不是估算。
+- `idempotencyKey`由UI在用户点击瞬间生成随机串，与draft-2既有模式一致（这是仍然真实需要"用户点击"的操作之一）。
+
+### 16.6b `confirmDataGapConservativeSettlement`（数据缺口保守结算，对应CEO"数据缺口保守结算"，仅适用于`UNRESOLVED_DATA_GAP`）
+
+```
+confirmDataGapConservativeSettlement(trade, account, storage, idempotencyKey): {ok, trade?, reason?}
+```
+
+- **红线（适用范围）**：只适用于`trade.status==='UNRESOLVED_DATA_GAP'`**且**§8.3回放判定确认缺失K线**无法**完整回补。其余状态（含`OPEN`/`PARTIALLY_CLOSED`，也含`UNRESOLVED_DATA_GAP`但当次回放其实已能完整覆盖的情形——此时应走正常回放恢复流程，不需要保守结算）下，`confirmDataGapConservativeSettlement`**直接拒绝**。
+- **必须单独二次确认（红线，与`emergencyClosePosition`的单次点击不同）**：UI流程为"第一次点击弹出确认对话（说明这是估算结算，非真实可验证价格）→第二次显式确认后才真正执行"，与§2.4账户设置类操作的两步确认模式一致，**不能**简化成`emergencyClosePosition`式的单击直接执行。确认文案必须包含"数据缺口无法完整回补，本次平仓按缺口后首个可获得的不利价格结算，结果仅为估算，不代表真实应得盈亏"（同draft-2 §8.5原文案，未变）。
+- 成交价：`fillPrice`取"缺口结束后**第一根**可获得的已收盘K线"的`open`价格（即"首个可获得的价格"），再按§4.4方向应用不利滑点——多单按SELL方向向下不利滑点，空单按BUY方向向上不利滑点（与draft-2 §8.5公式完全一致，未变）。
+- **审计字段（红线）**：`closeReason='DATA_GAP_CONSERVATIVE'`（**不是**`USER_EMERGENCY_CLOSE`）、`estimated=true`、`verified=false`；`PaperTrade.dataGap.startTime`（缺口起点）、`dataGap.replayAttempts`（全部回补尝试，含时间与结果）、`dataGap.conservativeSettlementConfirmedAt`（用户二次确认时间）三项审计字段完整保留（同draft-2 §8.5红线，未变）。
+- **统计口径（红线，CEO本轮重申并细化）**：`estimated===true`的这笔成交**不得**计入任何"已验证"策略准确度、胜率、平均R、盈亏比统计（与draft-2 §8.5"必须先过滤掉`estimated===true`的交易"红线一致），也**不得**混入Signal Archive/Shadow Evaluation的任何统计（两套系统本就互相隔离，此处只是重申）。**可以**影响500 USDT模拟账户的账面余额（`cash`/`equity`按§2.2恒等式正常变化，因为账户资金记账口径不允许出现"这笔钱没有真正加减"的例外），但UI与导出报表**必须**把这类`estimated===true`的成交与常规`estimated===false`的成交**分开显示**（见§16.9新增"估算结算"独立分区要求），不得合并进同一个不加区分的"全部成交"列表或同一个不加区分的汇总数字里。
+- `idempotencyKey`由UI在用户完成第二次确认那一刻生成随机串。
 
 ### 16.7 浏览器运行限制与心跳/回放（对应CEO"八"）
 
@@ -1277,7 +1306,9 @@ emergencyClosePosition(trade, decision, account, storage, idempotencyKey): {ok, 
 | 最大回撤 | 复用§10 |
 | 最近自动成交 | `PaperTrade.fills`（复用§10"模拟成交记录"） |
 | 自动运行审计日志 | `ethAlphaPaperLog`（复用§10"模拟交易日志"），新增记录类型`ENGINE_STATE_CHANGE`/`AUTO_OPEN`/`AUTO_ADDON`/`ENGINE_HEARTBEAT_GAP` |
-| 暂停、恢复、禁止新开仓及紧急平仓按钮 | 分别对应§16.1状态转换与§16.6`emergencyClosePosition` |
+| 开启、暂停、恢复、禁止新开仓、紧急平仓及关闭按钮 | 分别对应§16.1状态转换（`armAutoEngine`/`pauseAutoEngine`/`resumeAutoEngine`/`setAllowNewEntries`/`disarmAutoEngine`）与§16.6a`emergencyClosePosition`；"关闭"按钮在账户存在非终态`PaperTrade`时必须**禁用或点击后拒绝**并展示§16.1"OFF前置仓位校验"固定文案 |
+| 数据缺口保守结算按钮 | `UNRESOLVED_DATA_GAP`状态下唯一可用操作，对应§16.6b`confirmDataGapConservativeSettlement`，UI需与"紧急模拟平仓"视觉区分（不同按钮/不同确认流程） |
+| 估算结算独立分区 | "最近自动成交"/导出报表中，`estimated===true`（`closeReason==='DATA_GAP_CONSERVATIVE'`）的成交必须与`estimated===false`（含`USER_EMERGENCY_CLOSE`/自动止损止盈/自动分批止盈）的成交**分区展示**，不得合并进同一个不加区分的汇总数字（§16.6b红线） |
 
 其余§10已有字段（初始资金/JSON-CSV导出/重置账户按钮等）原样保留，不重复列出。
 
@@ -1289,25 +1320,27 @@ tickAutoEngine(decision, forecast, marketData, account, signals, storage): {ok, 
 pauseAutoEngine(storage, idempotencyKey): {ok, state?}
 resumeAutoEngine(storage, idempotencyKey): {ok, state?}
 setAllowNewEntries(allow, storage, idempotencyKey): {ok, state?}
-disarmAutoEngine(storage, confirmFn, idempotencyKey): {ok, state?}                // 任意状态→OFF，二次确认
+disarmAutoEngine(storage, confirmFn, idempotencyKey): {ok, state?, reason?}        // 任意状态→OFF，二次确认；**红线**：内部第一步必须校验account当前无非终态PaperTrade，否则直接返回{ok:false, reason:'当前存在模拟仓位，请先平仓；如只想停止新交易，请使用暂停或禁止新开仓。'}，不进入二次确认弹窗流程（§16.1"OFF前置仓位校验"）
 
 autoEngineOpenPosition(signal, decision, forecast, account, storage): {ok, trade?, reason?}   // 内部按AUTO-OPEN-${signalId}生成idempotencyKey，见§16.8
 autoEngineAddOn(trade, signal, decision, account, storage): {ok, trade?, reason?}              // 内部按AUTO-ADDON-${tradeId}生成idempotencyKey
-emergencyClosePosition(trade, decision, account, storage, idempotencyKey): {ok, trade?, reason?}  // 保留，唯一人工触发的仓位操作，见§16.6
+emergencyClosePosition(trade, decision, account, storage, idempotencyKey): {ok, trade?, reason?}                 // 仅适用OPEN/PARTIALLY_CLOSED，见§16.6a；closeReason='USER_EMERGENCY_CLOSE'，estimated=false，verified=true
+confirmDataGapConservativeSettlement(trade, account, storage, idempotencyKey): {ok, trade?, reason?}             // 仅适用UNRESOLVED_DATA_GAP，见§16.6b；closeReason='DATA_GAP_CONSERVATIVE'，estimated=true，verified=false；要求独立两步确认
+executeManualCloseFill(trade, account, fillParams, storage): {ok, trade?, fill?}   // 私有/内部共享的底层成交写入函数，仅供emergencyClosePosition与confirmDataGapConservativeSettlement调用，不直接暴露给UI，fillParams含fillPrice/closeReason/estimated/verified四项由上层各自传入，不由本函数自行判断业务语义
 
 checkReverseSignalCooldown(candidateSignal, account): {ok: boolean, reason?}      // §16.4冷却期判定
 replayEngineOfflineGap(trade, marketData, account, storage): {ok, trade?, coverageComplete}  // 复用§8.3机制，gapCause='ENGINE_OFFLINE'
 
 buildTradeProposal(decision, account, direction): TradeProposal | {ok:false, reason}  // 保留，角色见§16.5
-scanClosedBarsForExits(trade, newClosedBars, account, storage): {ok, trade?, fills?}  // 保留，draft-2既有，零改动
+scanClosedBarsForExits(trade, newClosedBars, account, storage): {ok, trade?, fills?}  // 保留，draft-2既有，零改动；AUTO_PAPER_DATA_BLOCKED期间不产生任何基于臆测价格的成交（见§16.1红线）
 ```
 
-### 16.11 版本号红线（draft-4更新）
+### 16.11 版本号红线（draft-4-final更新）
 
 ```
-PAPER_ALGORITHM_VERSION = 'v1.3-draft-4'            // 从v1.3-draft-2递增，理由见§15.14"draft-4更新"标注
-PAPER_SCHEMA_VERSION = 'v1.3-account-3' / 'v1.3-trade-3' / 'v1.3-log-3'  // 新增AutoEngineState相关字段与PaperTrade.linkedSignalId/dataGap.gapCause，相对draft-2的-2版本递增
-SIGNAL_ARCHIVE_ALGORITHM_VERSION = 'v1.3-draft-4'   // 与PAPER_ALGORITHM_VERSION本轮再次统一，见§15.14
+PAPER_ALGORITHM_VERSION = 'v1.3-draft-4-final'      // 从v1.3-draft-2递增至v1.3-draft-4（理由见§15.14"draft-4更新"），本轮一致性修正后固定为v1.3-draft-4-final
+PAPER_SCHEMA_VERSION = 'v1.3-account-3' / 'v1.3-trade-3' / 'v1.3-log-3'  // 新增AutoEngineState相关字段与PaperTrade.linkedSignalId/dataGap.gapCause，相对draft-2的-2版本递增；draft-4-final未新增字段（closeReason新枚举值/estimated/verified均为draft-2既有字段的既有取值范围内变化），schema版本号不再递增
+SIGNAL_ARCHIVE_ALGORITHM_VERSION = 'v1.3-draft-4-final'   // 与PAPER_ALGORITHM_VERSION本轮再次统一，见§15.14
 ```
 
 `migratePaperAccount`/`migratePaperTrades`必须包含`v1.3-account-2→v1.3-account-3`/`v1.3-trade-2→v1.3-trade-3`的显式迁移分支：新增`AutoEngineState`全部字段按默认值补齐（`engineState`默认`'AUTO_PAPER_OFF'`，`allowNewEntries`默认`true`，其余心跳/冷却期字段默认`null`）；`PaperTrade.linkedSignalId`历史记录（若存在，即draft-2/draft-3阶段产生的手动开仓记录）补`null`；`dataGap.gapCause`历史记录补`'MARKET_DATA_INVALID'`（历史缺口全部视为原有触发路径，因为`ENGINE_OFFLINE`路径是draft-4才新增的判定）。
@@ -1318,13 +1351,13 @@ SIGNAL_ARCHIVE_ALGORITHM_VERSION = 'v1.3-draft-4'   // 与PAPER_ALGORITHM_VERSIO
 
 ### 16.13 仍需CEO决定的问题（本轮，Auto Paper Trading Engine）
 
-无。CEO本轮"一至十一"的全部要求已在§16.0-§16.12逐条落地。以下两点是本文档在CEO未明确指定时做出的设计判断，已在相应小节说明理由，供CEO复核（非"待决策"，是"已决策并记录依据"）：① `AUTO_PAPER_PAUSED`/`AUTO_PAPER_RISK_LOCKED`/`AUTO_PAPER_DATA_BLOCKED`三个状态均保留对已有仓位的自动止损/止盈保护，只禁止新开仓/加仓（§16.1设计判断）；② `UNRESOLVED_DATA_GAP`的唯一退出路径复用`emergencyClosePosition`而非新增独立按钮（§16.6，`confirmConservativeSettlement`并入其中，见§17）。若实现阶段发现本文档未能预见的边界情况，将在`V1_3_IMPLEMENTATION_REPORT.md`中记录并视需要提请CEO补充决策。
+无。CEO本轮"一至十一"的全部要求已在§16.0-§16.12逐条落地。以下设计判断已在相应小节说明理由，供CEO复核（非"待决策"，是"已决策并记录依据"）：① `AUTO_PAPER_PAUSED`/`AUTO_PAPER_RISK_LOCKED`/`AUTO_PAPER_DATA_BLOCKED`三个状态均保留对已有仓位的自动止损/止盈保护，只禁止新开仓/加仓，且`AUTO_PAPER_DATA_BLOCKED`期间不产生任何基于臆测价格的成交（§16.1设计判断，CEO"最终一致性修正"轮已确认为正式规则）；② `UNRESOLVED_DATA_GAP`的唯一退出路径是独立的`confirmDataGapConservativeSettlement`（要求单独两步确认），与`emergencyClosePosition`（仅适用`OPEN`/`PARTIALLY_CLOSED`）是两个业务语义严格区分的上层命令，只共享底层`executeManualCloseFill`成交写入函数（§16.6a/§16.6b，CEO"最终一致性修正"轮明确要求拆分，纠正了draft-4首版"合并为一个函数内部分支"的设计）；③ 关闭自动模拟交易（OFF）在账户存在任何非终态`PaperTrade`时被前置拦截，用户必须先执行紧急模拟平仓或数据缺口保守结算使仓位归零，才能关闭（§16.1"OFF前置仓位校验"，CEO"最终一致性修正"轮新增，纠正了draft-4首版"任意非OFF状态可直接关闭"的保护失效风险）。若实现阶段发现本文档未能预见的边界情况，将在`V1_3_IMPLEMENTATION_REPORT.md`中记录并视需要提请CEO补充决策。
 
 ---
 
-## 17. 全文冲突旧定义扫描与撤销记录（对应CEO"十一、删除全部冲突旧定义"，本节为完整审计记录，覆盖四份文档）
+## 17. 全文冲突旧定义扫描与撤销记录（对应CEO"十一、删除全部冲突旧定义"，本节为完整审计记录，覆盖四份文档；**draft-4-final已重新执行全文扫描，见§17.6**）
 
-**扫描方法**：对`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ACCEPTANCE_TESTS.md`/`V1_3_ARCHITECTURE_REVIEW.md`四份文档全文执行关键词扫描（"点击"、`confirmOpenPosition`、`confirmAddOn`、`confirmReduce`、`confirmClose`、`confirmConservativeSettlement`、`TradeProposal`/`buildTradeProposal`、"用户必须"、"手动接受"），逐条判定是否属于CEO列出的四类冲突旧定义或其直接衍生表述，逐条记录处理方式。
+**扫描方法**：对`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ACCEPTANCE_TESTS.md`/`V1_3_ARCHITECTURE_REVIEW.md`四份文档全文执行关键词扫描（"点击"、`confirmOpenPosition`、`confirmAddOn`、`confirmReduce`、`confirmClose`、`confirmConservativeSettlement`、`autoOpenPosition`、`autoAddOn`、`TradeProposal`/`buildTradeProposal`、"用户必须"、"手动接受"），逐条判定是否属于CEO列出的四类冲突旧定义或其直接衍生表述，逐条记录处理方式。
 
 ### 17.1 CEO明确列出的四条待删除/改写表述——处理结果
 
@@ -1335,21 +1368,26 @@ SIGNAL_ARCHIVE_ALGORITHM_VERSION = 'v1.3-draft-4'   // 与PAPER_ALGORITHM_VERSIO
 | "不实现无人确认的自动模拟开仓" | 是（§0.3原文，CODEX_TASK §1.2同步） | **原地改写**，V1.3当前产品定义就是自动开仓，改写为"不得连接真实账户/发送真实订单/使用真实资金"三条红线（性质不同的禁止事项被保留，"无人确认"这条被撤销） | SPEC §0.3，CODEX_TASK §1.2/§8.1 |
 | "PaperAccount只有用户点击才生效" | 是（§15.0表格"是否需要用户点击"列） | **原地改写**为"仅需一次性开启（总开关+二次确认），运行期间不需要逐笔点击" | SPEC §15.0表格第③行 |
 
-### 17.2 函数级改动清单（全部四份文档一致生效）
+### 17.2 函数级改动清单（全部四份文档一致生效，唯一权威版本；**draft-4-final更新**）
 
-| 旧函数（draft-2/draft-3） | draft-4状态 | 新函数/去向 |
+| 旧函数（draft-2/draft-3/draft-4首版） | draft-4-final状态 | 唯一正式接口名称/去向 |
 |---|---|---|
-| `confirmOpenPosition`（draft-3已重命名`autoOpenPosition`） | 已废弃 | `autoEngineOpenPosition`（§16.10），由引擎在§16.2十四项条件满足时自动调用 |
-| `confirmAddOn`（draft-3已重命名`autoAddOn`） | 已废弃 | `autoEngineAddOn`（§16.10），由引擎在§5.2条件满足时自动调用 |
-| `confirmReduce` | **整体移除** | 无替代——CEO本轮明确不保留手动部分减仓概念，分批止盈完全由`scanClosedBarsForExits`自动执行 |
-| `confirmClose` | 改名+语义收窄 | `emergencyClosePosition`（§16.6），从"常规手动平仓"收窄为"唯一保留的例外性人工介入操作" |
-| `confirmConservativeSettlement` | **并入**`emergencyClosePosition` | 当`trade.status==='UNRESOLVED_DATA_GAP'`时，`emergencyClosePosition`内部自动切换为保守结算成交规则（§8.5/§16.6），不再是独立函数 |
-| `buildTradeProposal`/`TradeProposal` | **保留，角色改变** | 不再是"等待用户点击确认"的对象，改为引擎内部消费+UI"下一自动动作"只读预览（§16.5） |
-| `resetPaperAccount`/`changeInitialCapital`/`confirmForcedObservationAcknowledgement` | **保留，不变** | 账户级设置操作，本来就不是"逐笔交易"性质，不属于本轮撤销范围 |
+| `confirmOpenPosition`（draft-3曾重命名`autoOpenPosition`） | **历史名称，不得实现** | `autoEngineOpenPosition`（§16.10），由引擎在§16.2十四项条件满足时自动调用 |
+| `confirmAddOn`（draft-3曾重命名`autoAddOn`） | **历史名称，不得实现** | `autoEngineAddOn`（§16.10），由引擎在§5.2条件满足时自动调用 |
+| `confirmReduce` | **历史名称，不得实现，无替代** | CEO本轮明确不保留手动部分减仓概念，分批止盈完全由`scanClosedBarsForExits`自动执行 |
+| `confirmClose` | **历史名称，不得实现** | 语义拆分为`emergencyClosePosition`（§16.6a，仅`OPEN`/`PARTIALLY_CLOSED`）——draft-4首版曾误将其与保守结算合并，draft-4-final已拆分 |
+| `confirmConservativeSettlement` | **历史名称，不得实现** | 恢复为独立函数`confirmDataGapConservativeSettlement`（§16.6b，仅`UNRESOLVED_DATA_GAP`，要求独立两步确认）——draft-4首版曾将其**并入**`emergencyClosePosition`，CEO"最终一致性修正"轮明确指出"共用底层成交函数可以，但业务动作/确认文案/审计字段/统计口径必须分开"，故draft-4-final拆分为两个上层命令，仅共享底层`executeManualCloseFill` |
+| `buildTradeProposal`/`TradeProposal` | **保留，角色改变，是最终正式接口** | 不再是"等待用户点击确认"的对象，改为引擎内部消费+UI"下一自动动作"只读预览（§16.5） |
+| `resetPaperAccount`/`changeInitialCapital`/`confirmForcedObservationAcknowledgement` | **保留，不变，是最终正式接口** | 账户级设置操作，本来就不是"逐笔交易"性质，不属于本轮撤销范围 |
+| `emergencyClosePosition` | **是最终正式接口** | 仅适用`OPEN`/`PARTIALLY_CLOSED`；`closeReason='USER_EMERGENCY_CLOSE'`、`estimated=false`、`verified=true` |
+| `confirmDataGapConservativeSettlement` | **是最终正式接口** | 仅适用`UNRESOLVED_DATA_GAP`；`closeReason='DATA_GAP_CONSERVATIVE'`、`estimated=true`、`verified=false`；要求独立两步确认 |
+| `disarmAutoEngine` | **是最终正式接口，draft-4-final新增前置校验** | 内部第一步校验账户无任何非终态`PaperTrade`，否则直接拒绝（§16.1"OFF前置仓位校验"） |
+
+**红线（对应CEO本轮"四、清理旧函数名"）**：以上标注"历史名称，不得实现"的六个函数名（`confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose`/`confirmConservativeSettlement`，以及draft-3阶段过渡名`autoOpenPosition`/`autoAddOn`）**不得**出现在任何实现文件（`v1_3-paper-trading-core.js`/`v1_3-auto-engine-core.js`等）的导出列表中；四份V1.3文档中除本表、SPEC §17.5"已知残留说明"（若有）、以及明确标注"历史名称"的迁移/变更记录之外，**不应再出现**这些名字作为"应实现的当前接口"使用。`V1_3_ACCEPTANCE_TESTS.md` T55（废弃函数不存在性校验）与新增的T58（旧函数名零残留检查，见ACCEPTANCE_TESTS）共同覆盖该红线的可测试化。
 
 ### 17.3 状态机改动清单
 
-| 旧状态/概念 | draft-4状态 | 说明 |
+| 旧状态/概念 | draft-4-final状态 | 说明 |
 |---|---|---|
 | `PositionStatus.PENDING_ENTRY` | **整体移除** | `PaperTrade`只在实际开仓那一刻创建，不再有"已生成方案、等待确认"的持久化中间态（SPEC §3.4） |
 | `PositionStatus.CANCELLED` | **整体移除** | 无对应概念可取消（没有等待中的方案） |
@@ -1358,16 +1396,35 @@ SIGNAL_ARCHIVE_ALGORITHM_VERSION = 'v1.3-draft-4'   // 与PAPER_ALGORITHM_VERSIO
 | `SignalSnapshot.userActionStatus`的`REJECTED` | **撤销，不再产生** | 用户不再对单条建议做接受/拒绝，只有宏观的暂停/禁止新开仓/关闭 |
 | 新增：`EngineState`六态 | 新增 | `AUTO_PAPER_OFF/ARMED/RUNNING/PAUSED/RISK_LOCKED/DATA_BLOCKED`（§16.1） |
 | 新增：`userActionStatus`五个`AUTO_*`值 | 新增 | `AUTO_EXECUTED`/`AUTO_BLOCKED_BY_RISK`/`AUTO_BLOCKED_BY_POSITION`/`AUTO_MISSED_ENGINE_OFF`/`AUTO_MISSED_DATA_GAP`（§15.9） |
+| **新增（draft-4-final）**：`AUTO_PAPER_OFF`前置仓位校验 | 新增 | 任意非OFF状态→OFF的转换，只有账户无任何非终态`PaperTrade`时才允许，否则拒绝（§16.1） |
+| **新增（draft-4-final）**：`closeReason`枚举拆分 | 新增 | `USER_EMERGENCY_CLOSE`（普通紧急平仓，新增值）与`DATA_GAP_CONSERVATIVE`（数据缺口保守结算，draft-2既有值）严格区分，不再共用同一个笼统的"紧急平仓"语义 |
 
-### 17.4 逐文档扫描结果统计
+### 17.4 逐文档扫描结果统计（draft-4首版基线，历史记录，不代表draft-4-final当前状态，当前状态见§17.6）
 
-| 文档 | 扫描到的"点击"相关表述总数（改动前） | 判定为冲突需改写 | 判定为合法保留（账户级设置/`emergencyClosePosition`/历史变更记录） |
+| 文档 | 扫描到的"点击"相关表述总数（draft-3末尾，改动前） | 判定为冲突需改写 | 判定为合法保留（账户级设置/`emergencyClosePosition`/历史变更记录） |
 |---|---|---|---|
-| `V1_3_PAPER_TRADING_SPEC.md`（draft-3末尾状态，改动前） | 26处 | 15处已原地改写或标注（§0.3/§3.4/§5.2条件8/§6.2/§6.11/§8.5/§10/§11/§15.0/§15.2/§15.9，含术语表第6项） | 11处保留（`changeInitialCapital`两步确认、`emergencyClosePosition`点击时间、`FORCED_OBSERVATION`解除确认、历史changelog条目等，均为账户级设置操作或历史记录，非本轮撤销对象） |
+| `V1_3_PAPER_TRADING_SPEC.md` | 26处 | 15处已原地改写或标注（§0.3/§3.4/§5.2条件8/§6.2/§6.11/§8.5/§10/§11/§15.0/§15.2/§15.9，含术语表第6项） | 11处保留（`changeInitialCapital`两步确认、`emergencyClosePosition`点击时间、`FORCED_OBSERVATION`解除确认、历史changelog条目等，均为账户级设置操作或历史记录，非本轮撤销对象） |
 | `V1_3_CODEX_IMPLEMENTATION_TASK.md` | 5处 | 全部5处已原地改写（§1.2/§1.3/§3步骤3/新增§8全篇） | 0 |
-| `V1_3_ACCEPTANCE_TESTS.md` | 5处 | 全部5处已原地改写或已被函数级重命名覆盖（T16.1/T39.2-T39.4/T42.1，见§17.5） | 0 |
+| `V1_3_ACCEPTANCE_TESTS.md` | 5处 | 全部5处已原地改写或已被函数级重命名覆盖（T16.1/T39.2-T39.4/T42.1） | 0 |
 | `V1_3_ARCHITECTURE_REVIEW.md` | 3处 | 1处（T39.2引用行）已随ACCEPTANCE_TESTS同步更新 | 2处保留（历史设计说明，描述draft-1→draft-2的"重复点击"用户体验改进，非本轮撤销对象） |
 
-### 17.5 已知残留与说明
+### 17.5 draft-4首版遗留残留（已在draft-4-final清零，历史记录）
 
-`V1_3_ACCEPTANCE_TESTS.md`原T2/T3/T6/T7/T11/T17/T18/T19/T21/T23等既有测试用例（T1-T27）中大量出现的`confirmOpenPosition`/`confirmAddOn`已通过全文机械改名同步为`autoOpenPosition`/`autoAddOn`（draft-3已完成的第一次改名），但这两个名字本身在draft-4已被判定为废弃（见§17.2，实际应使用`autoEngineOpenPosition`/`autoEngineAddOn`）。**本文档不在T1-T27内逐条替换为最终函数名**——T1-T27测试的断言内容（会计恒等式、手续费滑点公式、加仓七条件、止损止盈撮合规则等）全部保持有效且未被本轮修订触碰，只是其中使用的函数名是draft-2/draft-3阶段的历史名称；`V1_3_ACCEPTANCE_TESTS.md`已在文件头新增字段/函数名对照说明（见文档T1章节前的红线注记）指向本表§17.2，供实现阶段Codex在编写`tests/v13-*.js`时使用正确的最终函数名。这是本文档在"全文替换风险"与"保持T1-T27两百余条已验证断言逐字稳定"之间做出的明确取舍，理由：T1-T27是draft-2两轮CEO决策已经核对过的成熟测试规范，逐条重写产生新错别字/断言遗漏的风险高于保留一份"函数名对照表"的认知成本。
+draft-4首版曾在`V1_3_ACCEPTANCE_TESTS.md` T1-T27保留`autoOpenPosition`/`autoAddOn`历史函数名，仅提供文档头部对照表供实现阶段换算，理由是"保持200余条已验证断言逐字稳定，优先级高于函数名表面一致性"。**CEO"最终一致性修正"轮明确指出这一取舍不可接受**（"不要只保留函数名对照表""全文搜索确认不存在会误导Codex的旧接口残留"），draft-4-final已**逐条实际替换**T1-T27中出现的`autoOpenPosition`→`autoEngineOpenPosition`、`autoAddOn`→`autoEngineAddOn`（机械改名，不改变任何断言内容本身），并同步移除文档头部原"函数名对照表"中已经不再需要的换算说明（改为§17.6"零残留确认"）。此项残留在draft-4-final**已清零**，详见§17.6。
+
+### 17.6 draft-4-final全文重新扫描结果（本轮新增，唯一当前有效的扫描记录）
+
+对四份文档重新执行§17开头"扫描方法"列出的关键词全文搜索，结果：
+
+| 关键词 | SPEC | CODEX_TASK | ACCEPTANCE_TESTS | ARCHITECTURE_REVIEW | 结论 |
+|---|---|---|---|---|---|
+| `confirmOpenPosition` | 0处（仅§17.2表格作为"历史名称"标注） | 0处（同上） | 0处（同上，仅文档头部说明段落提及） | 0处 | 零残留 |
+| `confirmAddOn` | 同上 | 同上 | 同上 | 0处 | 零残留 |
+| `autoOpenPosition` | 同上 | 同上 | 0处（T1-T27已全部替换为`autoEngineOpenPosition`） | 0处 | 零残留 |
+| `autoAddOn` | 同上 | 同上 | 0处（T1-T27已全部替换为`autoEngineAddOn`） | 0处 | 零残留 |
+| `confirmReduce` | 同上 | 同上 | 0处（T8.2/T10.2/T11.3/T21.3/T23.4已在draft-4首版原地改写为`emergencyClosePosition`/`confirmDataGapConservativeSettlement`表述，未残留旧名） | 0处 | 零残留 |
+| `confirmClose`（不含`emergencyClosePosition`/`confirmDataGapConservativeSettlement`子串） | 0处 | 0处 | 0处 | 0处 | 零残留 |
+| `confirmConservativeSettlement` | 同上（仅§17.2/§8.5标题作为"历史名称"标注） | 同上 | 0处（T21.3/T23.4/T24/T49改用`confirmDataGapConservativeSettlement`） | 0处 | 零残留 |
+| "用户点击"（不含"紧急模拟平仓"/"数据缺口保守结算"/账户级设置操作/历史changelog上下文） | 0处新增冲突 | 0处 | 0处 | 0处 | 无新增冲突表述 |
+
+**结论**：CEO"十一、删除全部冲突旧定义"要求的全文扫描已重新执行，确认不存在会误导Codex的旧接口残留；仅剩的旧名字出现位置均为§17.2/§8.5/§17.5等**明确标注"历史名称，不得实现"或"历史记录"**的审计性质段落，符合CEO"如某个旧名字只用于迁移说明，必须明确标注"的要求。四份V1.3文档现在只保留一套权威函数接口（§16.10完整清单）。

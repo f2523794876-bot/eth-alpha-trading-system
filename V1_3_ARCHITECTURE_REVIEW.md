@@ -1,6 +1,6 @@
 # V1_3_ARCHITECTURE_REVIEW.md — V1.3「模拟交易账户」架构复核与一致性核查
 
-版本：v1.3-draft-4（§1-§8为draft-2内容，其中"逐笔点击确认"相关条款已被draft-4原地改写，见§10；§9为draft-3内容不变；§10为draft-4新增，对应CEO本轮「真实行情自动模拟交易引擎」需求，正式撤销draft-2/draft-3"用户必须逐笔点击确认才建立模拟仓位"的授权模型，见`V1_3_PAPER_TRADING_SPEC.md`§16）
+版本：v1.3-draft-4-final（§1-§8为draft-2内容，其中"逐笔点击确认"相关条款已被draft-4原地改写，见§10；§9为draft-3内容不变；§10为draft-4新增，对应CEO本轮「真实行情自动模拟交易引擎」需求，正式撤销draft-2/draft-3"用户必须逐笔点击确认才建立模拟仓位"的授权模型，见`V1_3_PAPER_TRADING_SPEC.md`§16；§11为draft-4-final新增，核对CEO"最终一致性修正"轮四项问题的关闭情况，并订正§10.4/§10.6/§10.7中已被draft-4-final取代的过时表述）
 角色：本文档是四份V1.3文档中的最后一份，职责是**核对前三份文档（`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ACCEPTANCE_TESTS.md`）互相一致**，核对与V1.1/V1.2/`STRATEGY_SPEC.md`既有代码接口的一致性，给出风险清单，并作为交给CEO复审的入口文档。
 
 ---
@@ -105,7 +105,9 @@ WebSocket、条件提醒推送、长期运行监控**仍然**不在V1.3范围内
 
 - v1.3-draft-1：首次交付。
 - v1.3-draft-2：CEO七项决策+三项统一规则全部核对落地，draft-1开放问题清单归零，新增本轮设计一致性说明（§2）与历史文档修订核查（§5）。
-- v1.3-draft-3（本版本）：新增CEO需求「建议档案与影子验证」核对（§9），含默认有效期决定的详细理由（§9.2，CEO要求本决定必须记录在本文档）。§1-§8「模拟账户」核对结论本轮零改动。
+- v1.3-draft-3：新增CEO需求「建议档案与影子验证」核对（§9），含默认有效期决定的详细理由（§9.2，CEO要求本决定必须记录在本文档）。§1-§8「模拟账户」核对结论本轮零改动。
+- v1.3-draft-4：核对CEO正式撤销"逐笔点击确认"授权模型、新增「真实行情自动模拟交易引擎」的十一项要求（新增§10）。§1-§9核对结论本轮零改动。
+- v1.3-draft-4-final（本版本）：核对CEO"最终一致性修正"轮四项问题的关闭情况（新增§11：测试编号/数量口径统一、OFF前置仓位校验、紧急平仓与数据缺口保守结算拆分、旧函数名零残留），同步订正§9.3第4条/§10.4/§10.6第3条/§10.7中因draft-4-final设计变更而过时的表述（原地改写并保留取代前的历史文本供审计追溯，不做静默删除）。§1-§9核对结论本轮零改动。
 
 ---
 
@@ -154,7 +156,7 @@ WebSocket、条件提醒推送、长期运行监控**仍然**不在V1.3范围内
 1. **"失效位"与"止损位"的数值收敛**：CEO要求判断"触发进场后先到止损、失效位还是目标位"，但V1.1的`exitConditions`/`triggerPlans.invalidation`是文案数组，没有定义独立于`stopLoss`的第二个数值失效价位。本文档确认这是一次**忠实于现有数据结构的收敛处理**而非遗漏：`SignalSnapshot.invalidation`字段继续保留文案证据（审计用途），但状态机判定只在`stopLoss`与`targets`之间比较先后（SPEC §15.5"设计说明"已注明）。
 2. **不模拟移动止损**：`TARGET_1_HIT`/`TARGET_2_HIT`之后的止损判定统一使用`SignalSnapshot.stopLoss`原始冻结值，不引入draft-2 §6.10式的"移动止损到保本位"假设。理由：移动止损是Paper Trading账户里的主动仓位管理动作，若在Signal Archive里模拟，等同于为V1.1从未做出过的具体交易管理动作背书，与CEO"不得后见之明"的精神冲突。
 3. **`PAPER_ALGORITHM_VERSION`保持不变**：本轮文档整体版本号升级到`v1.3-draft-3`，但`PAPER_ALGORITHM_VERSION`（描述§2-§8模拟账户算法）保持`'v1.3-draft-2'`不变，因为该部分规则字面零改动；新增`SIGNAL_ARCHIVE_ALGORITHM_VERSION='v1.3-draft-3'`独立维护建议档案子系统自己的版本号（SPEC §15.14）。
-4. **Signal Archive与Paper Trading单向依赖**：`v1_3-signal-archive-core.js`（下轮实现）**不得**依赖`v1_3-paper-trading-core.js`内部实现，仅通过`signalId`/`tradeId`指针与`autoOpenPosition`新增的可选`signalId`参数关联；`v1_3-signal-archive-core.js`可以独立于Paper Trading Account是否已经实现而先行开发与测试（CODEX_TASK §7.1/§7.3已注明）。
+4. **Signal Archive与Paper Trading单向依赖**：`v1_3-signal-archive-core.js`（下轮实现）**不得**依赖`v1_3-paper-trading-core.js`内部实现，仅通过`signalId`/`tradeId`指针与开仓函数新增的可选`signalId`参数关联（draft-3撰写时暂用`autoOpenPosition`这一历史名称指代该开仓函数，不得实现；draft-4-final起该函数的唯一正式接口名称是`autoEngineOpenPosition`，见SPEC §16.10）；`v1_3-signal-archive-core.js`可以独立于Paper Trading Account是否已经实现而先行开发与测试（CODEX_TASK §7.1/§7.3已注明）。
 5. **BTC结构快照的只读边界**：`SignalSnapshot.btcStructureSnapshot`通过只读调用`v1-core.js`已导出的`analyzeKlines()`对BTC原始K线（`window.__lastMarketData.btc`）生成，**不**重新做多空方向判断——`biasDirection`/`btcAlignment`等方向性结论仍完全来自V1.1原始决策对象，只是把V1.1内部已经用来计算这些结论的BTC结构原始数据也存档，供未来审计追溯"当时BTC结构具体是什么样"，不违反draft-2 §7.1"V1.3只读消费V1.1，不重新计算"的红线。
 
 ### 9.4 CEO"十三、测试要求"逐条映射（对应`V1_3_ACCEPTANCE_TESTS.md` T28-T43）
@@ -237,8 +239,8 @@ Signal Archive（自动存档）与Shadow Evaluation（只读影子验证）的�
 已复核SPEC §17完整扫描记录，确认：
 
 - CEO明确列出的四条表述（"用户必须逐笔点击确认才建立模拟仓位"/"每次开仓必须手动接受"/"不实现无人确认的自动模拟开仓"/"PaperAccount只有用户点击才生效"）均已定位并原地改写，替换文案与CEO"十一"要求的四条替换表述逐句对应。
-- 函数级改动（`confirmReduce`整体移除、`confirmConservativeSettlement`并入`emergencyClosePosition`、`autoOpenPosition`/`autoAddOn`废弃改为`autoEngineOpenPosition`/`autoEngineAddOn`、`buildTradeProposal`保留但角色改变）在SPEC §17.2、CODEX_TASK §8.1/§8.5、ACCEPTANCE_TESTS函数名对照表（文档头部）与T55五处表述完全一致，未发现遗漏或矛盾。
-- **唯一已知的、经过明确取舍的残留**：`V1_3_ACCEPTANCE_TESTS.md` T1-T27的历史用例文本中仍出现`autoOpenPosition`/`autoAddOn`字样（draft-2/draft-3阶段的历史函数名），SPEC §17.5记录了这一取舍理由（保持200余条已验证断言逐字稳定，优先级高于函数名的表面一致性），并要求实现阶段Codex按文档头部"函数名对照表"换算为最终函数名。本次复核**认可**这一取舍——理由与SPEC §17.5一致，且ACCEPTANCE_TESTS文档头部的对照表本身构成了充分的、可审计的换算依据，不属于"遗漏未处理"。
+- **本表已被draft-4-final更新，见§11.3**：draft-4首版曾记录的函数级改动（`confirmReduce`整体移除、`confirmConservativeSettlement`**并入**`emergencyClosePosition`、`autoOpenPosition`/`autoAddOn`废弃改为`autoEngineOpenPosition`/`autoEngineAddOn`、`buildTradeProposal`保留但角色改变）中，"`confirmConservativeSettlement`并入`emergencyClosePosition`"这一条已被CEO"最终一致性修正"轮**撤销**，改为拆分成`emergencyClosePosition`/`confirmDataGapConservativeSettlement`两个独立命令（SPEC §16.6a/§16.6b，§11.3详述），其余改动（`confirmReduce`移除、`autoOpenPosition`/`autoAddOn`更名）结论不变。
+- **draft-4首版曾记录的残留，已在draft-4-final清零，见§11.4**：`V1_3_ACCEPTANCE_TESTS.md` T1-T27的历史用例文本中曾保留`autoOpenPosition`/`autoAddOn`字样（draft-2/draft-3阶段的历史函数名），仅提供文档头部对照表供实现阶段换算。CEO"最终一致性修正"轮明确指出这一取舍不可接受（"不要只保留函数名对照表"），draft-4-final已将T1-T27中的这两个旧名**逐条实际替换**为`autoEngineOpenPosition`/`autoEngineAddOn`，此项残留**已清零**，不再是"经过明确取舍的残留"。
 
 ### 10.5 与既有代码接口的核对表（本轮新增）
 
@@ -252,9 +254,63 @@ Signal Archive（自动存档）与Shadow Evaluation（只读影子验证）的�
 
 1. **`checkReverseSignalCooldown`与"同一次tick内不得连续平仓+反向开仓"两条规则的实现耦合是本轮新引入复杂度最高的点**：若`scanClosedBarsForExits`（自动止损/止盈）与`autoEngineOpenPosition`（自动开仓）在同一次`tickAutoEngine`调用内被连续调用而没有正确的"本tick已经平过仓，跳过本tick的反向开仓判定"标记，可能违反CEO"不允许同一刷新直接自动反手"的红线。建议实现阶段为`tickAutoEngine`函数本身维护一个"本次调用是否已处理平仓事件"的内部标志，作为该函数单元测试的重点（`V1_3_ACCEPTANCE_TESTS.md` T48.1）。
 2. **心跳/离线判定阈值（`TF_MS['15m']`，本文档建议值）与"引擎确实离线"之间不是绝对等价关系**：用户短暂切换浏览器标签页也可能导致`lastEngineHeartbeat`短暂滞后而未必真的错过K线收盘，实现阶段需要用`lastProcessedBarTime`与实际可获取的最新`confirmedBar.openTime`比较（而非单纯用心跳时间差）来判定"是否真的错过了K线"，避免把"标签页短暂不在前台但没错过任何K线"误判为需要回放的数据缺口——SPEC §16.7已经是按这个口径设计的（"比较`lastProcessedBarTime`与当前可获取的最新confirmedBar.openTime"），本条风险提示是给实现阶段的强调，不是文档设计缺陷。
-3. **`emergencyClosePosition`合并了"常规人工平仓"与"保守结算"两条路径，实现时的内部分支判断（`trade.status==='UNRESOLVED_DATA_GAP'`）如果被写反或遗漏，会导致数据缺口期间的平仓错误地使用当前`markPrice`（该状态下`markPrice`本身已冻结/不可靠）而非保守结算规则**，产生一个看似正常但实际不可靠的成交价。`V1_3_ACCEPTANCE_TESTS.md` T49.2/T49.3已分别覆盖两条分支，建议实现阶段优先编写这两条测试用例。
+3. **（本条已被draft-4-final取代，见§11.6）** ~~`emergencyClosePosition`合并了"常规人工平仓"与"保守结算"两条路径，实现时的内部分支判断（`trade.status==='UNRESOLVED_DATA_GAP'`）如果被写反或遗漏，会导致数据缺口期间的平仓错误地使用当前`markPrice`（该状态下`markPrice`本身已冻结/不可靠）而非保守结算规则，产生一个看似正常但实际不可靠的成交价。`V1_3_ACCEPTANCE_TESTS.md` T49.2/T49.3已分别覆盖两条分支，建议实现阶段优先编写这两条测试用例。~~ draft-4-final已将两条路径拆分为`emergencyClosePosition`/`confirmDataGapConservativeSettlement`两个独立函数，"内部分支写反"这一风险随之消失（每个函数只服务一种`trade.status`，入口处一次`if`判断即拒绝不适用的状态，不存在"分支内选错成交规则"的可能），但新引入了"两个函数各自实现一套成交计算逻辑导致公式漂移"的替代风险，见§11.6。
 4. **draft-2遗留的"`v1_3-paper-trading-core.js`本轮尚未实现"这一事实，意味着本文档§16全部内容目前仍是纯粹的设计规范，尚无任何实现可供交叉验证**——与draft-2/draft-3阶段相同的固有限制，不是draft-4新增的风险，但风险敞口随文档复杂度增加而增大（draft-4新增约560行SPEC正文），建议下一轮实现启动时安排比draft-2/draft-3更宽裕的自测时间。
 
-### 10.7 仍需CEO决定的问题
+### 10.7 仍需CEO决定的问题（draft-4首版结论，已被§11覆盖）
 
-无。CEO本轮"一至十一"全部要求已在§10.1核对表中确认落地。SPEC §16.13已记录的两项设计判断（暂停状态保留仓位保护、保守结算并入紧急平仓）本次复核已在§10.2/§10.6中独立核实并认可，不构成新的待决策事项。若实现阶段（Codex编码）发现本文档未能预见的边界情况，将在`V1_3_IMPLEMENTATION_REPORT.md`中记录并视需要提请CEO补充决策，不属于本轮文档范围。
+**本节结论已被draft-4-final的§11.7取代**：draft-4首版认为"暂停状态保留仓位保护"与"保守结算并入紧急平仓"是两项已核实认可的设计判断，不构成待决策事项；CEO"最终一致性修正"轮实际推翻了其中"保守结算并入紧急平仓"这一项（要求拆分为两个独立命令），并新增"有持仓时禁止关闭引擎"一项红线（draft-4首版未曾涵盖）。当前有效结论见§11.7。
+
+---
+
+## 11. 本轮（draft-4-final）CEO"最终一致性修正"核对（对应`V1_3_PAPER_TRADING_SPEC.md`§16.1/§16.6a/§16.6b/§17.5-§17.6）
+
+### 11.0 背景
+
+draft-4首版交付后，CEO复核发现四项需要在合入前关闭的问题：①测试编号/数量口径（`T44`至`T57`按包含首尾计算应为14个测试类别而非13个，且需明确区分功能测试类别数量/具体测试用例数量/回归命令数量三个独立指标）；②`disarmAutoEngine`允许"任意非OFF状态直接关闭"存在保护失效风险，账户存在模拟仓位时应禁止关闭；③`emergencyClosePosition`合并了普通紧急平仓与数据缺口保守结算两种业务语义，审计字段/统计口径/确认文案必须分开；④`V1_3_ACCEPTANCE_TESTS.md` T1-T27仍保留`autoOpenPosition`/`autoAddOn`历史函数名，仅提供文档头部对照表，未实际清理。本节是对这四项问题关闭情况的独立复核。
+
+### 11.1 四项问题逐条核对表
+
+| # | CEO要求要点 | SPEC落地章节 | CODEX_TASK是否同步 | ACCEPTANCE_TESTS是否覆盖 | 状态 |
+|---|---|---|---|---|---|
+| 一 | 测试编号/数量口径：T44-T57包含首尾为14个测试类别，明确区分功能类别数量/用例数量/回归命令数量三项独立指标，四份文档数字一致 | ACCEPTANCE_TESTS"测试类别数量汇总"新增口径说明段落（本文档不重复维护具体数字，唯一权威来源是ACCEPTANCE_TESTS） | 不涉及具体数字，无需同步 | "测试类别数量汇总"表格与口径说明段落、T58.1元测试 | 已关闭 |
+| 二 | 有持仓时禁止直接关闭自动引擎，PAUSED/RISK_LOCKED继续保护已有仓位但禁止开仓加仓，DATA_BLOCKED不伪造成交，用户须先紧急平仓/保守结算使仓位归零才能OFF | §16.1"OFF前置仓位校验"、§16.10 `disarmAutoEngine`签名 | §1.2、§8.1、§8.3步骤18（新增红线段落） | T44.6/T44.6b/T44.7b/T44.8b/T44.9/T44.9b/T44.10/T44.11 | 已关闭 |
+| 三 | 紧急平仓与数据缺口保守结算拆分为两个独立命令，共用底层成交函数但业务动作/确认文案/审计字段/统计口径分开 | §16.6a、§16.6b、§16.9"估算结算独立分区"、§16.10 `executeManualCloseFill` | §1.2、§3步骤3-4（步骤4已重写）、§8.3步骤19a（新增） | T21.3、T23.4、T24、T49（T49已从4条扩为7条，含T49.5-T49.7三条红线） | 已关闭 |
+| 四 | T1-T27旧函数名逐条实际替换为最终接口名，不再依赖对照表；全文档搜索确认无误导性旧接口残留 | §17.5（记录draft-4首版遗留）、§17.6（draft-4-final重新扫描结果） | 已按§17.6结论核对，无新增残留 | T1-T27已逐条替换`autoOpenPosition`→`autoEngineOpenPosition`、`autoAddOn`→`autoEngineAddOn`；T58.3新增旧函数名零残留元测试 | 已关闭 |
+
+**结论**：CEO"最终一致性修正"轮四项问题，经核对**已在SPEC §16.1/§16.6a/§16.6b/§17.5-§17.6、CODEX_TASK §1.2/§3/§8、ACCEPTANCE_TESTS T44/T49/T58三份文档中逐条一致落地**，`V1_3_PAPER_TRADING_SPEC.md`§16.13（"仍需CEO决定的问题"）本轮同样归零。
+
+### 11.2 测试编号/数量口径核对（对应第一项）
+
+复核`V1_3_ACCEPTANCE_TESTS.md`"测试类别数量汇总"：`T44`至`T57`包含首尾逐一计数确为14个类别（`T44`-`T56`共13个功能类别，`T57`为第14个、回归类别），此前版本"draft-4新增用例组合计（T44-T56）"标注的69条已按当前`T44`（16条，含`T44.6b`/`T44.7b`/`T44.9b`三条新增红线用例）与`T49`（7条，含T49.5-T49.7三条新增红线用例）的实际内容重新计数为78条。文档新增的口径说明段落明确区分：功能测试类别55个、用例组284条、回归命令18个（`T27`10个+`T43`4个+`T57`4个）三项独立指标，本文档与CODEX_TASK均不重复维护具体数字，避免未来再次出现"多处各自维护一份数字、逐渐漂移"的问题，唯一权威来源固定为`V1_3_ACCEPTANCE_TESTS.md`本身，`V1_3_ACCEPTANCE_TESTS.md` T58.1对此做自动化断言。
+
+### 11.3 OFF前置仓位校验核对（对应第二项）
+
+`disarmAutoEngine`（SPEC §16.10）新增红线：函数体第一步校验账户当前是否存在`OPEN`/`PARTIALLY_CLOSED`/`UNRESOLVED_DATA_GAP`任一状态的非终态`PaperTrade`，存在则直接拒绝且不弹出二次确认对话框，UI展示固定文案"当前存在模拟仓位，请先平仓；如只想停止新交易，请使用暂停或禁止新开仓。"（SPEC §16.1）。本次复核确认：
+
+- 该校验对`engineState`当前处于`RUNNING`/`PAUSED`/`RISK_LOCKED`/`DATA_BLOCKED`四种非OFF状态**统一生效**，SPEC原文与CODEX_TASK §8.3步骤18表述一致，未出现"某状态下豁免"的例外分支。
+- `AUTO_PAPER_PAUSED`/`AUTO_PAPER_RISK_LOCKED`/`AUTO_PAPER_DATA_BLOCKED`三态"继续保护已有仓位、只禁止新开仓/加仓"这一设计判断，draft-4首版已作为"设计判断"记录（§10.2/§10.6已复核），CEO本轮明确将其**从设计判断确认为正式规则**，SPEC §16.1已同步措辞（"CEO本轮已确认为正式规则而非仅设计判断"）。`AUTO_PAPER_DATA_BLOCKED`期间"不产生任何基于臆测价格的成交"这一红线是本轮新增的显式重申（draft-4首版虽隐含此意但未单独成句），SPEC §16.1已补充独立段落。
+- 用户退出路径（先执行紧急模拟平仓/保守结算使仓位归零，再关闭）在SPEC §16.1、ACCEPTANCE_TESTS T44.11中表述一致，未发现三份文档间的措辞分歧。
+
+### 11.4 紧急平仓与数据缺口保守结算拆分核对（对应第三项）
+
+复核SPEC §16.6a/§16.6b、CODEX_TASK §8.3步骤19a、ACCEPTANCE_TESTS T49：
+
+- **业务动作分离**：`emergencyClosePosition`仅适用`OPEN`/`PARTIALLY_CLOSED`，单击直接执行；`confirmDataGapConservativeSettlement`仅适用`UNRESOLVED_DATA_GAP`，要求独立两步确认。两者互相拒绝对方的适用范围（`emergencyClosePosition`在`UNRESOLVED_DATA_GAP`下直接拒绝，`confirmDataGapConservativeSettlement`在非`UNRESOLVED_DATA_GAP`下直接拒绝），三份文档表述一致。
+- **审计字段分离**：`closeReason`分别为`'USER_EMERGENCY_CLOSE'`（新增枚举值）与`'DATA_GAP_CONSERVATIVE'`（draft-2既有值）；`estimated`/`verified`分别为`false`/`true`与`true`/`false`，SPEC §16.6a/§16.6b、ACCEPTANCE_TESTS T49.6逐字一致。
+- **统计口径分离**：`USER_EMERGENCY_CLOSE`正常计入模拟账户全部统计；`DATA_GAP_CONSERVATIVE`排除出已验证策略准确度/胜率/平均R统计，但仍计入账面余额，且UI/报表须与已验证成交分区展示（SPEC §16.9"估算结算独立分区"），未发现与T25/T40既有"过滤`estimated`"红线的冲突。
+- **共用底层**：两者仅共享私有函数`executeManualCloseFill`（不对外导出），`fillParams`四项（`fillPrice`/`closeReason`/`estimated`/`verified`）由上层各自传入，底层函数不自行判断业务语义——ACCEPTANCE_TESTS T49.7专项验证这一"共用底层、业务语义分离"的设计要求，CODEX_TASK §8.3步骤19a同步要求。
+- 本次复核**未发现**三份文档在这一项上存在分歧或遗漏，§10.6第3条已记录的"内部分支写反"风险已随拆分设计消失，替代风险（两个函数各自实现一套公式导致漂移）已通过"共用`executeManualCloseFill`"的架构约束规避。
+
+### 11.5 旧函数名零残留核对（对应第四项）
+
+复核SPEC §17.6"draft-4-final全文重新扫描结果"表格：`confirmOpenPosition`/`confirmAddOn`/`autoOpenPosition`/`autoAddOn`/`confirmReduce`/`confirmClose`/`confirmConservativeSettlement`七个关键词在四份文档中除SPEC §17.2函数级改动清单（明确标注"历史名称，不得实现"）与本文档历史设计说明段落（已在§9.3第4条/§10.4/§10.6/§10.7原地标注"历史名称"或"已被取代"）外，**零残留**。本文档在本轮复核过程中同步修正了自身遗留的三处过时表述（§9.3第4条`autoOpenPosition`裸引用、§10.4函数级改动清单"并入"表述、§10.6第3条"合并了两条路径"表述），确保本文档自身也满足"不出现误导性旧接口残留"的要求。ACCEPTANCE_TESTS T58.3新增可测试化断言，覆盖本节结论。
+
+### 11.6 风险清单（本轮新增/更新）
+
+1. **拆分后的`emergencyClosePosition`/`confirmDataGapConservativeSettlement`若未能正确共用`executeManualCloseFill`，可能导致两套成交价/滑点/手续费计算公式逐渐漂移**（例如未来某次修改只更新了其中一个函数的滑点公式）：这是draft-4-final拆分设计相对draft-4首版"单函数内部分支"新引入的风险（首版天然只有一套公式，不存在漂移可能）。建议实现阶段将`executeManualCloseFill`的单元测试作为两个上层函数共同的测试基础，任何一个上层函数的成交价断言都应该能追溯到对`executeManualCloseFill`同一组输入的验证，ACCEPTANCE_TESTS T49.7已覆盖"两者调用同一底层函数"这一结构性断言，但建议实现阶段额外补充"两者在相同输入下产生数值一致的`simulatedFillPrice`"这类交叉验证测试（非CEO强制要求，本文档作为实现建议提出）。
+2. **`disarmAutoEngine`前置仓位校验依赖`ethAlphaPaperTrades`的`status`字段准确性**：若该校验实现时读取的是缓存的/未及时刷新的账户快照而非当前最新状态，可能出现"仓位已经通过其他路径平仓但校验仍误判为存在仓位"的假阳性拒绝，或反向的假阴性放行。建议`disarmAutoEngine`直接读取`storage`当前持久化的最新状态而非任何内存缓存，ACCEPTANCE_TESTS T44.9-T44.11已覆盖正常路径，但未显式覆盖"缓存陈旧"这类实现细节风险，留待实现阶段自行注意。
+
+### 11.7 仍需CEO决定的问题
+
+无。CEO"最终一致性修正"轮四项问题已在§11.1-§11.5逐条核对确认落地。SPEC §16.13记录的三项设计判断（暂停/锁定/数据阻断三态保护已有仓位、数据缺口保守结算的唯一退出路径、OFF前置仓位校验）本次复核已在§11.3-§11.4独立核实并认可，均已从"设计判断"层面的解释性文字落地为可测试化的正式规则（ACCEPTANCE_TESTS对应用例见§11.1核对表）。若实现阶段（Codex编码）发现本文档未能预见的边界情况，将在`V1_3_IMPLEMENTATION_REPORT.md`中记录并视需要提请CEO补充决策，不属于本轮文档范围。

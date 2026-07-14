@@ -1,13 +1,13 @@
 # V1_3_ACCEPTANCE_TESTS.md — V1.3「模拟交易账户」验收测试规范
 
-版本：v1.3-draft-4（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-4 同步；T1-T27为draft-2既有内容，T28-T43为draft-3既有内容，新增T44-T57对应SPEC §16「真实行情自动模拟交易引擎」；draft-4正式撤销"逐笔点击确认"授权模型，见下方**函数名对照表**）
+版本：v1.3-draft-4-final（随 `V1_3_PAPER_TRADING_SPEC.md` v1.3-draft-4-final同步；T1-T27为draft-2既有内容，T28-T43为draft-3既有内容，T44-T57共14个测试类别（13个功能类别T44-T56+1个回归类别T57）对应SPEC §16「真实行情自动模拟交易引擎」，新增T58为跨文档一致性元测试；draft-4-final是CEO"最终一致性修正"轮，关闭四项问题：①测试编号/数量口径统一（见下方"测试类别数量汇总"三项独立指标）②有持仓时禁止关闭引擎（T44.9-T44.11）③紧急平仓与数据缺口保守结算拆分为两个独立命令（T49）④T1-T27旧函数名已逐条替换为最终接口名，不再依赖对照表）
 依据：`V1_3_PAPER_TRADING_SPEC.md`（每条用例都标注对应章节）。所有测试**必须用构造好的合成K线/合成决策/合成预测对象跑**，不能只靠人工打开页面观察——沿用 `ACCEPTANCE_TESTS.md`/`V1_2_ACCEPTANCE_TESTS.md` 已确立的"合成数据优先"原则。
 
 **fixture真实性红线**：所有涉及 `decision`/`forecast`/`marketData` 字段的测试fixture，字段名和取值格式必须与 `v1-core.js buildDecision()`/`v1_2-forecast-core.js buildForecast()` 的真实返回结构逐字段一致。**禁止**测试自造一套近似结构让测试通过而生产代码实际收到的数据形状不同。
 
 **字段命名红线（draft-2相对draft-1的重命名，测试断言必须使用新字段名）**：`equityHighWaterMark`→`peakEquity`；`availableCash`（=`cash-marginUsed`）→`availableBalance`（=**`equity-marginUsed`**，公式本身也变了，不只是改名）；`realizedPnlTotal`→`realizedPnlGross`；`slippageCostTotal`→`slippageCostReport`。任何测试如果沿用旧字段名或旧公式，视为未同步CEO决策，必须修正。
 
-**函数名对照表（draft-4红线，对应`V1_3_PAPER_TRADING_SPEC.md`§17.2完整记录）**：本文档T1-T27中出现的`autoOpenPosition`/`autoAddOn`是draft-2/draft-3阶段的历史函数名，**已被draft-4废弃**；这些用例断言的会计恒等式/手续费滑点公式/加仓七条件/止损止盈撮合规则等**内容本身继续有效**，只是Codex实现`tests/v13-*.js`时必须把测试里出现的`autoOpenPosition`替换为`autoEngineOpenPosition`、`autoAddOn`替换为`autoEngineAddOn`；`confirmReduce`已整体移除，涉及它的用例（原T8.2/T10.2/T11.3/T21.3/T23.4）已在本文档下方**原地改写**为反映`emergencyClosePosition`唯一保留的现状；`confirmConservativeSettlement`已并入`emergencyClosePosition`，涉及它的用例（原T21.3/T23.4/T24.1）同样已原地改写。T28-T43（Signal Archive/Shadow Evaluation）額外新增：`markSignalRejected`已移除，`userActionStatus`枚举的`ACCEPTED`/`REJECTED`/`MISSED`三值已被`AUTO_EXECUTED`/`AUTO_BLOCKED_BY_RISK`/`AUTO_BLOCKED_BY_POSITION`/`AUTO_MISSED_ENGINE_OFF`/`AUTO_MISSED_DATA_GAP`五值取代（原T39.2-T39.4已原地改写）。
+**旧函数名处理状态（draft-4-final更新，对应`V1_3_PAPER_TRADING_SPEC.md`§17.2/§17.6完整记录）**：本文档T1-T27中曾经出现的`autoOpenPosition`/`autoAddOn`（draft-2/draft-3阶段的历史函数名）已在draft-4-final**逐条实际替换**为最终正式接口名`autoEngineOpenPosition`/`autoEngineAddOn`（机械改名，不改变任何断言内容本身），不再需要实现阶段自行换算，四份文档现在只保留`autoEngineOpenPosition`/`autoEngineAddOn`一套权威接口名。`confirmReduce`已整体移除，涉及它的用例（原T8.2/T10.2/T11.3/T21.3/T23.4）已原地改写为反映`emergencyClosePosition`/`confirmDataGapConservativeSettlement`的现状；`confirmConservativeSettlement`是历史名称，不得实现——draft-4首版曾误将其并入`emergencyClosePosition`，draft-4-final已**拆分为两个独立命令**`emergencyClosePosition`（§16.6a，仅`OPEN`/`PARTIALLY_CLOSED`）与`confirmDataGapConservativeSettlement`（§16.6b，仅`UNRESOLVED_DATA_GAP`），涉及它的用例（T21.3/T23.4/T24/T49）均已按拆分后的两个函数原地改写。T28-T43（Signal Archive/Shadow Evaluation）額外新增：`markSignalRejected`已移除，`userActionStatus`枚举的`ACCEPTED`/`REJECTED`/`MISSED`三值已被`AUTO_EXECUTED`/`AUTO_BLOCKED_BY_RISK`/`AUTO_BLOCKED_BY_POSITION`/`AUTO_MISSED_ENGINE_OFF`/`AUTO_MISSED_DATA_GAP`五值取代（原T39.2-T39.4已原地改写）。四份文档旧函数名零残留的完整扫描记录见SPEC §17.6，可测试化断言见T58.3。
 
 **测试文件与运行方式**：
 ```
@@ -48,7 +48,7 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 | 用例 | 断言 |
 |---|---|
 | T2.1 | `decision.biasDirection==='long'&&worthBetting&&!opportunityScores.blocked&&dataHealth==='normal'` 时，`buildTradeProposal` 返回有效方案；否则返回 `{ok:false}` 并给出具体拒绝原因 |
-| T2.2 | `autoOpenPosition` 成功后产生 `status:'OPEN'` 的 `PaperTrade`，`fills`长度为1且`fillType==='OPEN'`、`side==='BUY'` |
+| T2.2 | `autoEngineOpenPosition` 成功后产生 `status:'OPEN'` 的 `PaperTrade`，`fills`长度为1且`fillType==='OPEN'`、`side==='BUY'` |
 | T2.3 | 开仓成交价 = `referencePrice × (1 + spreadRate/2 + slippageRate)` |
 | T2.4 | 构造收盘K线 `low <= currentStop` 触发止损，产生 `fillType==='STOP_LOSS'`、`side==='SELL'` 的成交，`status`变为`EXITED` |
 | T2.5 | 构造收盘K线 `high >= targets[0]` 触发止盈，`status`变为`PARTIALLY_CLOSED`，剩余`quantity`为原始的50% |
@@ -58,7 +58,7 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 
 | 用例 | 断言 |
 |---|---|
-| T3.1 | `decision.biasDirection==='short'` 场景下`buildTradeProposal`/`autoOpenPosition`全流程，`side==='SELL'`（开仓） |
+| T3.1 | `decision.biasDirection==='short'` 场景下`buildTradeProposal`/`autoEngineOpenPosition`全流程，`side==='SELL'`（开仓） |
 | T3.2 | 空单开仓成交价 = `referencePrice × (1 - spreadRate/2 - slippageRate)` |
 | T3.3 | 收盘K线 `high >= currentStop` 触发止损，回补`side==='BUY'` |
 | T3.4 | 收盘K线 `low <= targets[0]` 触发止盈 |
@@ -87,13 +87,13 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 
 | 用例 | 断言 |
 |---|---|
-| T6.1 | 全部前提（浮盈+V1.1许可有效+`signalPermission.addOnAllowed`+止损已达保本位+`addOnCount===0`+统一止损口径下`worstCaseLoss<=equity×maxRiskPct`+提供`idempotencyKey`）同时满足时，`autoAddOn`成功，产生`fillType==='ADD_ON'` |
+| T6.1 | 全部前提（浮盈+V1.1许可有效+`signalPermission.addOnAllowed`+止损已达保本位+`addOnCount===0`+统一止损口径下`worstCaseLoss<=equity×maxRiskPct`+提供`idempotencyKey`）同时满足时，`autoEngineAddOn`成功，产生`fillType==='ADD_ON'` |
 | T6.2 | 加仓后 `entryPrice` 按§4.3加权平均公式更新，`quantity`增加，`addOnCount`变为1 |
 | T6.3 | 加仓不产生`realizedPnlDelta`（`ADD_ON`类型成交的`realizedPnlDelta===0`） |
 | T6.4 | 构造`currentStop`恰好等于`calcBreakevenStop`计算值的边界场景，断言允许加仓（边界值本身合法，不是要求严格大于） |
 | T6.5 | 构造加仓后`worstCaseLoss`恰好等于`equity×maxRiskPct`的边界场景，断言允许加仓（边界值合法） |
 | T6.6 | 构造加仓后`worstCaseLoss`略微超过`equity×maxRiskPct`（例如多算0.01 USDT）的场景，断言拒绝，且拒绝原因文案包含具体超出的金额数字 |
-| T6.7 | `autoAddOn`未提供`idempotencyKey`或提供空字符串时拒绝执行（红线：不存在无幂等键的加仓路径） |
+| T6.7 | `autoEngineAddOn`未提供`idempotencyKey`或提供空字符串时拒绝执行（红线：不存在无幂等键的加仓路径） |
 
 ## T7. 禁止加仓的各类场景（逐条前提条件单独构造反例）
 
@@ -103,11 +103,11 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 | T7.2 | `decision.biasDirection !== position.direction` 时拒绝 |
 | T7.3 | `opportunityScores.blocked===true` 时拒绝，即使`decision.worthBetting`字段本身可能仍为true也必须拒绝 |
 | T7.4 | `signalPermission.addOnAllowed===false`（非full_aligned）时拒绝 |
-| T7.5 | **第二次加仓被明确阻止**：构造`addOnCount===1`（已成功加仓过一次）的持仓，再次调用`autoAddOn`，断言拒绝，理由文案明确"V1.3每笔交易最多允许1次加仓"，且不产生任何新的`PaperFill` |
-| T7.6 | **未移动到成本保本位时禁止加仓**：构造`currentStop`仍等于`initialStop`（尚未触发过`targets[0]`分批止盈、止损从未移动）的持仓，即使`unrealizedPnl>0`且其余条件都满足，断言`autoAddOn`仍然拒绝，理由文案明确提及"止损尚未移动到保本位" |
+| T7.5 | **第二次加仓被明确阻止**：构造`addOnCount===1`（已成功加仓过一次）的持仓，再次调用`autoEngineAddOn`，断言拒绝，理由文案明确"V1.3每笔交易最多允许1次加仓"，且不产生任何新的`PaperFill` |
+| T7.6 | **未移动到成本保本位时禁止加仓**：构造`currentStop`仍等于`initialStop`（尚未触发过`targets[0]`分批止盈、止损从未移动）的持仓，即使`unrealizedPnl>0`且其余条件都满足，断言`autoEngineAddOn`仍然拒绝，理由文案明确提及"止损尚未移动到保本位" |
 | T7.7 | 构造`currentStop`已经移动但**低于**（多单）/**高于**（空单）`calcBreakevenStop`计算值的场景（即移动了但移动幅度不够，仍不足以真正保本），断言拒绝 |
 | T7.8 | `addOnQuantity > initialQuantity` 时拒绝 |
-| T7.9 | 全文扫描`autoAddOn`所有拒绝路径的文案，断言不出现"摊平"以外的禁止词 |
+| T7.9 | 全文扫描`autoEngineAddOn`所有拒绝路径的文案，断言不出现"摊平"以外的禁止词 |
 
 ## T8. 当日亏损3%锁定（对应SPEC §5.3，CEO决策第8项）
 
@@ -134,7 +134,7 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 
 | 用例 | 断言 |
 |---|---|
-| T10.1 | `decision.dataHealth!=='normal'`时，`buildTradeProposal`/`autoAddOn`拒绝 |
+| T10.1 | `decision.dataHealth!=='normal'`时，`buildTradeProposal`/`autoEngineAddOn`拒绝 |
 | T10.2 | `decision.dataHealth!=='normal'`时，用户仍可对`OPEN`/`PARTIALLY_CLOSED`（非`UNRESOLVED_DATA_GAP`）持仓执行`emergencyClosePosition`，但返回结果/UI标记须包含"陈旧数据"提示字样 |
 | T10.3 | `decision.dataHealth!=='normal'`期间，`scanClosedBarsForExits`不产生新的自动止损/止盈成交 |
 
@@ -142,12 +142,12 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 
 | 用例 | 断言 |
 |---|---|
-| T11.1 | 用同一个`idempotencyKey`连续两次调用`autoOpenPosition`，第二次调用**不产生**第二笔`PaperTrade`/`PaperFill`，而是返回与第一次完全相同的结果（真正的幂等重放，不是简单报错） |
-| T11.2 | 用同一个`idempotencyKey`连续两次调用`autoAddOn`，验证同上（不重复加仓，返回原结果） |
+| T11.1 | 用同一个`idempotencyKey`连续两次调用`autoEngineOpenPosition`，第二次调用**不产生**第二笔`PaperTrade`/`PaperFill`，而是返回与第一次完全相同的结果（真正的幂等重放，不是简单报错） |
+| T11.2 | 用同一个`idempotencyKey`连续两次调用`autoEngineAddOn`，验证同上（不重复加仓，返回原结果） |
 | T11.3 | 用同一个`idempotencyKey`连续两次调用`emergencyClosePosition`，验证不产生重复成交 |
 | T11.4 | 用同一个`idempotencyKey`连续两次调用`resetPaperAccount`，验证`resetCount`只增加1次（不是2次），第二次调用返回与第一次相同的账户状态 |
 | T11.5 | 模拟"并发"调用（同一tick内连续调用两次任意确认函数，不同`idempotencyKey`），`account.actionLock`机制阻止真正意义上的重入，断言最终状态变化次数与传入的不同key数一致（即锁不会误伤合法的不同操作） |
-| T11.6 | `TradeProposal`过期（`Date.now() > expiresAt`）后调用`autoOpenPosition`（即使`idempotencyKey`是全新的）必须拒绝，要求重新生成方案 |
+| T11.6 | `TradeProposal`过期（`Date.now() > expiresAt`）后调用`autoEngineOpenPosition`（即使`idempotencyKey`是全新的）必须拒绝，要求重新生成方案 |
 
 ## T12. 同K线止盈止损冲突采用不利结果（对应SPEC §6.7）
 
@@ -199,7 +199,7 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 | 用例 | 断言 |
 |---|---|
 | T17.1 | 构造`decision.opportunityScores.blocked===true`但其余字段看似正常的fixture，断言`buildTradeProposal`仍然拒绝 |
-| T17.2 | 已有持仓场景下，`decision.opportunityScores.blocked`变为true后，`autoAddOn`必须拒绝 |
+| T17.2 | 已有持仓场景下，`decision.opportunityScores.blocked`变为true后，`autoEngineAddOn`必须拒绝 |
 | T17.3 | `decision.isManual===true`时，`buildTradeProposal`必须拒绝，理由文案明确提及"手动观察模式" |
 
 ## T18. V1.2预测不能单独触发模拟开仓（对应SPEC §7.1）
@@ -207,8 +207,8 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 | 用例 | 断言 |
 |---|---|
 | T18.1 | 构造`forecast.m15/h1/h4`全部为"偏多"高权重、高置信度，但`decision.worthBetting===false`（或`opportunityScores.blocked===true`）的fixture，断言`buildTradeProposal`仍然拒绝 |
-| T18.2 | 扫描`buildTradeProposal`/`autoOpenPosition`/`autoAddOn`函数体源码，断言不引用`forecast.m15`/`forecast.h1`/`forecast.h4`/`weights`/`directionLabel`等V1.2字段作为条件判断依据 |
-| T18.3 | `forecastSnapshot`允许为`null`时，若`decision`本身满足开仓条件，`buildTradeProposal`/`autoOpenPosition`依然可以正常工作 |
+| T18.2 | 扫描`buildTradeProposal`/`autoEngineOpenPosition`/`autoEngineAddOn`函数体源码，断言不引用`forecast.m15`/`forecast.h1`/`forecast.h4`/`weights`/`directionLabel`等V1.2字段作为条件判断依据 |
+| T18.3 | `forecastSnapshot`允许为`null`时，若`decision`本身满足开仓条件，`buildTradeProposal`/`autoEngineOpenPosition`依然可以正常工作 |
 
 ## T19. 建仓快照冻结不可被后续刷新覆盖（对应SPEC §7.2）
 
@@ -216,7 +216,7 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 |---|---|
 | T19.1 | 开仓后修改原始传入的`decision`对象某字段，断言`trade.decisionSnapshot`不受影响 |
 | T19.2 | 同样验证`forecastSnapshot`不受后续`forecast`对象变化影响 |
-| T19.3 | 构造模拟"v1-core.js风格原地修改"的fixture，确认`autoOpenPosition`在赋值之后才做深拷贝仍能拿到正确的最终值 |
+| T19.3 | 构造模拟"v1-core.js风格原地修改"的fixture，确认`autoEngineOpenPosition`在赋值之后才做深拷贝仍能拿到正确的最终值 |
 
 ## T20. 精度与最小名义价值（对应SPEC §6.12）
 
@@ -232,7 +232,7 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 |---|---|
 | T21.1 | 逐条覆盖SPEC §3.4状态转换表列出的**每一行**转换，含新增的`OPEN/PARTIALLY_CLOSED→UNRESOLVED_DATA_GAP`与`UNRESOLVED_DATA_GAP→EXITED` |
 | T21.2 | 断言状态机纯函数对"当前状态不允许该事件"的组合返回明确拒绝而不是抛出异常或静默忽略 |
-| T21.3 | `UNRESOLVED_DATA_GAP`状态下调用自动加仓判定一律拒绝，断言状态不变；`emergencyClosePosition`在该状态下**允许**调用但自动切换为§8.5保守结算成交规则（非常规成交），断言两种路径分别正确 |
+| T21.3 | `UNRESOLVED_DATA_GAP`状态下调用自动加仓判定一律拒绝，断言状态不变；`emergencyClosePosition`在该状态下**直接拒绝**（提示改用"数据缺口保守结算"）；`confirmDataGapConservativeSettlement`是唯一可用的平仓操作，断言三条路径分别正确 |
 
 ## T22. 数据缺口成功回放（对应SPEC §8.3，CEO决策第6项）
 
@@ -249,13 +249,13 @@ node tests/v13-auto-engine-live-rest-test.js # draft-4新增
 | T23.1 | 构造恢复后返回的K线相对缺口存在不连续（`openTime`序列出现跳跃），断言`status`变为`UNRESOLVED_DATA_GAP` |
 | T23.2 | `replayAttempts`新增一条`coverageComplete:false`记录，`missingBarCount`给出可估算的缺口跨度 |
 | T23.3 | 该次失败回放尝试**不产生**任何`PaperFill`（不得因为找不到完整数据就假装按当前价格继续或假装已经安全离场） |
-| T23.4 | `UNRESOLVED_DATA_GAP`状态下自动加仓判定拒绝；`emergencyClosePosition`是唯一可用操作，且必然采用保守结算成交规则（非常规当前markPrice成交） |
+| T23.4 | `UNRESOLVED_DATA_GAP`状态下自动加仓判定拒绝；`emergencyClosePosition`调用被拒绝（红线：该状态下不适用普通紧急平仓）；`confirmDataGapConservativeSettlement`是唯一可用操作，且必然采用保守结算成交规则（非当前markPrice成交） |
 
-## T24. 用户确认保守结算（对应SPEC §8.5，CEO决策第6项）
+## T24. 用户确认数据缺口保守结算（对应SPEC §8.5/§16.6b，CEO决策第6项，draft-4-final更新为独立函数）
 
 | 用例 | 断言 |
 |---|---|
-| T24.1 | `emergencyClosePosition`的保守结算分支只能由用户显式点击触发，不存在任何自动触发路径（源码扫描：该函数不出现在`scanClosedBarsForExits`/`tickAutoEngine`内部的自动调用列表中） |
+| T24.1 | `confirmDataGapConservativeSettlement`只能由用户显式二次确认触发（第一次点击只弹出确认，不改变任何状态；第二次显式确认后才执行），不存在任何自动触发路径（源码扫描：该函数不出现在`scanClosedBarsForExits`/`tickAutoEngine`内部的自动调用列表中） |
 | T24.2 | 成交价 = 缺口结束后第一根可获得的已收盘K线的`open`价格，按方向叠加不利滑点（多单向下、空单向上，与§4.2方向表一致） |
 | T24.3 | 平仓后`closeReason==='DATA_GAP_CONSERVATIVE'`，`estimated===true`，`verified===false` |
 | T24.4 | `dataGap.startTime`/`dataGap.replayAttempts`/`dataGap.conservativeSettlementConfirmedAt`三项审计字段均被正确填充且不可再被覆盖 |
@@ -404,7 +404,7 @@ node work/build-v1.js   # 构建产物逐字节可复现，且新增的/*__PAPER
 | T38.1 | 构造一个完整的`TARGET_3_HIT→COMPLETED`盈利影子验证场景，运行前后对比`ethAlphaPaperAccount`（`equity`/`cash`/`marginUsed`/`realizedPnlGross`等全部字段）逐字节不变 |
 | T38.2 | 同上构造一个`STOPPED`亏损影子验证场景，同样验证`PaperAccount`零变化 |
 | T38.3 | 扫描`evaluateShadowSignals`/`computeSignalAccuracyStats`等全部Signal Archive导出函数源码，断言不存在对`ethAlphaPaperAccount`/`ethAlphaPaperTrades`/`ethAlphaPaperLog`的任何写操作（`localStorage.setItem`/`storage.setItem`调用目标key白名单校验） |
-| T38.4 | 断言`evaluateShadowSignals`不产生任何`PaperPosition`/`PaperFill`对象，不调用`v1_3-paper-trading-core.js`的任何写操作型导出函数（`autoOpenPosition`等） |
+| T38.4 | 断言`evaluateShadowSignals`不产生任何`PaperPosition`/`PaperFill`对象，不调用`v1_3-paper-trading-core.js`的任何写操作型导出函数（`autoEngineOpenPosition`等） |
 
 ## T39. 用户行为关联与执行对比（对应SPEC §15.9）
 
@@ -474,12 +474,18 @@ node work/build-v1.js   # 构建产物逐字节可复现，新增的/*__SIGNAL_A
 | T44.2 | 用户第一次点击"开启自动模拟交易"只弹出确认，`engineState`保持`AUTO_PAPER_OFF`不变（CEO"首次开启需要二次确认"） |
 | T44.3 | 第二次显式确认+`idempotencyKey`后，`engineState`变为`AUTO_PAPER_ARMED`；未提供`idempotencyKey`时`armAutoEngine`拒绝执行 |
 | T44.4 | `AUTO_PAPER_ARMED`状态下，下一次`v11decision`事件tick到达后`engineState`自动变为`AUTO_PAPER_RUNNING`，无需任何额外用户操作（CEO"ARMED到RUNNING"） |
-| T44.5 | `AUTO_PAPER_RUNNING`状态下用户点击"暂停"：`engineState`变为`AUTO_PAPER_PAUSED`，之后构造满足自动开仓十四项条件的场景，断言`tickAutoEngine`不产生新开仓（CEO"暂停状态不交易"） |
-| T44.6 | `AUTO_PAPER_PAUSED`状态下，构造已有`OPEN`持仓触及止损的场景，断言`scanClosedBarsForExits`仍正常触发止损（验证§16.1"暂停不停止已有仓位保护"设计判断） |
+| T44.5 | `AUTO_PAPER_RUNNING`状态下用户点击"暂停"：`engineState`变为`AUTO_PAPER_PAUSED`，之后构造满足自动开仓十四项条件的场景，断言`tickAutoEngine`不产生新开仓（CEO"暂停状态不交易"/"PAUSED状态禁止开仓和加仓"之开仓部分） |
+| T44.6 | `AUTO_PAPER_PAUSED`状态下，构造已有`OPEN`持仓触及止损/触及目标位的场景，断言`scanClosedBarsForExits`仍正常触发止损/分批止盈，与`RUNNING`状态下完全一致（CEO"PAUSED状态继续执行保护性止损止盈"，验证§16.1正式规则，非仅"设计判断"） |
+| T44.6b | `AUTO_PAPER_PAUSED`状态下，构造已有`OPEN`持仓且§5.2加仓条件1-7全部满足的场景，断言自动加仓判定不触发（CEO"PAUSED状态禁止开仓和加仓"之加仓部分，与T44.5互补覆盖开仓/加仓两条路径） |
 | T44.7 | `riskRegime`变为`DAILY_LOSS_LOCKED`或`FORCED_OBSERVATION`时，`engineState`自动变为`AUTO_PAPER_RISK_LOCKED`；日亏损次日UTC解锁后（且未同时触发总回撤锁定）`engineState`自动回到`AUTO_PAPER_RUNNING` |
+| T44.7b | `AUTO_PAPER_RISK_LOCKED`状态下，构造已有`OPEN`持仓触及止损/目标位的场景，断言`scanClosedBarsForExits`仍正常触发（CEO"RISK_LOCKED状态继续保护已有仓位"）；同时构造满足自动开仓/加仓条件的候选，断言均被拒绝 |
 | T44.8 | `decision.dataHealth!=='normal'`时，`engineState`变为`AUTO_PAPER_DATA_BLOCKED`，`preDataBlockedState`正确记录进入前状态（分别构造从`RUNNING`/`PAUSED`/`RISK_LOCKED`进入的三种场景）；数据恢复后`engineState`正确回退到`preDataBlockedState`记录的值 |
-| T44.9 | 任意非`AUTO_PAPER_OFF`状态下用户点击"关闭自动模拟交易"（二次确认+`idempotencyKey`）：`engineState`变为`AUTO_PAPER_OFF` |
-| T44.10 | `allowNewEntries=false`（用户点击"禁止新开仓"）时，`engineState`仍显示`AUTO_PAPER_RUNNING`（不因此变为`PAUSED`），但自动开仓/加仓判定被拒绝，已有仓位自动止损/止盈继续正常工作 |
+| T44.8b | **红线**：`AUTO_PAPER_DATA_BLOCKED`期间，断言`scanClosedBarsForExits`不产生任何基于臆测价格的成交（不伪造成交），数据恢复后按§16.7/§8.3 K线回放机制补齐处理（同T50结论互证） |
+| T44.9 | **红线（对应CEO"有持仓时禁止切换OFF"）**：构造账户存在任意`OPEN`/`PARTIALLY_CLOSED`/`UNRESOLVED_DATA_GAP`状态的非终态`PaperTrade`，用户点击"关闭自动模拟交易"：`disarmAutoEngine`直接返回`{ok:false, reason:'当前存在模拟仓位，请先平仓；如只想停止新交易，请使用暂停或禁止新开仓。'}`，**不弹出**二次确认对话，`engineState`不变 |
+| T44.9b | 上述红线对`engineState`当前处于`RUNNING`/`PAUSED`/`RISK_LOCKED`/`DATA_BLOCKED`四种非OFF状态**均**适用，逐一构造四种场景验证拒绝结果一致（CEO"这条校验独立于engineState具体是哪一个"） |
+| T44.10 | 账户不存在任何非终态`PaperTrade`时，用户点击"关闭自动模拟交易"（二次确认+`idempotencyKey`）：`engineState`正常变为`AUTO_PAPER_OFF` |
+| T44.11 | 用户先对唯一一笔`OPEN`持仓执行`emergencyClosePosition`使其变为`EXITED`（仓位归零），再点击"关闭自动模拟交易"：断言此时被接受，`engineState`变为`AUTO_PAPER_OFF`（CEO"用户如坚持退出，必须先执行紧急模拟平仓，仓位归零后才能OFF"） |
+| T44.12 | `allowNewEntries=false`（用户点击"禁止新开仓"）时，`engineState`仍显示`AUTO_PAPER_RUNNING`（不因此变为`PAUSED`），但自动开仓/加仓判定被拒绝，已有仓位自动止损/止盈继续正常工作 |
 
 ## T45. 自动开仓十四项条件（对应SPEC §16.2，draft-4新增）
 
@@ -527,14 +533,17 @@ node work/build-v1.js   # 构建产物逐字节可复现，新增的/*__SIGNAL_A
 | T48.4 | 冷却期满足（反向信号的`sourceConfirmedBarTime`晚于`lastPositionClosedBarOpenTime`）后，断言反向信号仍需重新通过完整十四项条件判定（构造此时该反向信号已过期/已被十四项条件其中一条拒绝的场景，断言依然不开仓） |
 | T48.5 | 同方向新信号（与`lastPositionClosedDirection`相同）不受本节冷却期约束，仅受§16.2条件12"当前无冲突仓位"约束——构造场景验证同方向信号在原仓位平仓后可以立即（不受冷却期限制）重新开仓 |
 
-## T49. 紧急模拟平仓（对应SPEC §16.6，draft-4新增，公式复用draft-2既有滑点/手续费规则）
+## T49. 紧急模拟平仓与数据缺口保守结算的拆分（对应SPEC §16.6a/§16.6b，draft-4-final更新为两个独立上层命令，公式复用draft-2既有滑点/手续费规则）
 
 | 用例 | 断言 |
 |---|---|
-| T49.1 | 任意非终态`PaperTrade`存在时，用户点击"紧急模拟平仓"立即触发，无需满足§16.2任何条件（CEO"紧急模拟平仓"） |
-| T49.2 | `trade.status`为`OPEN`/`PARTIALLY_CLOSED`时，`emergencyClosePosition`按当前`markPrice`+§4.4常规不利滑点成交，`estimated===false`、`verified===true` |
-| T49.3 | `trade.status==='UNRESOLVED_DATA_GAP'`时，`emergencyClosePosition`自动切换为§8.5保守结算成交规则，`estimated===true`、`verified===false`（同T24结论） |
+| T49.1 | `trade.status`为`OPEN`/`PARTIALLY_CLOSED`时，用户点击"紧急模拟平仓"立即触发`emergencyClosePosition`，无需满足§16.2任何条件（CEO"紧急模拟平仓"） |
+| T49.2 | `emergencyClosePosition`按当前`markPrice`+§4.4常规不利滑点成交，`closeReason==='USER_EMERGENCY_CLOSE'`、`estimated===false`、`verified===true`；该笔成交正常计入模拟账户全部统计（不被T25/T40类"过滤estimated"红线排除） |
+| T49.3 | **红线**：`decision.dataHealth!=='normal'`（数据在点击瞬间不可验证，仓位尚未被引擎转入`UNRESOLVED_DATA_GAP`的竞态场景）时，`emergencyClosePosition`拒绝执行，理由文案包含"当前行情数据暂不可验证" |
 | T49.4 | `emergencyClosePosition`未提供`idempotencyKey`时拒绝执行 |
+| T49.5 | **红线**：`trade.status==='UNRESOLVED_DATA_GAP'`时，`emergencyClosePosition`**直接拒绝**（不产生任何成交），理由文案提示改用"数据缺口保守结算"，断言两个函数**不共享**同一个业务入口（同T21.3/T23.4结论） |
+| T49.6 | **红线（对应CEO"紧急平仓与数据缺口保守结算使用不同closeReason"）**：分别构造`emergencyClosePosition`与`confirmDataGapConservativeSettlement`各一次完整成交，断言`closeReason`分别为`'USER_EMERGENCY_CLOSE'`与`'DATA_GAP_CONSERVATIVE'`，两者不相等、不可混用 |
+| T49.7 | 断言`emergencyClosePosition`与`confirmDataGapConservativeSettlement`在源码层面调用同一个底层成交写入函数`executeManualCloseFill`（共用手续费/滑点计算逻辑，不重复实现两套公式），但各自的`closeReason`/`estimated`/`verified`三个参数由上层各自传入，不由底层函数自行判断（验证"共用底层，业务语义分离"的设计要求） |
 
 ## T50. 浏览器运行限制、心跳与离线回放（对应SPEC §16.7，draft-4新增）
 
@@ -613,7 +622,29 @@ node work/build-v1.js   # 构建产物逐字节可复现，新增的/*__AUTO_ENG
 
 ---
 
+## T58. 元测试：跨文档一致性与旧接口零残留检查（对应CEO"最终一致性修正"轮新增要求，draft-4-final新增）
+
+这一类别本身不测试V1.3业务逻辑，而是对**四份V1.3文档自身**做自动化一致性校验，防止未来任何一轮修订再次出现"编号/口径/接口名"不一致的问题。建议实现为独立的文档静态检查脚本（例如`tests/v13-docs-consistency-tests.js`，只读解析四份`.md`文件，不依赖任何运行时代码），纳入CI。
+
+| 用例 | 断言 |
+|---|---|
+| T58.1 | **所有文档测试编号及数量自动一致性检查**：解析`V1_3_ACCEPTANCE_TESTS.md`全部`## T\d+\.`标题，断言编号连续无跳号（`T1`到`T58`逐一递增）；断言"测试类别数量汇总"表格中每一行声明的"用例组数"与该类别标题下实际的`用例`行数逐一相等；断言文档末尾"累计用例组合计"数字等于全部功能类别（不含T27/T43/T57三个回归类别）"用例组数"列的算术和 |
+| T58.2 | 断言`V1_3_PAPER_TRADING_SPEC.md`/`V1_3_CODEX_IMPLEMENTATION_TASK.md`/`V1_3_ARCHITECTURE_REVIEW.md`三份文档中出现的、形如`T\d+(\.\d+)?`的测试编号引用，全部能在`V1_3_ACCEPTANCE_TESTS.md`中找到对应存在的编号（不存在"引用了一个从未定义的测试编号"这类悬空引用） |
+| T58.3 | **旧函数名零残留检查（对应CEO"四、清理旧函数名"）**：对四份文档全文正则搜索`confirmOpenPosition`/`confirmAddOn`/`confirmReduce`/`confirmClose`（不含`emergencyClosePosition`/`confirmDataGapConservativeSettlement`子串）/`confirmConservativeSettlement`/`autoOpenPosition`（不含`autoEngineOpenPosition`子串）/`autoAddOn`（不含`autoEngineAddOn`子串）六个旧名称，逐条命中位置断言其所在段落（或所在带版本号的变更记录/changelog条目，如"v1.3-draft-4："开头的历史版本描述段落）包含"历史名称"/"历史函数名"/"不得实现"/"已废弃"/"已移除"/"已撤销"/"已整体移除"字样之一（即只允许作为标注清晰的历史/迁移说明或已归档的版本变更记录出现，不允许作为"应实现的当前接口"不加说明地出现） |
+| T58.4 | 断言四份文档版本头字符串完全一致（均为`v1.3-draft-4-final`），无一份文档遗漏更新 |
+| T58.5 | 断言`V1_3_PAPER_TRADING_SPEC.md`§16.10函数接口清单是四份文档中**唯一**权威列表——扫描CODEX_TASK/ACCEPTANCE_TESTS/ARCHITECTURE_REVIEW中出现的全部函数名，断言均能在SPEC §16.10或draft-2既有§11保留清单中找到，不存在"三份周边文档自创了一个SPEC未定义的函数名"的情况 |
+
+---
+
 ## 测试类别数量汇总
+
+**口径说明（draft-4-final新增，CEO"最终一致性修正"轮要求明确区分的三项独立指标，全文档及最终汇报必须使用本节数字，不得出现其他口径）**：
+
+1. **功能测试类别数量**：本文档`## T\d+.`标题总数为**58**（`T1`至`T58`连续编号，无跳号），其中**55个**是功能测试类别（每个类别下有若干条"用例组"），**3个**是回归类别（`T27`/`T43`/`T57`，内容是既有测试命令的重新执行要求，不是新增用例组）。
+2. **具体测试用例数量**：全部55个功能类别下的"用例组"行数之和为**284**条（见下表逐类别计数与三段小计）。
+3. **回归命令数量**：`T27`（draft-2基线）10个既有命令 + `T43`（追加于T27）4个既有命令 + `T57`（追加于T43）4个既有命令 = 共**18**个既有测试命令需要重新执行验证零回归（三个回归类别本身不计入上方"用例组数量"284条）。
+
+**T44至T57区间澄清（对应CEO本轮指出的编号口径错误）**：`T44`到`T57`**包含首尾**逐一计数为**14个测试类别**（`T44`/`T45`/`T46`/`T47`/`T48`/`T49`/`T50`/`T51`/`T52`/`T53`/`T54`/`T55`/`T56`/`T57`），其中`T44`-`T56`是**13个**功能类别（合计78条用例组，draft-4新增），`T57`是**1个**回归类别（4个既有命令）。此前版本"draft-4新增用例组合计（T44-T56）"误标注为69条、或口径表述中出现"T44-T56"与"T44-T57"混用的情况，本轮已统一为下表数字，T58.1（元测试）对本节数字与实际表格行数的一致性做自动化校验。
 
 | 类别 | 用例组数 |
 |---|---:|
@@ -640,11 +671,11 @@ node work/build-v1.js   # 构建产物逐字节可复现，新增的/*__AUTO_ENG
 | T21 状态机全转换覆盖（含UNRESOLVED_DATA_GAP） | 3 |
 | T22 数据缺口成功回放 | 3 |
 | T23 数据缺口无法回补时不伪造成交 | 4 |
-| T24 用户确认保守结算 | 4 |
+| T24 用户确认数据缺口保守结算 | 4 |
 | T25 estimated交易排除于验证统计 | 3 |
 | T26 风险预算恒以当前净值为基准 | 3 |
-| T27 V1.1/V1.2回归（既有测试文件重跑，不计入新增用例数） | 10个既有命令 |
-| **draft-2新增用例组合计（T1-T26）** | **118** |
+| T27 V1.1/V1.2回归（既有测试文件重跑，不计入用例组数量；回归命令10个） | — |
+| **draft-2新增用例组合计（T1-T26，共26个功能类别）** | **118** |
 | T28 建议档案自动创建 | 5 |
 | T29 建议不进入正式档案的排除场景 | 7 |
 | T30 signalFingerprint去重与版本规则 | 6 |
@@ -660,15 +691,15 @@ node work/build-v1.js   # 构建产物逐字节可复现，新增的/*__AUTO_ENG
 | T40 准确度统计口径与分组（分母规则） | 11 |
 | T41 存储/迁移/损坏恢复/容量/导出安全 | 7 |
 | T42 清空建议历史二次确认且不触碰模拟账户 | 4 |
-| **draft-3新增用例组合计（T28-T42）** | **83** |
-| T43 V1.1/V1.2/V1.3既有回归（追加于T27，不计入新增用例数） | 4个既有命令 |
-| **累计用例组合计（T1-T42）** | **201** |
-| T44 引擎宏观状态机 | 10 |
+| **draft-3新增用例组合计（T28-T42，共15个功能类别）** | **83** |
+| T43 V1.1/V1.2/V1.3既有回归（追加于T27，不计入用例组数量；回归命令4个） | — |
+| **累计用例组合计（T1-T42，41个功能类别）** | **201** |
+| T44 引擎宏观状态机 | 16 |
 | T45 自动开仓十四项条件 | 13 |
 | T46 自动止损/止盈 | 4 |
 | T47 自动加仓 | 4 |
 | T48 反向信号与冷却期 | 5 |
-| T49 紧急模拟平仓 | 4 |
+| T49 紧急模拟平仓与数据缺口保守结算的拆分 | 7 |
 | T50 浏览器运行限制、心跳与离线回放 | 6 |
 | T51 幂等与重复保护 | 5 |
 | T52 与建议档案/影子验证的隔离与关联 | 4 |
@@ -676,8 +707,11 @@ node work/build-v1.js   # 构建产物逐字节可复现，新增的/*__AUTO_ENG
 | T54 UI字段规范 | 3 |
 | T55 废弃函数不存在性校验 | 4 |
 | T56 Schema迁移 | 3 |
-| **draft-4新增用例组合计（T44-T56）** | **69** |
-| T57 V1.1/V1.2/V1.3既有回归（追加于T43，不计入新增用例数） | 4个既有命令 |
-| **累计用例组合计（T1-T56）** | **270** |
+| **draft-4新增用例组合计（T44-T56，共13个功能类别）** | **78** |
+| T57 V1.1/V1.2/V1.3既有回归（追加于T43，不计入用例组数量；回归命令4个） | — |
+| **T44-T57区间合计（14个测试类别=13个功能类别+1个回归类别，回归命令不计入用例组数量）** | **78** |
+| **累计用例组合计（T1-T56，54个功能类别）** | **279** |
+| T58 元测试：跨文档一致性与旧接口零残留检查（draft-4-final新增，第55个功能类别） | 5 |
+| **累计用例组合计（T1-T58，55个功能类别，唯一权威总数）** | **284** |
 
-（draft-1为85条，draft-2新增/扩展33条（T1-T26合计118条），主要来自：T1/T5/T6/T7/T8/T9/T11/T14/T15/T16细化，以及全新的T22-T26；draft-3新增83条（T28-T42），对应SPEC §15「建议档案与影子验证」，累计201条；draft-4新增69条（T44-T56），对应SPEC §16「真实行情自动模拟交易引擎」，累计270条。"用例组"指本文档表格中的一行，实际实现时单个用例组可能展开为多条`assert`。回归命令（T27/T43/T57）不计入用例组数量，是对既有测试文件的重新执行要求。）
+（draft-1为85条，draft-2新增/扩展33条（T1-T26合计118条，26个功能类别），主要来自：T1/T5/T6/T7/T8/T9/T11/T14/T15/T16细化，以及全新的T22-T26；draft-3新增83条（T28-T42，15个功能类别），对应SPEC §15「建议档案与影子验证」，累计201条（41个功能类别）；draft-4新增78条（T44-T56，13个功能类别），对应SPEC §16「真实行情自动模拟交易引擎」，累计279条（54个功能类别）；draft-4-final新增T58元测试类别5条，累计**284条（55个功能类别）为唯一权威总数**。"用例组"指本文档表格中的一行，实际实现时单个用例组可能展开为多条`assert`。回归命令（T27共10个/T43共4个/T57共4个，合计18个既有命令）不计入用例组数量，是对既有测试文件的重新执行要求；T44-T57区间包含首尾共14个测试类别（13个功能类别+1个回归类别T57），不是13个——这一编号口径已在draft-4-final全文统一，四份文档与最终汇报均使用本节数字。）
