@@ -259,11 +259,11 @@ node tests/v12-ui-tests.js
 | T17.3 | 手动模式下调用 `saveForecastLog` 不写入任何 `localStorage` 记录（与V1.1决策日志规则一致） |
 | T17.4 | `saveForecastLog` 使用的 `localStorage` key 为 `ethAlphaForecastLogs`，与V1.1现有的 `ethAlphaDecisionLogs`/`ethAlphaDecisionLogsV11` 均不同（防止存储互相覆盖） |
 | T17.5 | 数据不足、陈旧、关键周期缺失、预测失败或过期均写blocked审计；方向、权重、区间、目标、路径、置信度为null或空集合，不能沿用旧预测 |
-| T17.5 | `closedKlineRef` 只包含引用信息（`symbol`/`timeframe`/`lastClosedOpenTime`），不包含完整K线数组（防止日志体积失控），且长度恒为6（ETH+BTC×三周期） |
-| T17.6 | `directionLabel==='数据不足'` 的horizon**仍然**产出日志条目（`factorResults`如实记录missing因子，`directionWeights`/`priceRange`等为null），不得因为没有方向结论就跳过写入（spec§12.3） |
-| T17.7 | `factorResults` 长度恒为12，且每一项包含 `id`/`status`/`bull`/`bear`/`range`/`weightMax`/`points`/`evidenceText` 全部字段；用该日志条目独立重算一遍 §5.1-§5.3（不调用被测代码本身，而是测试脚本自行按spec公式重算），得到的 `directionWeights` 必须与日志中记录的完全一致（这是"可复现性"的直接验证，防止 `factorResults` 记录了却对不上最终权重） |
-| T17.8 | `schemaVersion`/`forecastAlgorithmVersion`/`factorWeightVersion` 均为非空字符串，且与 `v1_2-forecast-core.js` 导出的同名常量值相等（防止日志里硬编码了与代码不同步的版本号） |
-| T17.9 | `closedKlineRef` 中每条记录的 `lastClosedOpenTime` 与生成该条日志时对应快照最后一根已收盘K线的 `openTime` 相等（防止引用信息本身就是错的，反查不到真实K线） |
+| T17.6 | `closedKlineRef` 只包含引用信息（`symbol`/`timeframe`/`lastClosedOpenTime`），不包含完整K线数组（防止日志体积失控），且长度恒为6（ETH+BTC×三周期） |
+| T17.7 | `directionLabel==='数据不足'` 的horizon**仍然**产出日志条目（`factorResults`如实记录missing因子，`directionWeights`/`priceRange`等为null），不得因为没有方向结论就跳过写入（spec§12.3） |
+| T17.8 | `factorResults` 长度恒为12，且每一项包含 `id`/`status`/`bull`/`bear`/`range`/`weightMax`/`points`/`evidenceText` 全部字段；用该日志条目独立重算一遍 §5.1-§5.3（不调用被测代码本身，而是测试脚本自行按spec公式重算），得到的 `directionWeights` 必须与日志中记录的完全一致（这是"可复现性"的直接验证，防止 `factorResults` 记录了却对不上最终权重） |
+| T17.9 | `schemaVersion`/`forecastAlgorithmVersion`/`factorWeightVersion` 均为非空字符串，且与 `v1_2-forecast-core.js` 导出的同名常量值相等（防止日志里硬编码了与代码不同步的版本号） |
+| T17.10 | `closedKlineRef` 中每条记录的 `lastClosedOpenTime` 与生成该条日志时对应快照最后一根已收盘K线的 `openTime` 相等（防止引用信息本身就是错的，反查不到真实K线） |
 
 ---
 
