@@ -8,6 +8,9 @@ function replaceExact(source,target,replacement,expected=1,label=target){const a
 
 function build(){
   let template=fs.readFileSync(path.join(__dirname,'v1-ui.template.html'),'utf8');
+  const paperUi=fs.readFileSync(path.join(__dirname,'v1-paper-trading.template.html'),'utf8');
+  const signalUi=fs.readFileSync(path.join(__dirname,'v1-signal-archive.template.html'),'utf8');
+  const autoUi=fs.readFileSync(path.join(__dirname,'v1-auto-engine.template.html'),'utf8');
   const replacements=[
     ['ETH ALPHA · V1 REST DECISION CORE','ETH Alpha · V1 多周期REST决策核心',1,'页面标题'],
     ['4H','4小时',6,'4H中文化'],
@@ -31,12 +34,22 @@ function build(){
     ["showLogs();}function showLogs()","showLogs();document.dispatchEvent(new CustomEvent('v11decision',{detail:d}));}function showLogs()",1,'V1.1决策事件'],
     ['showLogs();refresh();setInterval','window.renderDashboard=render;showLogs();refresh();setInterval',1,'渲染函数暴露'],
     ['cache=await C.fetchAllTimeframeKlines();const d=','cache=await C.fetchAllTimeframeKlines();window.__lastMarketData=cache;const d=',1,'市场数据生产接线']
+    ,['C.invalidateDashboard(id=>$(id),k,reason);',"C.invalidateDashboard(id=>$(id),k,reason);['paperEquity','paperAvailable','paperMargin','paperAccounting','paperRisk','paperPosition','paperLogs','paperExportJson','paperExportCsv','paperReset','paperEmergencyClose','paperGapSettle','signalArchiveList','signalExportJson','signalExportCsv','signalReset','shadowStats','autoEngineState','autoAllowEntries','autoHeartbeat','autoGap','autoNextAction','autoArm','autoPause','autoResume','autoToggleEntries','autoDisarm'].forEach(id=>$(id)?.classList.add('invalidated'));",1,'V1.3数据字段统一失效样式']
   ];
   for(const [target,replacement,expected,label] of replacements)template=replaceExact(template,target,replacement,expected,label);
+  template=replaceExact(template,'/*__PAPER_TRADING_UI__*/',paperUi,1,'V1.3模拟账户UI占位符');
+  template=replaceExact(template,'/*__SIGNAL_ARCHIVE_UI__*/',signalUi,1,'V1.3建议档案UI占位符');
+  template=replaceExact(template,'/*__AUTO_ENGINE_UI__*/',autoUi,1,'V1.3自动引擎UI占位符');
   const core=fs.readFileSync(path.join(root,'v1-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const forecast=fs.readFileSync(path.join(root,'v1_2-forecast-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
+  const paper=fs.readFileSync(path.join(root,'v1_3-paper-trading-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
+  const signal=fs.readFileSync(path.join(root,'v1_3-signal-archive-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
+  const auto=fs.readFileSync(path.join(root,'v1_3-auto-engine-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   template=replaceExact(template,'/*__CORE__*/',core,1,'V1.1核心占位符');
   template=replaceExact(template,'/*__FORECAST__*/',forecast,1,'V1.2预测核心占位符');
+  template=replaceExact(template,'/*__PAPER_TRADING__*/',paper,1,'V1.3模拟账户核心占位符');
+  template=replaceExact(template,'/*__SIGNAL_ARCHIVE__*/',signal,1,'V1.3建议档案核心占位符');
+  template=replaceExact(template,'/*__AUTO_ENGINE__*/',auto,1,'V1.3自动引擎核心占位符');
   fs.writeFileSync(path.join(root,'eth-dynamic-trading-dashboard.html'),template);
   console.log('built eth-dynamic-trading-dashboard.html');
 }
