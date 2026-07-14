@@ -47,12 +47,13 @@
 ### 1.3 V2：历史验证引擎（不在本阶段范围，保持不变）
 独立 Node.js 脚本/小工程，不要求单文件、不要求双击打开。复用 V1 的纯函数，实现 STRATEGY_SPEC §18 定义的回放引擎、防未来数据泄漏规则、训练/验证/测试集划分、滚动样本外验证、参数敏感性测试、统计报告产出。**本阶段Codex不需要写V2的任何代码**，但如果V1阶段把纯函数写成了依赖DOM的形式，将直接导致V2无法启动，因此V1阶段的"纯函数"要求是硬性的。
 
-### 1.4 V3：WebSocket、条件提醒、模拟仓位与长期运行监控（不在本阶段范围，范围经CEO第二轮验收调整）
-在V1基础上叠加以下四项，**均不在本阶段Codex交付范围内**：
+### 1.4 V3：WebSocket、条件提醒与长期运行监控（不在本阶段范围，范围经CEO第二轮验收调整；v1.3新增说明：本节原列的"模拟仓位"已拆出，不再属于V3，见下方标注与`V1_3_PAPER_TRADING_SPEC.md`）
+在V1基础上叠加以下三项，**均不在本阶段Codex交付范围内**：
 - **WebSocket实时架构**：STRATEGY_SPEC §14 完整WS连接状态机、自动重连退避、缺失K线检测、三周期同步（V1用REST轮询实现§14的对应子集，见1.2节）。
 - **条件提醒推送**：STRATEGY_SPEC §19.2 八类条件提醒的浏览器 `Notification API` 推送（V1只做决策日志的被动记录，不做主动推送）。
-- **模拟仓位（Paper Position Tracking，v2.1新增概念）**：允许用户在UI标记"如果此刻按建议开仓"，系统据此虚拟记录方向/开仓价/止损/目标，后续每个tick比对实时价格计算浮动盈亏，价格触及止损/目标时自动标记平仓结果并写回决策日志的 `outcome` 字段。全程不接真实账户、不下单，纯本地模拟，用于让用户在不动真钱的情况下检验系统建议的实际表现。
 - **长期运行监控（v2.1新增概念）**：页面长时间挂机运行时的自我监控——记录WebSocket/REST的可用率、平均延迟、重连次数、数据缺口次数等运行指标，属于运维可观测性功能，不影响交易判断逻辑本身。
+
+**（v1.3范围调整说明）**：本节原有的第三项"模拟仓位（Paper Position Tracking，v2.1新增概念）"——即"允许用户在UI标记'如果此刻按建议开仓'，系统据此虚拟记录方向/开仓价/止损/目标，后续每个tick比对实时价格计算浮动盈亏，价格触及止损/目标时自动标记平仓结果并写回决策日志的`outcome`字段"这一简化构想——已由CEO决定拆出V3，作为独立的V1.3阶段实现，且实际交付范围远超本节原先的构想（真实账户记账、多空持仓生命周期、风险预算与日亏损/回撤锁定、保守成交撮合），详见`V1_3_PAPER_TRADING_SPEC.md`。本节此后不再是模拟仓位的权威定义来源。
 
 ### 1.5 本阶段产出物与授权事项（v2.1新增）
 - 仍为单文件：`eth-dynamic-trading-dashboard.html`（直接改这一个文件）。如需新增测试脚本，遵循 ACCEPTANCE_TESTS.md 的建议（例如 `legacy-tests/run-tests.mjs`），不新建其他正式产品文件。
@@ -142,7 +143,7 @@ function buildDecision(ethTf, btcTf, manualInput, prevStates, tradingCost) -> De
 // ---- V2/V3 接口草案（本阶段不实现，仅记录以保持与STRATEGY_SPEC架构一致，签名可能在V2/V3阶段调整）----
 // function connectRealtimeStreams(onMessage, onStateChange) -> ConnectionHandle                             // §14 WS部分，V3
 // function checkAlertConditions(prevDecision, decision) -> AlertEvent[]                                     // §19.2，V3（V1不做主动推送）
-// function trackPaperPosition(decision, userAction) -> PaperPositionState                                   // 模拟仓位，V3新增
+// function trackPaperPosition(decision, userAction) -> PaperPositionState                                   // 模拟仓位，已于v1.3拆出单独实现（不再是V3），见V1_3_PAPER_TRADING_SPEC.md
 // function collectRuntimeHealthMetrics() -> RuntimeHealthReport                                             // 长期运行监控，V3新增
 // function runBacktest(historicalKlines, params) -> BacktestReport                                          // §18，V2专属工程，不在HTML内
 ```
@@ -153,7 +154,7 @@ function buildDecision(ethTf, btcTf, manualInput, prevStates, tradingCost) -> De
 - 不允许把 §9.1 的"数据不足降级"逻辑散落到多个函数里各写一份，必须统一从 `assessDataQuality` 一个入口产出，其余函数只读取 `dataQuality` 字段做分支。
 - （v2.0新增）不允许在 `calcVolumeQuality` 或任何成交量相关函数之外的地方，让成交量字段单独触发状态转换（STRATEGY_SPEC §16 硬性声明，成交量只能是六项假突破判据之一/评分分项之一/证据列表条目之一）。
 - （v2.0新增）`calcScore` 的输出 `ScoreBreakdown.total` 不允许出现在 `worthBetting` 的判断表达式里（STRATEGY_SPEC §17.3），两条判断链路必须独立，Code Review会专门检查是否有人图省事把评分和硬性规则耦合在一起。
-- （v2.1修正：原此处曾禁止"提前实现§12三周期权限"，该条已被CEO第二轮验收撤销——§12三周期权限现在是V1必须实现的部分，见第1.2节）**V1阶段仍然不得**实现 §14（WebSocket部分）、§18（回测引擎）、§19.2（条件提醒推送）、模拟仓位、长期运行监控的真实功能代码——这五项是第1.3/1.4节明确的V2/V3范围，提前实现属于范围蔓延，会挤占V1核心工作的时间。
+- （v2.1修正：原此处曾禁止"提前实现§12三周期权限"，该条已被CEO第二轮验收撤销——§12三周期权限现在是V1必须实现的部分，见第1.2节）**V1阶段仍然不得**实现 §14（WebSocket部分）、§18（回测引擎）、§19.2（条件提醒推送）、模拟仓位、长期运行监控的真实功能代码——这五项在当时是第1.3/1.4节明确的V2/V3范围，提前实现属于范围蔓延，会挤占V1核心工作的时间。（v1.3范围调整说明：模拟仓位已于v1.3阶段拆出单独实现，不再属于V3范围，见`V1_3_PAPER_TRADING_SPEC.md`；本条对V1阶段本身的历史约束不变。）
 
 ---
 
@@ -214,7 +215,7 @@ classifyState(eth15m,btc15m,prevLtfState)                   │
                        ▼
           prevLtfState/prevMtfState/prevHtfState = 本次三层状态   （供下一次tick各自防抖使用）
 ```
-**V1不做的部分**：条件提醒推送（`checkAlertConditions`+`Notification`）、模拟仓位、长期运行监控——这三项留给V3（第1.4节），本图未画出。
+**V1不做的部分**：条件提醒推送（`checkAlertConditions`+`Notification`）、模拟仓位、长期运行监控——这三项在当时留给V3（第1.4节），本图未画出。（v1.3范围调整说明：模拟仓位已拆出，于v1.3阶段实现，不再属于V3，见`V1_3_PAPER_TRADING_SPEC.md`；条件提醒推送、长期运行监控仍留在V3。）
 
 ---
 
@@ -269,7 +270,7 @@ classifyState(eth15m,btc15m,prevLtfState)                   │
 21. 真实浏览器手测（双击文件，不是起本地server），**验证全部6路REST请求**（不只是过去验证过的15分钟一路）在真实浏览器下的 CORS/网络表现，回填 PROJECT_AUDIT.md 第6节的"待验证"结论。
 22. 跑 ACCEPTANCE_TESTS.md 全部V1标记用例（含T12-T15、T17.1/T17.4、T18-T20、T24），逐条勾选。
 
-**明确不属于本次实现顺序的内容**（V2/V3范围，见第1.3/1.4节，本阶段不要主动去做）：WebSocket实时架构（§14 WS部分）、历史回测引擎（§18）、条件提醒推送（§19.2）、模拟仓位、长期运行监控。
+**明确不属于本次实现顺序的内容**（V2/V3范围，见第1.3/1.4节，本阶段不要主动去做）：WebSocket实时架构（§14 WS部分）、历史回测引擎（§18）、条件提醒推送（§19.2）、模拟仓位、长期运行监控。（v1.3范围调整说明：模拟仓位已拆出，于v1.3阶段实现，不再属于V3，见`V1_3_PAPER_TRADING_SPEC.md`；其余各项范围不变。）
 
 ---
 
@@ -287,7 +288,7 @@ classifyState(eth15m,btc15m,prevLtfState)                   │
 10.（v2.0新增）**禁止无限补仓**：延续第3条的精神，`buildAddOnCondition` 的实现必须同时满足STRATEGY_SPEC §8.2的加仓触发条件与风险预算上限约束，不能只判断价格条件而忽略风险预算检查。
 11.（v2.0新增）**禁止黑箱AI直接决定买卖**：不得接入任何不可解释的机器学习模型直接输出方向，本系统所有判断必须是本文档和STRATEGY_SPEC.md定义的显式规则（STRATEGY_SPEC §20第2条）。
 12.（v2.0新增）**不扩展到其他币种**：任何函数、UI文案、数据结构都不得引入 ETH/BTC 之外的交易对（STRATEGY_SPEC §20第3条）。
-13.（v2.1修正：原第13条曾把"三周期数据拉取"也列为V1不得实现的范围，该条已被CEO第二轮验收撤销）V1阶段**不得**实现的是 WebSocket（§14 WS部分）、历史回测引擎（§18功能代码）、条件提醒推送（§19.2）、模拟仓位与长期运行监控（第1.4节）——三周期REST数据拉取与三周期决策（§12）现在**必须**在V1完成，不在此禁止之列。
+13.（v2.1修正：原第13条曾把"三周期数据拉取"也列为V1不得实现的范围，该条已被CEO第二轮验收撤销）V1阶段**不得**实现的是 WebSocket（§14 WS部分）、历史回测引擎（§18功能代码）、条件提醒推送（§19.2）、模拟仓位与长期运行监控（第1.4节）——三周期REST数据拉取与三周期决策（§12）现在**必须**在V1完成，不在此禁止之列。（v1.3范围调整说明：模拟仓位已于v1.3阶段拆出单独实现，不再属于V3范围，见`V1_3_PAPER_TRADING_SPEC.md`；本条对V1阶段本身的历史约束不变，其余三项范围不变。）
 14.（v2.1新增）Codex被明确授权在项目目录内执行 `git init` 与开发基线提交（第1.5节），这不属于禁止事项，不需要事先询问用户——但仍需遵守本文档开头"Git Safety Protocol"精神：不强制推送、不重写历史、不跳过确认删除已有工作。
 
 ---
@@ -313,7 +314,7 @@ classifyState(eth15m,btc15m,prevLtfState)                   │
 - [ ]（v2.1新增）`classifyState` 已验证可在15分钟和1小时两个周期上无修改复用；`classifyHtfState`（4小时六态）已用合成数据验证六个状态各自能正确触发。
 - [ ]（v2.1新增）`computeSignalPermission` 的四条规则（三周期同向/15分钟逆4小时/BTC周期冲突/多周期冲突或数据异常）均已用合成场景验证（对应ACCEPTANCE_TESTS.md T12-T14），`positionSizeCapPct`/`addOnAllowed` 输出符合STRATEGY_SPEC §12.4定义。
 - [ ]（v2.1新增）透明评分（§17）"4小时方向""1小时结构"两项已使用真实4h/1h数据计算，不再是固定0分的占位。
-- [ ]（v2.1新增）已确认没有实现WebSocket/回测引擎/条件提醒推送/模拟仓位/长期运行监控的功能代码（第6条第13款，V2/V3范围）。
+- [ ]（v2.1新增）已确认没有实现WebSocket/回测引擎/条件提醒推送/模拟仓位/长期运行监控的功能代码（第6条第13款，V2/V3范围；v1.3范围调整说明：模拟仓位已于v1.3阶段拆出单独实现，不再属于V3范围，见`V1_3_PAPER_TRADING_SPEC.md`，本条对V1阶段本身的历史验收结论不变）。
 - [ ]（v2.1新增）核心分析函数（`analyzeKlines`/`classifyState`/`classifyHtfState`/`computeSignalPermission`/`buildAdvice`/`calcRiskReward`等）均为不依赖DOM的纯函数，可被独立于渲染层单独调用和测试（为V2铺路，§1.2工程要求）。
 - [ ]（v2.1新增）项目目录已 `git init` 并提交开发基线（第1.5节）。
 - [ ]（v2.1新增）旧文件（三文件版+旧单文件版）保持原样，未被删除、移动或归档。

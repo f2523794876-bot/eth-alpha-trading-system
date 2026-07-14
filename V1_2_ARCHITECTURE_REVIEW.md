@@ -123,7 +123,7 @@ eth-dynamic-trading-dashboard.html 第4个<script>块（新增渲染层，V1.2�
 
 - **V1.1边界**：本轮四份文档均不修改 `v1-core.js`、不修改 `PROJECT_AUDIT.md`/`STRATEGY_SPEC.md`/`CODEX_IMPLEMENTATION_TASK.md`/`ACCEPTANCE_TESTS.md`/`V1_IMPLEMENTATION_REPORT.md`/`TEST_RESULTS.md` 六份V1.1既有文档，不修改 `v1.1.0` tag / `main` 分支历史。
 - **V2边界**：`V1_2_FORECAST_SPEC.md` §12 只定义了 `ForecastLogEntry` 的字段结构和"写入接口"，`outcomeAfter*`/`brierScoreComponent`/`directionAccuracy`/`rangeCoverage`/`calibrationBucket`/`calibratedProbability` 六个字段本轮**只建结构不实现计算**，恒为`null`，回放引擎、Brier Score计算、样本外验证等留给独立的V2工程。
-- **V3边界**：WebSocket、条件提醒推送、模拟仓位追踪均未在本轮四份文档中出现任何实现要求，`V1_2_CODEX_IMPLEMENTATION_TASK.md` §1.2 显式列为"禁止顺手实现"。
+- **V3边界**：WebSocket、条件提醒推送、模拟仓位追踪均未在本轮四份文档中出现任何实现要求，`V1_2_CODEX_IMPLEMENTATION_TASK.md` §1.2 显式列为"禁止顺手实现"。**（v1.3范围调整说明）**：模拟仓位追踪已由CEO决定从V3拆出，作为独立的V1.3阶段实现，不再属于V3范围，见`V1_3_PAPER_TRADING_SPEC.md`；WebSocket、条件提醒推送、长期运行监控三项范围不变，仍留在未来V3，本条调整不影响V1.2本身任何已验收的规范或代码。
 
 ---
 
