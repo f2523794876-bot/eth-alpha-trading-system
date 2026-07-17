@@ -1,6 +1,6 @@
 # V1_4_DATA_SOURCE_MATRIX.md — V1.4 数据源分层矩阵
 
-版本：v1.4-matrix-draft-1
+版本：v1.4-matrix-draft-2（同步P0-2服务器时间要求后的修订版）
 基线：`main` @ `a3d7aea`
 角色：本文档是**数据源真实性/研究状态**的唯一权威记录。不购买、不开通任何付费服务，不接入任何真实交易账户，不读取任何交易所API交易密钥。分三层：**A. V1.4真实使用**、**B. V1.4只研究不接入**、**C. GMKG目标架构（240+48项，40-60候选权威来源）**。
 
@@ -16,11 +16,12 @@
 
 ### A.1 详情（唯一使用的数据源）
 
-- **官方页面/API**：`GET https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={INTERVAL}&limit={N}`，文档 `developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints`。
+- **官方页面/API**：`GET https://api.binance.com/api/v3/klines?symbol={SYMBOL}&interval={INTERVAL}&limit={N}`，文档 `developers.binance.com/docs/binance-spot-api-docs/rest-api/market-data-endpoints`；另需配合 `GET https://api.binance.com/api/v3/time`（服务器时间端点，公开、免费、无需API Key）共同使用，见下方P0-2同步说明。
 - **本轮现场核实**（2026-07-18，`curl`直接调用生产端点，非文档推测）：
   - `GET .../klines?symbol=ETHUSDT&interval=15m&limit=3` 返回3根已收盘K线，实测 `closeTime = openTime + 899999`（即 `timeframeMs(900000) − 1`），下一根`openTime = 上一根closeTime + 1`；
   - `GET .../klines?symbol=BTCUSDT&interval=4h&limit=2` 返回2根已收盘K线，实测 `closeTime = openTime + 14399999`（即`timeframeMs(14400000) − 1`），边界关系与15m周期一致；
   - 结论已写入 `V1_4_FORECAST_DATA_SPEC.md` §5.3，作为`BarRef.closeTime`公式的实测依据。
+- **P0-2同步（CEO已冻结裁决）**：K线"是否已收盘"的判定不得仅凭本地时钟推断，必须调用`GET /api/v3/time`取得服务器时间后换算判定，服务器时间不可用时fail closed（`DATA_BLOCKED`），不得用本地时间安全边际替代；完整规则见`V1_4_FORECAST_DATA_SPEC.md`§3.0，本处只做数据源清单层面的同步标注，不重复展开判定逻辑。
 - **准确性**：交易所自身撮合引擎产生的一手行情，无第三方转译误差。
 - **更新频率**：K线随周期收盘更新（15分钟/1小时/4小时各一次）。
 - **典型延迟**：已收盘K线立即可查，实测无感知延迟（同一`curl`调用往返 < 1秒）。
@@ -138,3 +139,4 @@ Binance（现货+合约）、OKX、Coinbase、Bybit、Deribit、Etherscan、DeFi
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.4-matrix-draft-1 | 2026-07-18 | 初稿：分层记录V1.4真实使用（Binance现货K线，本轮`curl`+`WebFetch`现场核实）、V1.4只研究不接入（15项，部分现场核实可达性/失败记录）、GMKG目标架构候选来源汇总（引用GMKG总架构§5/§6，不重新定义域划分） |
+| v1.4-matrix-draft-2 | 2026-07-18 | 同步P0-2服务器时间前置门禁裁决：A.1新增`/api/v3/time`端点标注与"不得用本地时间安全边际替代"的同步说明，完整判定规则见`V1_4_FORECAST_DATA_SPEC.md`§3.0 |

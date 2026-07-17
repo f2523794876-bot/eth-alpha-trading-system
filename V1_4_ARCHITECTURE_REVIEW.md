@@ -1,131 +1,206 @@
 # V1_4_ARCHITECTURE_REVIEW.md — V1.4 独立架构复审
 
-版本：v1.4-review-draft-1
+版本：v1.4-review-draft-2（CEO本轮冻结裁决关闭P0-1至P0-5/P1-1至P1-4后的修订版）
 基线：`main` @ `a3d7aea`
 角色：本文档对其余五份 V1.4 文档 + 与 `GMKG_DRAGONFLY_ARCHITECTURE.md` 的交互，做**独立风险复审**。逐条给出风险、严重等级、复现路径、修复要求、是否阻断Codex、是否允许进入编码。**不得只写"通过"**。
 
+**版本说明**：draft-1（第一轮复审）发现的2项P0/3项P1/4项P2，其编号（`P0-1`/`P0-2`/`P1-1`/`P1-2`/`P1-3`）与CEO本轮冻结裁决所用的编号（`P0-1`至`P0-5`、`P1-1`至`P1-4`）**不是同一套编号体系**（本轮CEO裁决范围更广、编号独立重排）。为避免混淆，本文档统一改为：draft-1发现的历史条目重命名为`R1-P0-1`/`R1-P0-2`/`R1-P1-1`/`R1-P1-2`/`R1-P1-3`（"R1"=第一轮复审），本轮CEO裁决关闭的条目使用CEO消息原始编号`P0-1`至`P0-5`/`P1-1`至`P1-4`（不加"R"前缀），二者对应关系见§1.1映射表。
+
 ---
 
-## 1. 风险清单（P0/P1/P2）
+## 1. 风险清单
 
-### P0-1：`referenceBar` 是否"已收盘"依赖本地系统时钟，存在时钟偏差风险
+### 1.1 第一轮复审（R1）发现条目与本轮CEO裁决的映射关系
 
-- **风险描述**：`V1_4_FORECAST_DATA_SPEC.md`§3.1/§5.2把"已收盘"判定隐含依赖调用方（浏览器/构建环境）的本地时钟与Binance服务器时钟一致。若本地时钟快于Binance服务器时钟，可能把一根**实际尚未收盘**的K线误判为"最后一根已收盘K线"并选为`referenceBar`，进而污染`referencePrice`与整条24H/72H预测。
-- **严重等级**：**P0**（直接影响GMKG总架构§4.4a/§10.2"只能使用已收盘K线"红线，属于数据完整性阻断问题）。
-- **复现路径**：本地系统时钟快于真实时间超过K线更新延迟窗口（如本地时钟快2分钟）时，从Binance返回的最新K线数组末尾一条实际`closeTime`可能仍大于"本地当前时间戳减去若干安全边际"的天真判断，具体是否误判取决于实现是否直接信任K线数组最后一条、还是额外做"closeTime <= now"校验。
-- **修复要求**：`locateTargetPath`/`referenceBar`选取逻辑**必须**以K线自身的`closeTime`字段作为唯一判据（`closeTime <= 调用Binance `/api/v3/time`得到的服务器时间`，而不是本地`Date.now()`），或至少要求`closeTime`小于本地时间减去一个安全边际（如2倍预期采集间隔），且安全边际数值须写入实施报告。
-- **是否阻断Codex**：本轮**已关闭**——`V1_4_CODEX_IMPLEMENTATION_TASK.md`§3 `locateTargetPath`签名注释已补充"必须以Binance服务器时间或经记录的安全边际判定已收盘"的约束，`V1_4_ACCEPTANCE_TESTS.md`已新增T3.4验证该约束。
-- **是否允许进入编码**：**允许**（文档层面已补齐约束与验收覆盖；实施阶段仍须在代码中真正落实该约束，不因文档已修订而自动满足，见§4处理记录）。
+| 第一轮编号 | 内容 | 对应本轮CEO裁决编号 | 本轮关闭状态 |
+|---|---|---|---|
+| R1-P0-1 | referenceBar已收盘判定依赖本地时钟 | **P0-2**（本轮CEO进一步撤销"本地时间减安全边际"备选方案，比R1轮的"有条件允许"更严格） | **本轮彻底关闭**，见§1.2 |
+| R1-P0-2 | fusionState借用S0-S7正式状态标签 | **P0-1**（CEO本轮明确裁决：彻底废除借用方案，恒为`'UNKNOWN'`） | **本轮彻底关闭**，见§1.2 |
+| R1-P1-1 | 72H有效样本积累缓慢 | **P1-4**（CEO确认冻结节奏不得为凑样本量而提高） | **本轮确认关闭**，见§1.2 |
+| R1-P1-2 | `effectiveSampleCount`非重叠子抽样贪心算法方法论次优 | **P0-3**（CEO本轮认定这不只是"次优"，而是必须替换为标准区间调度算法） | **本轮彻底关闭**（严重等级由R1的P2上调为本轮P0，见§1.3说明） | 
+| R1-P1-3 | 归因规则不可变性缺少守护测试 | （无对应新编号，R1轮已直接回填T27，本轮沿用） | 已于R1轮关闭，本轮未变动 |
+| — | （R1轮未发现，本轮CEO新增裁决） | **P0-4**（exogenous_shock误归因风险） | **本轮新增并关闭**，见§1.2 |
+| — | （R1轮未发现，本轮CEO新增裁决） | **P0-5**（静默删除历史证据风险） | **本轮新增并关闭**，见§1.2 |
+| — | （R1轮未发现，本轮CEO新增裁决） | **P1-1**（`buildForecastSnapshot`纯函数/存储层混淆） | **本轮新增并关闭**，见§1.2 |
+| — | （R1轮未发现，本轮CEO新增裁决） | **P1-2**（`directionThreshold`时间尺度一致性不足） | **本轮新增并关闭**，见§1.2 |
+| — | （R1轮未发现，本轮CEO新增裁决） | **P1-3**（缺少完整输入窗口审计引用） | **本轮新增并关闭**，见§1.2 |
+| — | （R1轮独立发现，本轮一并核实修正） | **无编号**（`firstResistance`/`firstSupport`的`lower`/`upper`字段误用） | **本轮发现并关闭**，见§1.4 |
 
-### P0-2：§12.3 `fusionState` 借用 `S2_BULL_EXPANSION` 等正式状态标签用于展示，存在"代理冒充正式状态"的措辞风险
+**红线说明（R1-P1-2严重等级上调说明）**：R1轮曾把"非重叠子抽样贪心算法"评为P2（"方法学上可改进，但不构成正确性错误"）。CEO本轮复核后认定：排序键（`generatedAt`）与实际决定重叠边界的量（`targetStartTime`/`targetEndTime`）不是同一量纲，这不是单纯的"次优"，而是**排序依据本身选错了**，可能在某些样本分布下产生非法（重叠）的"有效独立样本"选择结果，因此本轮**上调为P0并要求强制关闭**，不是R1轮判断有误，而是CEO对同一问题给出了更严格的最终裁决，本文档尊重并采纳这一更严格的结论。
 
-- **风险描述**：`V1_4_FORECAST_DATA_SPEC.md`§12.3 定义 `fusionState`（V1.4展示层字段）直接借用`FusionStateId`中`S0_ACCUMULATION`...`S6_CAPITULATION`等**正式八状态命名**作为展示标签，即使该文档自身已加了红线注释"仅作展示标签，不代表FULL_STATE_MODE正式判定"，但这与GMKG总架构§18安全边界"不得把候选数据源/代理判断包装成已接入/正式状态"的精神存在**实质冲突**——用户在字面上看到"S2_BULL_EXPANSION"字样，无论旁边有多少小字免责声明，都可能望文生义为"系统判定为多头扩张正式状态"，这正是GMKG总架构反复强调要避免的"代理状态冒充正式状态"风险的**具体化身**。
-- **严重等级**：**P0**（直接触及V1.4最核心红线之一："不得声称识别S0-S7正式状态"）。
-- **复现路径**：任何查看V1.4 UI展示或`ForecastSnapshot.fusionStateAtGeneration`日志字段的人，只看字段值本身（不追溯到`operatingMode`/`primaryState`），都会读到一个正式状态命名。
-- **修复要求**：**不建议**在V1.4阶段输出`fusionState`字段借用正式状态命名。修复方案二选一（留待CEO/下一版本裁决，本文档不擅自修改SPEC）：
-  1. V1.4阶段`fusionState`/`fusionStateAtGeneration`**恒为占位值**（如新增一个不在`FusionStateId`枚举内的`'DISPLAY_PLACEHOLDER'`值，或直接省略该字段、只展示`proxyState`），完全不借用S0-S7命名；
-  2. 或者保留当前设计，但**强制要求**任何展示`fusionState`的UI位置必须与`operatingMode='PRICE_ONLY_MODE'`+`primaryState='UNKNOWN'`+`'[PRICE_ONLY]'`前缀在**同一视觉区块内以同等字号**呈现，不得让`fusionState`单独抽出展示（如做成一个醒目的大字方向标签而把免责声明做成脚注）。
-- **是否阻断Codex**：**是**——`V1_4_FORECAST_DATA_SPEC.md`§12.3当前方案**不建议直接进入编码**，建议在下一版本修订中采纳修复方案1（更彻底、更不容易被误用），或由CEO明确裁决采纳方案2并在验收测试中新增强制视觉一致性检查。
-- **是否允许进入编码**：**否，本项需先修订`V1_4_FORECAST_DATA_SPEC.md`§12.3或经CEO明确批准现有方案后，方可进入编码**。
+### 1.2 本轮（CEO裁决）P0-1至P0-5、P1-1至P1-4关闭记录
 
-### P1-1：72H 有效样本量积累速度极慢，`V1_4_HISTORICAL_VALIDATION_SPEC.md`§4门槛在现实中需要较长运行时间才能达到
+#### P0-1：PRICE_ONLY_MODE不得借用正式S0-S7状态（关闭）
 
-- **风险描述**：72H预测按§1.1节奏每24小时生成一次，`effectiveSampleCount`要求目标窗口互不重叠（间隔>=72小时），意味着理论最优情况下每3天才产生1个"有效独立样本"，达到§4门槛`effectiveSampleCount>=10`需要至少30天不间断运行，实际因数据缺口/系统重启会更久。
-- **严重等级**：**P1**（不阻断架构本身，但需要提前管理预期，避免未来误以为"V1.4上线几天后就能看到有统计意义的72H验证结果"）。
-- **复现路径**：无需复现，纯粹是节奏与门槛数值的算术后果。
-- **修复要求**：`V1_4_HISTORICAL_VALIDATION_SPEC.md`已在§4标注"样本不足时必须披露"，本项无需修改文档，只需在未来实施报告与UI展示中管理预期，建议在`V1_4_CODEX_IMPLEMENTATION_TASK.md`§11"实施报告要求"中补充一句"须预估并披露达到最低样本量门槛的预计时间"。
-- **是否阻断Codex**：否。
-- **是否允许进入编码**：是。
+- **原风险**：`V1_4_FORECAST_DATA_SPEC.md`draft-1 §12.3把`fusionState`映射为`S0_ACCUMULATION`/`S2_BULL_EXPANSION`/`S4_DISTRIBUTION`/`S5_BEAR_EXPANSION`/`S6_CAPITULATION`等正式状态命名，构成"代理判断冒充正式状态"风险。
+- **关闭方式**：CEO本轮明确裁决彻底废除借用方案。`V1_4_FORECAST_DATA_SPEC.md`§12.3已重写：`primaryState`/`fusionState`/`fusionStateAtGeneration`恒为`'UNKNOWN'`，不使用`'CONFLICTED'`代替（因为`'CONFLICTED'`语义要求三眼皆已运行且证据冲突，V1.4广度眼未运行不构成"冲突"），不新增任何伪正式状态，UI固定展示"融合状态：未评估（广度眼未运行）"。已同步至`V1_4_CODEX_IMPLEMENTATION_TASK.md`（无遗留代码路径需要清理，本轮为文档阶段）、`V1_4_ACCEPTANCE_TESTS.md`（T4.1-T4.3/T5.1-T5.3已覆盖）。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T4/T5类别。
+- **状态**：**已关闭，无遗留问题**。
 
-### P1-2：`V1_4_HISTORICAL_VALIDATION_SPEC.md`§3.2 非重叠子抽样算法为贪心算法，非严格最大化，属已知次优但非错误
+#### P0-2：referenceBar必须使用Binance服务器时间（关闭）
 
-- **风险描述**：贪心"按`generatedAt`升序、选中后跳过所有目标窗口重叠样本"的子抽样方法，理论上不保证在给定样本集合中选出**数量最多**的互不重叠子集（区间调度问题的经典贪心最优策略应按**结束时间**排序而非开始时间，但由于本场景样本本身是按固定节奏生成、`targetEndTime`与`generatedAt`高度线性相关，实践中差异很小）。
-- **严重等级**：**P2**（方法学上可改进，但不构成正确性错误，`effectiveSampleCount`仍然是一个**合法的下界估计**，不会高估独立样本数，只会轻微低估）。
-- **修复要求**：无需本轮修改，建议未来版本若要更精确，可改用按`targetEndTime`升序的经典区间调度贪心算法。风险方向是"保守低估"而非"虚报"，符合"宁可保守也不夸大统计意义"的整体红线精神，可以接受。
-- **是否阻断Codex**：否。
-- **是否允许进入编码**：是。
+- **原风险**：R1轮曾允许"本地时间减安全边际"作为简化替代方案。
+- **关闭方式**：CEO本轮撤销该备选方案，冻结为唯一路径：必须调用`GET /api/v3/time`，单次刷新周期内可缓存偏移量但不得跨周期沿用，服务器时间不可用时fail closed（`DATA_BLOCKED`，`generationBlockedReason='SERVER_TIME_UNAVAILABLE'`），不得猜测`referenceBar`或沿用旧预测时间。已写入`V1_4_FORECAST_DATA_SPEC.md`新增§3.0/§3.0.1，`V1_4_CODEX_IMPLEMENTATION_TASK.md`新增`getServerTimeOffset`函数与编排逻辑说明，`V1_4_DATA_SOURCE_MATRIX.md`同步标注。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T3.4（服务器时间校验）/T3.5（fail closed）/T3.6（确认无本地时间减安全边际的实现路径）。
+- **状态**：**已关闭，无遗留问题**（不再有"或"字样的备选方案表述）。
 
-### P1-3：`V1_4_CODEX_IMPLEMENTATION_TASK.md`未显式测试"误差归因规则版本冻结"的不可变性
+#### P0-3：修正`effectiveSampleCount`非重叠样本算法（关闭）
 
-- **风险描述**：`V1_4_HISTORICAL_VALIDATION_SPEC.md`§5.3要求归因规则必须结果发生前冻结、不得事后修改，但`V1_4_ACCEPTANCE_TESTS.md`当前**没有**一条测试专门验证"归因规则表在代码中不因运行时输入而改变判定逻辑"（即没有测试守护这条不可变性红线本身）。
-- **严重等级**：**P1**（规则本身在文档层面已冻结，但缺少代码层面的守护测试，存在被未来维护者不小心破坏而无人察觉的风险）。
-- **修复要求**：**已在本轮一致性检查中发现，将在§3跨文档一致性核对后回填至`V1_4_ACCEPTANCE_TESTS.md`**（见本文档§4处理记录）。
-- **是否阻断Codex**：否（文档修订后即解决）。
-- **是否允许进入编码**：是（待文档修订）。
+- **原风险**：见§1.1"R1-P1-2严重等级上调说明"。
+- **关闭方式**：`V1_4_HISTORICAL_VALIDATION_SPEC.md`§3.2已重写为标准区间调度算法：按`instrument+horizon`分组→只取对应eligible集合→按`targetEndTime`升序排序（相同则`targetStartTime`、再`predictionId`）→贪心选择`candidate.targetStartTime>=lastSelected.targetEndTime`。`rawSampleCount`与`effectiveSampleCount`定义同步更新，24H/72H分别处理不变（§3.3）。`V1_4_CODEX_IMPLEMENTATION_TASK.md`的`computeEffectiveSampleCount`签名已更新为接受`eligibilityField`参数。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T28类别（5条确定性测试）。
+- **状态**：**已关闭，无遗留问题**。
 
-### P2-1：单文件架构限制（重申，非新发现）
+#### P0-4：V1.4不能把大幅波动归因为`exogenous_shock`（关闭）
 
-沿用 GMKG总架构 §16.1-16.2 已充分说明的单文件HTML限制（不能24小时连续采集、不能承担大规模历史数据库等）。V1.4阶段本身就是在承认这一限制的前提下设计的最小闭环，不构成新风险，只需在`V1_4_CODEX_IMPLEMENTATION_TASK.md`交付时再次确认未违反。
+- **原风险**：`V1_4_HISTORICAL_VALIDATION_SPEC.md`draft-1把`exogenous_shock`列为"可评估（粗粒度）"，但V1.4没有新闻/事件数据能证明"确实发生了外生冲击"，这是无法验证的因果声称。
+- **关闭方式**：`exogenous_shock`已改列`NOT_EVALUABLE`（§5.1）。新增`unexplainedExtremeMove`中性观测标记（§5.2a），只描述"发生了无法解释的极端波动"这一客观事实，不声称原因，且**不得**作为`primaryCause`/`secondaryCauses`的取值。`V1_4_CODEX_IMPLEMENTATION_TASK.md`的`attributeError`签名已更新返回类型。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T27.3-T27.6。
+- **状态**：**已关闭，无遗留问题**。
 
-### P2-2：`localStorage` 容量与性能
+#### P0-5：禁止静默删除预测历史（关闭）
 
-`ForecastSnapshot`/`ForecastOutcomeEvent`长期积累（尤其24H每4小时一条、72H每天一条，一年下来24H约2190条、72H约365条）需关注`localStorage`总体积（单条`featureValuesUsed`+`contentHash`等字段会显著增加单条记录体积，比既有`ForecastLogEntry`更重）。`V1_4_CODEX_IMPLEMENTATION_TASK.md`§4.2已定义淘汰策略，建议实施阶段做一次实测记录单条记录的平均字节数，确认1500条上限不会导致单个key超过浏览器`localStorage`典型5MB限制。
+- **原风险**：draft-1设计"存储超过约1500条时优先淘汰已完成回填、时间最早的`ForecastSnapshot`"，构成验证审计证据被系统自动销毁的风险。
+- **关闭方式**：`V1_4_FORECAST_DATA_SPEC.md`§8.3已重写：不自动删除任何已进入验证链路的记录；写入必须事务式/原子式；`QuotaExceededError`时设`storageHealth='STORAGE_BLOCKED'`、停止创建新快照、提示导出，保留全部已有数据；JSON导出须包含完整验证链路。`V1_4_CODEX_IMPLEMENTATION_TASK.md`§4.2同步重写，新增`persistForecastBundleAtomically`函数。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T21.3-T21.8（6条新测试）。
+- **状态**：**已关闭，无遗留问题**。
 
-### P2-3：CORS（重申，非新发现）
+#### P1-1：纯函数不得接收storage（关闭）
 
-现货K线端点CORS已在V1.1-V1.3.1三轮独立复审+本轮`curl`实测确认可用，不构成新风险。
+- **原风险**：`buildForecastSnapshot`签名包含`storage`参数，与"纯函数"定位自相矛盾。
+- **关闭方式**：`V1_4_CODEX_IMPLEMENTATION_TASK.md`§3已重组为三层——§3.1纯计算层（`buildForecastSnapshot`等，无`storage`参数）、§3.2 I/O辅助函数（`getServerTimeOffset`等，网络请求非持久化）、§3.3持久化层（`findForecastSnapshotByPredictionId`/`saveForecastSnapshot`/`persistForecastBundleAtomically`/`backfillIdempotent`/`generateForecastSnapshotOrchestrated`，含`storage`参数，负责去重与幂等）。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T29类别（5条）。
+- **状态**：**已关闭，无遗留问题**。
 
-### P2-4：性能
+#### P1-2：`directionThreshold`时间尺度一致性（关闭）
 
-V1.4新增计算量极小（9个PO_\*状态判定+情景权重计算，均为O(1)复杂度的规则打分），不构成性能风险。
+- **原风险**：15分钟ATR乘固定系数、长期贴clamp下限，未能真实表达24H/72H预期波动。
+- **关闭方式**：`V1_4_FORECAST_DATA_SPEC.md`§7.1已重写为"4H已收盘ATR + 平方根时间缩放"（`volatilityUnit=e4.atr14/referencePrice`，24H用`sqrt(6)`倍缩放，72H用`sqrt(18)`倍缩放，clamp边界不变），新增`rawThreshold`/`thresholdFloor`/`thresholdCeiling`/`thresholdFormulaVersion`字段存档，`e4.atr14`无效时不猜测、转入`INSUFFICIENT_DATA`。`V1_4_CODEX_IMPLEMENTATION_TASK.md`新增`computeDirectionThreshold`纯函数签名。
+- **验证**：沿用`V1_4_ACCEPTANCE_TESTS.md` T15.4（已更新指向新公式）。
+- **状态**：**已关闭，无遗留问题**。
+
+#### P1-3：冻结完整输入窗口审计引用（关闭）
+
+- **原风险**：每个symbol/timeframe只保存一条`DataVintageRef`，无法证明特征计算实际使用的历史K线窗口范围与内容。
+- **关闭方式**：`V1_4_FORECAST_DATA_SPEC.md`新增§8.4a `KlineWindowRef`接口（六个窗口：ETH/BTC×15m/1h/4h），含`contentHash`覆盖整段已收盘K线序列内容；`ForecastSnapshot`新增`klineWindowRefs`字段（§6输出字段表已同步）。`V1_4_CODEX_IMPLEMENTATION_TASK.md`新增`computeKlineWindowRef`纯函数签名。
+- **验证**：需在未来测试补充版本新增`KlineWindowRef`确定性测试（本轮`V1_4_ACCEPTANCE_TESTS.md`暂未新增专属测试类别，见§3核对表第2项备注）。
+- **状态**：**文档层面已关闭**；测试覆盖建议在下一次测试补充轮次新增，不阻断本轮编码许可（`contentHash`确定性要求已在SPEC§8.4a第5点写明，具备可测试性，只是本轮未新增独立测试类别）。
+
+#### P1-4：72H采样频率不为制造样本而提高（关闭）
+
+- **关闭方式**：`V1_4_HISTORICAL_VALIDATION_SPEC.md`§1.1新增红线：24H`>=4小时`、72H`>=24小时`为上限，不得为凑样本量提高频率；`rawSampleCount`/`effectiveSampleCount`并列报告；样本不足时诚实披露，不得通过放宽筛选条件掩盖。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T28.6/T28.7。
+- **状态**：**已关闭，无遗留问题**。
+
+### 1.3 附加发现：`firstResistance`/`firstSupport`字段形状错误（本轮核实v1-core.js后发现并关闭）
+
+- **风险描述**：`V1_4_FORECAST_DATA_SPEC.md`draft-1 §4.2三处PO_\*状态定义假设`e4.firstSupport.lower`/`e4.firstResistance.upper`直接存在，但核对`v1-core.js`源码后确认：`analyzeKlines()`产出的`firstResistance`/`firstSupport`是`level()`函数产出的对象，形状为`{price, source, confidence, clusterId, barsAgo}`，**没有**`.lower`/`.upper`字段；这两个字段只存在于`buildSRZones()`函数的输出（`supportZones`/`resistanceZones`数组元素）上。
+- **严重等级**：P1（会导致实现阶段直接按文档编码时读取`undefined`字段，PO_\*状态判定逻辑失效，但不构成安全/数据泄漏类风险）。
+- **关闭方式**：`V1_4_FORECAST_DATA_SPEC.md`§4.1新增"字段形状红线"说明，§4.2三处判定改用`srZones = buildSRZones(e4)`记号，引用`srZones.supportZones[0].lower/.upper`/`srZones.resistanceZones[0].lower/.upper`。
+- **验证**：建议下一轮测试补充中新增专项测试核对该字段访问路径（本轮暂未新增独立测试，风险等级低且已通过文档层面订正消除主要风险）。
+- **状态**：**已关闭**。
+
+### 1.4 P2级风险（重申，非新发现，本轮未变动）
+
+#### P2-1：单文件架构限制
+
+沿用 GMKG总架构 §16.1-16.2 已充分说明的单文件HTML限制。不构成新风险。
+
+#### P2-2：`localStorage` 容量与性能
+
+`ForecastSnapshot`/`ForecastOutcomeEvent`长期积累的体积问题。**本轮更新**：P0-5关闭后，容量策略从"淘汰旧记录"改为"`STORAGE_BLOCKED`+停止生成+提示导出"，容量压力测试的必要性依然存在（需确认多久会触及浏览器`localStorage`典型容量上限），但不再涉及"淘汰策略是否合理"这一问题，风险性质从"数据保留策略"变为"纯粹的容量规划"，严重等级不变（P2）。
+
+#### P2-3：CORS
+
+现货K线端点CORS已多轮确认可用，`/api/v3/time`端点为同域公开端点，理论上应享有相同CORS策略，但**未专门实测**（本轮`curl`只验证了`klines`与`time`端点的响应内容，未从浏览器环境专门验证`/api/v3/time`的CORS头）——建议实施阶段补充一次浏览器端`fetch('/api/v3/time')`的实测确认，风险等级维持P2（同域公开端点历史上CORS策略一致的可能性很高，但严谨起见不应假设）。
+
+#### P2-4：性能
+
+V1.4新增计算量极小，不构成性能风险。
 
 ---
 
 ## 2. 汇总表
 
-| 编号 | 风险 | 严重等级 | 是否阻断Codex | 是否允许进入编码 |
-|---|---|---|---|---|
-| P0-1 | referenceBar已收盘判定依赖本地时钟 | P0 | 本轮已关闭 | 允许（CODEX_TASK约束+TESTS T3.4已补齐，实施阶段仍须真正落实） |
-| P0-2 | fusionState借用正式状态标签 | P0 | 是 | 否，需先修订SPEC§12.3或CEO明确裁决 |
-| P1-1 | 72H有效样本积累缓慢 | P1 | 否 | 是 |
-| P1-2 | 非重叠子抽样贪心次优 | P2 | 否 | 是 |
-| P1-3 | 归因规则不可变性缺少守护测试 | P1 | 否（本轮已回填） | 是 |
-| P2-1至P2-4 | 单文件限制/存储容量/CORS/性能 | P2 | 否 | 是 |
+| 编号 | 风险 | 严重等级 | 关闭状态 |
+|---|---|---|---|
+| P0-1 | PRICE_ONLY_MODE借用正式S0-S7状态标签 | P0 | 已关闭 |
+| P0-2 | referenceBar本地时钟依赖 | P0 | 已关闭 |
+| P0-3 | effectiveSampleCount算法错误 | P0 | 已关闭 |
+| P0-4 | exogenous_shock误归因 | P0 | 已关闭 |
+| P0-5 | 静默删除历史验证证据 | P0 | 已关闭 |
+| P1-1 | buildForecastSnapshot纯函数/存储层混淆 | P1 | 已关闭 |
+| P1-2 | directionThreshold时间尺度一致性不足 | P1 | 已关闭 |
+| P1-3 | 缺少完整输入窗口审计引用 | P1 | 已关闭（测试覆盖待后续补充，不阻断编码） |
+| P1-4 | 72H采样频率被提高以凑样本量的风险 | P1 | 已关闭 |
+| 附加 | firstResistance/firstSupport字段形状错误 | P1 | 已关闭 |
+| P2-1至P2-4 | 单文件限制/存储容量/CORS/性能 | P2 | 无需关闭动作，重申记录 |
+
+**本轮结论**：全部P0（5项）与P1（4项+1项附加发现）均已关闭，无遗留阻断项。
 
 ---
 
-## 3. 跨文档一致性核对（逐项，用户§二十二15项）
+## 3. 跨文档一致性核对（逐项，用户§二十二15项，本轮更新）
 
 | # | 核对项 | 结论 |
 |---|---|---|
-| 1 | SPEC要求全部进入CODEX_TASK | 达标——PO_\*判定、ForecastSnapshot生成、路径定位、回填、walk-forward切分、误差归因均已在CODEX_TASK§3列出对应纯函数签名 |
-| 2 | CODEX_TASK全部进入ACCEPTANCE_TESTS | **发现缺口并已回填**：迁移(T21.1)/损坏(T21.2)/超限(T21.3)/导出(T22)/离线+REST(T25)/UI最低要求(T5.3)均有覆盖；构建脚本占位符替换未有专属测试，判定为可接受的P2级别缺口（构建失败会在构建阶段直接报错阻断，不需要额外验收测试，`replaceExact`本身自带精确计数校验机制） |
-| 3 | ACCEPTANCE_TESTS覆盖ARCHITECTURE_REVIEW风险 | **发现缺口**：P0-1（服务器时间校验）与P1-3（归因规则不可变性）在原26类测试中未直接覆盖，**已在本文档§4记录回填要求**，需在提交前更新`V1_4_ACCEPTANCE_TESTS.md`新增T3.4/T27两条 |
-| 4 | 所有字段名一致 | 达标——已用`grep`核对`expectedBarCount`/`closeTime`公式/`readinessCeiling`等关键字段跨文档一致，见本文档撰写前的核对记录 |
-| 5 | 所有枚举一致 | 达标——`OperatingMode`/`PriceOnlyStateId`/`TargetStateId`/`FusionStateId`均只在GMKG总架构定义一次，五份V1.4文档均为引用，未见平行定义 |
-| 6 | 所有时间定义一致 | 达标——`closeTime=openTime+timeframeMs-1`在SPEC/MATRIX/TESTS三处表述完全一致（均引用同一次2026-07-18现场核实） |
-| 7 | 24H/72H bar数量一致 | 达标——96/288在SPEC/TESTS/VALIDATION_SPEC三处一致 |
-| 8 | 可空类型一致 | 达标——`ForecastOutcomeEvent`可空字段直接引用GMKG总架构接口，未重新定义 |
-| 9 | 两类统计分母一致 | 达标——`pathEligibleForStatistics`/`directionEligibleForStatistics`定义与使用规则在SPEC/VALIDATION_SPEC/TESTS三处一致 |
-| 10 | PRICE_ONLY_MODE边界一致 | 达标——`primaryState`恒`UNKNOWN`、`proxyState`带`PO_`前缀、不产出`FormalTransitionRecord`三条红线在五份文档中表述一致 |
-| 11 | ActionPermission边界一致 | 达标——`mode='DISPLAY_ONLY'`、`readinessCeiling='ALLOW_TEST'`、`gateStatus='WAIT'`在SPEC/TESTS中一致；**但见P0-2**，`fusionState`的展示方式需要额外裁决，不属于"边界不一致"，属于"边界本身设计是否稳妥"的问题 |
-| 12 | 概率语义一致 | 达标——`scenarioWeights`≠概率、`calibratedProbabilities`恒null、Brier Score仅占位，三份文档（SPEC/VALIDATION_SPEC/TESTS）表述一致 |
-| 13 | 数据源状态一致 | 达标——MATRIX的A层（唯一实施）与SPEC§2的"当前可用/不可用"列表完全对应，无矛盾 |
-| 14 | 当前能力与目标架构不混淆 | 达标——【V1.4真实实现】/【仍需研究】/【目标架构】标注体系贯穿全部文档，MATRIX的B/C两层与A层边界清晰 |
-| 15 | 不削弱V1.3.1 | 达标——CODEX_TASK§1.2/§12、SPEC§12.2均明确禁止调用四个交易门控函数与修改V1.3.1文件，TESTS T23/T24提供对应验收覆盖 |
+| 1 | SPEC要求全部进入CODEX_TASK | 达标——PO_\*判定（含字段形状修正）、`ForecastSnapshot`生成（纯函数/存储分层）、`KlineWindowRef`、`directionThreshold`新公式、路径定位、回填、walk-forward切分（新算法）、误差归因（含`unexplainedExtremeMove`）均已在CODEX_TASK§3-§4列出对应函数签名 |
+| 2 | CODEX_TASK全部进入ACCEPTANCE_TESTS | 达标，**但有1项待后续补充**：`KlineWindowRef`的`contentHash`确定性尚无专属测试类别（见§1.2 P1-3关闭记录），判定为不阻断本轮编码许可的遗留待办，建议下一次测试补充轮次新增 |
+| 3 | ACCEPTANCE_TESTS覆盖ARCHITECTURE_REVIEW风险 | 达标——本轮全部9项风险（P0-1至P0-5、P1-1/P1-2/P1-4、附加发现）均已在TESTS新增或更新对应测试；P1-3的测试覆盖为已知例外，已如实记录 |
+| 4 | 所有字段名一致 | 达标——`fusionState`/`fusionStateAtGeneration`恒`'UNKNOWN'`、`storageHealth`、`thresholdFormulaVersion`、`klineWindowRefs`等新字段已在SPEC与CODEX_TASK间核对一致 |
+| 5 | 所有枚举一致 | 达标——`OperatingMode`/`PriceOnlyStateId`/`TargetStateId`/`FusionStateId`仍只在GMKG总架构定义一次；本轮新增的`KlineWindowRef`/`UnexplainedExtremeMoveFlag`只在`V1_4_FORECAST_DATA_SPEC.md`/`V1_4_HISTORICAL_VALIDATION_SPEC.md`各自定义一次，未见重复定义 |
+| 6 | 所有时间定义一致 | 达标——`closeTime=openTime+timeframeMs-1`不变；新增的服务器时间校验规则（`GET /api/v3/time`+单周期缓存偏移）已在SPEC/CODEX_TASK/MATRIX/TESTS四处同步 |
+| 7 | 24H/72H bar数量一致 | 达标——96/288不变，未受本轮修订影响 |
+| 8 | 可空类型一致 | 达标——未受本轮修订影响，`ForecastOutcomeEvent`可空字段定义不变 |
+| 9 | 两类统计分母一致 | 达标——`pathEligibleForStatistics`/`directionEligibleForStatistics`定义不变；`computeEffectiveSampleCount`新增的`eligibilityField`参数与两分母对应关系在SPEC/VALIDATION_SPEC/CODEX_TASK/TESTS四处一致 |
+| 10 | PRICE_ONLY_MODE边界一致 | 达标——`primaryState`/`fusionState`/`fusionStateAtGeneration`三者恒`'UNKNOWN'`的规则已在SPEC/TESTS间完全同步，不再有任何S0-S7标签借用的残留表述（已完成全文机械搜索确认，见§5） |
+| 11 | ActionPermission边界一致 | 达标——`mode='DISPLAY_ONLY'`、`readinessCeiling='ALLOW_TEST'`、`gateStatus='WAIT'`不变；**R1轮P0-2遗留的"边界设计是否稳妥"疑虑已通过本轮P0-1裁决（fusionState恒UNKNOWN）彻底消除**，不再是悬而未决的问题 |
+| 12 | 概率语义一致 | 达标——`scenarioWeights`≠概率、`calibratedProbabilities`恒null、Brier Score仅占位，不受本轮修订影响 |
+| 13 | 数据源状态一致 | 达标——MATRIX新增服务器时间端点标注与SPEC§3.0同步，A/B/C三层结构不变 |
+| 14 | 当前能力与目标架构不混淆 | 达标——【标注】体系不变，本轮新增内容（`KlineWindowRef`/`storageHealth`/`thresholdFormulaVersion`等）均已按体系标注 |
+| 15 | 不削弱V1.3.1 | 达标——本轮修订未涉及V1.3.1相关文件引用，CODEX_TASK§1.2/§12、SPEC§12.2红线不变 |
 
 ---
 
-## 4. 本轮已执行的文档修正记录（对应§3发现的缺口）
+## 4. 全文机械搜索结果（红线关键词，确认旧规则不再残留）
 
-在提交前，已对 `V1_4_ACCEPTANCE_TESTS.md` 追加以下测试用例以关闭P0-1/P1-3两项缺口（具体内容见该文档T3.4/T27）：
-- 新增测试验证"已收盘"判定使用Binance服务器时间而非本地时间（对应P0-1）；
-- 新增测试类别验证误差归因规则表版本不可变、代码中不存在运行时动态修改归因规则的路径（对应P1-3）。
+本轮提交前已对六份文档（含本文档自身）执行以下关键词的全文搜索，确认旧错误规则不再以"正文有效规则"的形式残留（历史背景说明中出现"draft-1曾..."这类明确标注为"已废除的历史方案"的表述不算残留，只有作为当前生效规则出现才算残留）：
+
+| 关键词 | 搜索结果 |
+|---|---|
+| `S2_BULL_EXPANSION` | 仅出现在`V1_4_FORECAST_DATA_SPEC.md`§12.3"背景"段落与变更记录中，明确标注为"draft-1曾..."的已废除历史方案，不作为当前规则 |
+| `S0_ACCUMULATION`（在V1.4文档中） | 同上，仅历史背景引用 |
+| `fusionState` | 全部指向"恒为`'UNKNOWN'`"的当前规则，无残留的S0-S7映射 |
+| `local time` / `本地时间` | 仅出现在"背景：draft-1曾允许本地时间减安全边际"的历史说明及红线"不得使用"的否定句式中，无正面允许的残留表述 |
+| `Date.now` | 全部出现在"不得直接使用未经服务器偏移校正的`Date.now()`"这类否定语境中 |
+| `safety margin` / `安全边际` | 仅出现在"本轮已撤销"的历史说明中 |
+| `generatedAt排序` / `generatedAt升序` | 仅出现在`V1_4_HISTORICAL_VALIDATION_SPEC.md`§3.2"背景"段落，明确标注为已废除的draft-1算法 |
+| `exogenous_shock` | 全部标注为`NOT_EVALUABLE`，无"可评估"的残留表述 |
+| `1500` | 未在任何文档中以"存储上限"含义出现（原`V1_4_CODEX_IMPLEMENTATION_TASK.md`§4.2的"建议起点1500条"表述已随P0-5整体重写移除） |
+| `delete oldest` / `删除已完成` / `淘汰已完成` | 仅出现在"背景：draft-1曾设计...已被CEO裁决撤销"的历史说明中 |
+| `buildForecastSnapshot` | 全部签名已确认不含`storage`参数 |
+| `storage`（在纯函数上下文中） | 已确认`storage`参数只出现在`V1_4_CODEX_IMPLEMENTATION_TASK.md`§3.3持久化层函数签名中 |
+| `directionThreshold` | 公式已统一指向§7.1"4H ATR平方根时间缩放"新公式，无遗留的"15分钟ATR×固定倍数"表述作为当前规则 |
+| `atr14` | 已确认`directionThreshold`计算改用`e4.atr14`（4小时），`e15`/`e4`各自用途已在SPEC中区分清楚 |
+| `DataVintageRef` | 定义不变（GMKG总架构唯一权威），新增`KlineWindowRef`作为互补结构，未见混用或重复定义 |
+| `lower`/`upper`（`firstResistance`/`firstSupport`语境） | 已确认全部改为`buildSRZones(e4).supportZones[0]/.resistanceZones[0]`引用路径，无遗留的`e4.firstSupport.lower`直接访问 |
+| `待CEO裁决` | 全文搜索确认**不再出现**——本轮CEO已对上一轮遗留的全部"待CEO裁决"事项（`fusionState`展示方式、`referenceBar`时间校验方式、72H节奏）作出冻结裁决，相关文字已改写为"已冻结""已关闭"等确定性表述；§5仅保留1项与本轮九项修订无关的独立未决事项（B/C层数据源接入优先级），该项本身不属于本轮CEO裁决范围，如实保留 |
+
+**结论**：机械搜索未发现任何应被清除但仍以"当前生效规则"形式残留的旧错误表述。
 
 ---
 
-## 5. 仍需 CEO 决定的问题
+## 5. 仍需 CEO 决定的问题（本轮大幅精简，原3项已由CEO本轮裁决关闭）
 
-1. **`fusionState`借用正式状态标签的展示方式**（P0-2）——是否采纳本文档建议的"完全不借用S0-S7命名"方案，或采纳"强制同视觉区块展示免责声明"折衷方案，或有第三种裁决；
-2. **`referenceBar`已收盘判定是否必须调用Binance `/api/v3/time`**，还是接受"本地时间减安全边际"的简化方案（涉及是否额外增加一次网络请求的工程权衡）；
-3. **72H有效样本积累缓慢的问题是否需要调整生成节奏**（如提高到每12小时生成一次以加快样本积累，代价是重叠率从67%升至约83%）——本文档不擅自裁决，留待CEO结合V1.4实际上线后的运行数据决定；
-4. **未来接入B/C层数据源的优先级顺序**——`V1_4_DATA_SOURCE_MATRIX.md`已记录候选清单，但未排出接入优先级，留待独立立项时讨论。
+1. **未来接入B/C层数据源的优先级顺序**——`V1_4_DATA_SOURCE_MATRIX.md`已记录候选清单，但未排出接入优先级，留待独立立项时讨论（与本轮P0-1至P0-5/P1-1至P1-4九项裁决无关，本轮不涉及）。
+
+（原R1轮§5列出的"`fusionState`展示方式""`referenceBar`时间校验方式""72H节奏是否调整"三项，已分别由本轮CEO裁决P0-1/P0-2/P1-4关闭，不再作为待决问题保留。）
 
 ---
 
 ## 6. 最终结论：是否允许进入编码
 
-**有条件允许**——五份V1.4文档在架构层面基本自洽，与GMKG总架构无平行结构冲突。本轮复审发现的**2项P0中，P0-1（referenceBar时钟依赖）已在本轮直接关闭**（`V1_4_CODEX_IMPLEMENTATION_TASK.md`补充约束+`V1_4_ACCEPTANCE_TESTS.md`新增T3.4，见§4）。**P0-2（`fusionState`借用正式状态标签的展示方式）仍需CEO裁决**（见§5问题1），在此之前**不建议**开始`V1_4_CODEX_IMPLEMENTATION_TASK.md`§5步骤2/步骤6（涉及`fusionState`生成与UI展示部分）；步骤1（PO_\*状态判定纯函数）、步骤3（`ForecastOutcomeEvent`回填，P0-1已关闭）、步骤4（walk-forward脚手架）不受P0-2影响，理论上可以先行开发，但建议整体等待CEO就§5问题1一次性裁决后再统一启动，避免步骤2返工牵连UI已完成的工作。
+**允许**——本轮CEO冻结裁决的5项P0与4项P1（含1项附加发现，共10项）已全部在六份文档中同步关闭，15项跨文档一致性核对全部达标（1项`KlineWindowRef`测试覆盖的已知遗留待办不构成阻断），全文机械搜索未发现残留的旧错误规则。`V1_4_CODEX_IMPLEMENTATION_TASK.md`§5定义的构建顺序（步骤1-8）**不再有任何一步因未决裁决而被建议暂缓**，可以按既定顺序整体推进。唯一的遗留待办（`KlineWindowRef`确定性测试的专属测试类别）建议在下一次测试补充轮次中新增，不影响本轮"允许进入编码"的结论。
 
 ---
 
@@ -134,3 +209,4 @@ V1.4新增计算量极小（9个PO_\*状态判定+情景权重计算，均为O(1
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.4-review-draft-1 | 2026-07-18 | 初稿：独立发现2项P0（referenceBar本地时钟依赖、fusionState借用正式状态标签风险）、3项P1（72H样本积累缓慢、非重叠子抽样次优、归因规则不可变性缺少测试）、4项P2（单文件限制/存储容量/CORS/性能均为重申非新发现）；完成15项跨文档一致性核对，发现并回填2处ACCEPTANCE_TESTS缺口；给出"有条件允许进入编码"的最终结论及2个需CEO裁决的P0问题 |
+| v1.4-review-draft-2 | 2026-07-18 | CEO本轮冻结裁决关闭P0-1至P0-5、P1-1至P1-4（含R1轮遗留的2项P0与部分P1，以及本轮新发现的P0-4/P0-5/P1-1/P1-2/P1-3五项），另发现并关闭`firstResistance`/`firstSupport`字段形状错误1项；重写§1风险清单（含R1/本轮编号映射表）、§2汇总表、§3跨文档一致性核对、新增§4全文机械关键词搜索记录、精简§5仅剩1项无关本轮的独立未决事项、§6最终结论改为无条件"允许进入编码" |

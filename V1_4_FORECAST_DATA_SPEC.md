@@ -3,7 +3,7 @@
 正式名称：**V1.4 Forecast Data & Historical Validation Foundation — GMKG Minimum Verifiable Loop**
 中文名称：**V1.4 预测数据与历史验证基础——GMKG 最小可验证闭环**
 
-版本：v1.4-spec-draft-1
+版本：v1.4-spec-draft-2（CEO本轮冻结裁决关闭P0-1/P0-2/P0-5/P1-2/P1-3及firstResistance/firstSupport字段形状订正后的修订版）
 基线：`main` @ `a3d7aea`（含 V1.1/V1.2/V1.3/V1.3.1 + `GMKG_DRAGONFLY_ARCHITECTURE.md`，PR #6 已合并）
 角色：本文档是 V1.4 六份文档中**唯一的核心业务规范**，回答"V1.4 具体要产出什么、用什么规则产出、这些规则的具体数值是多少"。本轮**只交付规范文档**，不修改 `GMKG_DRAGONFLY_ARCHITECTURE.md`、不修改任何 HTML/JS/测试/正式业务代码、不创建 PR、不合并 main、不开始编码。
 
@@ -95,13 +95,44 @@ V1.4 **只能真实运行** `PRICE_ONLY_MODE`；A组现货K线数据不完整时
 | `INSUFFICIENT_DATA`不产生迁移记录 | 【V1.4真实实现】 |
 | 代理状态不得进入正式八状态校准分母 | 【V1.4真实实现】 |
 
-### 3.1 `INSUFFICIENT_DATA` 触发条件（V1.4具体冻结）
+### 3.0 服务器时间前置门禁（红线，CEO已冻结裁决，P0-2，先于`operatingMode`判定执行）
+
+**背景**：draft-1曾允许"本地时间减安全边际"作为Binance服务器时间校验的简化替代方案。CEO本轮已**撤销**这一备选方案，冻结为唯一路径。
+
+**冻结规则**：
+
+1. 生成任何24H/72H `ForecastSnapshot`之前，**必须**调用 `GET https://api.binance.com/api/v3/time` 获取Binance服务器时间；
+2. 可以在**单次刷新周期内**缓存`serverTime`与本地时间的偏移量（`offset = serverTime − Date.now()`），避免同一刷新周期内重复请求；缓存**不得**跨刷新周期沿用（每次新的生成周期必须重新校验一次偏移，防止长时间运行后偏移漂移未被发现）；
+3. K线"是否已收盘"的判定**必须**以 `候选K线.closeTime <= (Date.now() + offset)`（即换算到服务器时间坐标系）为准；
+4. **禁止**直接用 `Date.now()`（未做服务器偏移校正）判定K线是否已收盘、进而选择`referenceBar`；
+5. **禁止**"本地时间减1分钟/减任意安全边际"作为正式替代方案——这条路径在draft-1中曾被列为可接受的简化选项，本轮**明确撤销**，不再是合法实现路径；
+6. **若`/api/v3/time`请求失败或超时（服务器时间不可用）**：
+   - **fail closed**——整条生成流程立即中止；
+   - **不创建**新的24H/72H `ForecastSnapshot`；
+   - 返回明确的阻塞结果，`generationBlockedReason='SERVER_TIME_UNAVAILABLE'`，顶层状态标记为`'DATA_BLOCKED'`（见下方§3.0.1，这是比`operatingMode='INSUFFICIENT_DATA'`更前置的一道门禁，二者不是同一层级的判断）；
+   - **不得**猜测`referenceBar`（不得退回"就用最后一次成功缓存的服务器时间偏移"这种隐性猜测）；
+   - **不得**沿用上一次成功生成时的`referenceBarRef`/`generatedAt`伪装成本次预测的时间戳。
+
+### 3.0.1 `DATA_BLOCKED` 与 `operatingMode` 的层级关系
+
+```
+DATA_BLOCKED（生成流程级别的前置门禁，本节新增）：
+  触发条件：服务器时间不可获取（§3.0第6点）
+  结果：不产生ForecastSnapshot，不产生operatingMode判断，只记录一条阻塞事件（结构见V1_4_CODEX_IMPLEMENTATION_TASK.md）
+
+operatingMode（precision-eye状态判定级别，见§3.1，前提是已通过§3.0门禁）：
+  'PRICE_ONLY_MODE' / 'INSUFFICIENT_DATA'（GMKG总架构§7.0a既有二态，V1.4不产出FULL_STATE_MODE）
+```
+
+**红线**：`DATA_BLOCKED`**不是**`OperatingMode`枚举的第三个值——`OperatingMode`类型本身（`GMKG_DRAGONFLY_ARCHITECTURE.md`§6.3定义）不因此扩展，`DATA_BLOCKED`是V1.4新增的、更前置的生成流程状态，只在服务器时间门禁失败时出现，此时**根本不产生**`TargetState`/`operatingMode`判断（不是"产生了一个`operatingMode='DATA_BLOCKED'`"，是"整个判断都没有发生"）。
+
+### 3.1 `INSUFFICIENT_DATA` 触发条件（V1.4具体冻结，前提：已通过§3.0服务器时间门禁）
 
 当且仅当以下任一条件成立时，`operatingMode='INSUFFICIENT_DATA'`（`primaryState='UNKNOWN'`，`proxyState=null`，只输出`candidateStates`）：
 
 1. ETH或BTC任一周期（15m/1h/4h）K线数组长度不足以计算ATR14（沿用`v1-core.js` `assessDataQuality().sufficientForATR14`既有判定，不重新发明）；
 2. `assessOverallHealth()`（`v1-core.js`既有函数）返回`'invalid'`；
-3. 用于本次24H/72H预测的`referenceBarRef`对应K线本身缺失或未收盘。
+3. 用于本次24H/72H预测的`referenceBarRef`对应K线（按§3.0服务器时间校正后判定）本身缺失或未收盘。
 
 否则（即A组数据完整可用）进入`PRICE_ONLY_MODE`，即使`assessOverallHealth()`返回`'delayed'`（数据延迟但结构未失效）也仍归入`PRICE_ONLY_MODE`，只是`featureCompleteness.criticalFeatureCompleteness`相应下调（见§5.4）。
 
@@ -118,16 +149,20 @@ V1.4 **只能真实运行** `PRICE_ONLY_MODE`；A组现货K线数据不完整时
 
 ### 4.1 输入特征清单（全部已由 `v1-core.js`/`v1_2-forecast-core.js` 计算，本节只做只读消费，不新增采集）
 
-`e4.price`、`e4.ema5/10/20`、`e4.atr14`、`e4.recentHigh20/recentLow20`、`e4.firstResistance/firstSupport`（含`.lower/.upper`区间）、`e4.isBreakout/isBreakdown`、`e4.breakoutBarsCount/breakdownBarsCount`、`e4.volumeRatio`、`e4.trend`（`'up'|'down'|'flat'`）、`e4.risingLows/fallingHighs`、`e1`（同名字段，1小时周期，交叉确认用）、`btcAlignment(direction, b4)`（复用`v1-core.js`既有函数）、`decision.dataHealth`。
+`e4.price`、`e4.ema5/10/20`、`e4.atr14`、`e4.recentHigh20/recentLow20`、`e4.isBreakout/isBreakdown`、`e4.breakoutBarsCount/breakdownBarsCount`、`e4.volumeRatio`、`e4.trend`（`'up'|'down'|'flat'`）、`e4.risingLows/fallingHighs`、`e4.hasLongUpperWick/hasLongLowerWick`、`e1`（同名字段，1小时周期，交叉确认用）、`btcAlignment(direction, b4)`（复用`v1-core.js`既有函数）、`decision.dataHealth`。
+
+**字段形状红线（本轮核对v1-core.js源码后订正，取代draft-1的错误假设）**：`e4.firstResistance`/`e4.firstSupport`是`analyzeKlines()`直接产出的`level()`对象，其形状为`{price, source, confidence, clusterId, barsAgo}`——**只有`.price`，没有`.lower`/`.upper`字段**。§4.2中任何需要"区间"边界（`.lower`/`.upper`）的判定，**必须**改用`buildSRZones(e4)`的输出（`{supportZones, resistanceZones}`，其中每个zone元素形状为`{type, rank, center, lower, upper, confidence, source, sourceLabel, sourceSwingCount, zoneHalfWidth}`），即：区间下沿/上沿取自`buildSRZones(e4).supportZones[0].lower/.upper`（对应`firstSupport`）或`buildSRZones(e4).resistanceZones[0].lower/.upper`（对应`firstResistance`），**不得**假设`e4.firstSupport.lower`/`e4.firstResistance.upper`这类字段直接存在于原始快照对象上。
 
 ### 4.2 九个代理状态定义
 
+**记号约定**：以下 `srZones = buildSRZones(e4)` 表示对`e4`调用`v1-core.js`既有`buildSRZones()`函数得到的区间结果；`srZones.supportZones[0].lower/.upper`即"第一支撑区"的下沿/上沿（对应`firstSupport`的区间化版本），`srZones.resistanceZones[0].lower/.upper`即"第一压力区"的下沿/上沿（对应`firstResistance`的区间化版本）——这两个字段**只存在于`buildSRZones()`的输出上**，不存在于`e4.firstSupport`/`e4.firstResistance`原始`level`对象本身（见§4.1字段形状红线）。
+
 **`PO_RANGE_LOW_STRUCTURE`（区间低位结构代理，对应S0积累的价格结构侧证据）**
-- 必要条件：`e4.price` 落入 `[e4.firstSupport.lower − 0.3×ATR14, e4.firstSupport.upper + 0.3×ATR14]` 区间内，**或** `e4.price <= e4.recentLow20 × 1.03`；且 `e4.trend ∈ {'flat','down'}`（非强势上行）。
+- 必要条件：`e4.price` 落入 `[srZones.supportZones[0].lower − 0.3×ATR14, srZones.supportZones[0].upper + 0.3×ATR14]` 区间内，**或** `e4.price <= e4.recentLow20 × 1.03`；且 `e4.trend ∈ {'flat','down'}`（非强势上行）。
 - 加分条件：`e4.risingLows === true`（低点抬高）；`e4.volumeRatio` 在 `[0.8, 1.2]`（温和，非放量非缩量）。
 - 否决条件：`e4.isBreakdown === true` 且 `e4.breakdownBarsCount >= 2`（已确认跌破，不满足"低位企稳"叙事）；`decision.dataHealth !== 'normal'`。
 - 状态保持条件：连续满足必要条件的4小时K线数 `>= 2`（即8小时未破位）。
-- 状态退出条件：`e4.price` 突破 `e4.firstResistance.upper + 0.3×ATR14`（转入`PO_BREAKOUT_UP_STRUCTURE`）或跌破 `e4.firstSupport.lower − 0.5×ATR14` 且已收盘确认（转入`PO_BREAKDOWN_STRUCTURE`）。
+- 状态退出条件：`e4.price` 突破 `srZones.resistanceZones[0].upper + 0.3×ATR14`（转入`PO_BREAKOUT_UP_STRUCTURE`）或跌破 `srZones.supportZones[0].lower − 0.5×ATR14` 且已收盘确认（转入`PO_BREAKDOWN_STRUCTURE`）。
 - 切换滞后：进入需连续2根4H K线确认，退出需1根已收盘4H K线确认突破/跌破（不对称，突破退出更快，呼应V1.1"已收盘确认"传统）。
 - 最短持续bar数：2根4H bar（8小时）。
 - 冲突处理：若同时满足`PO_RANGE_RECOVERY_STRUCTURE`条件（见下），以更晚近的出清事件为准（若近期`PO_SHARP_DROP_STRUCTURE`未曾触发，归入本状态；若曾触发，归入`PO_RANGE_RECOVERY_STRUCTURE`）。
@@ -169,7 +204,7 @@ V1.4 **只能真实运行** `PRICE_ONLY_MODE`；A组现货K线数据不完整时
 - 加分条件：`e4.volumeRatio < 1.0`（滞涨伴随缩量）；`e4.hasLongUpperWick === true`（长上影线，价格结构层面的滞涨信号）。
 - 否决条件：`e4.price`重新突破`e4.recentHigh20`（应退回`PO_TREND_UP_STRUCTURE`，不满足滞涨）。
 - 状态保持：不创新高持续。
-- 状态退出：跌破`e4.firstSupport.lower`（转入`PO_BREAKDOWN_STRUCTURE`）或重新创新高（退回`PO_TREND_UP_STRUCTURE`）。
+- 状态退出：跌破`srZones.supportZones[0].lower`（转入`PO_BREAKDOWN_STRUCTURE`）或重新创新高（退回`PO_TREND_UP_STRUCTURE`）。
 - 切换滞后：进入需2根bar确认，退出（跌破方向）需1根已收盘bar确认。
 - 最短持续bar数：2根4H bar。
 - 冲突处理：与`PO_TREND_UP_STRUCTURE`冲突时按"是否创新高"这一客观价格事实裁决，不依赖主观判断。
@@ -330,21 +365,48 @@ V1.4 的 `ForecastSnapshot` 严格使用 GMKG总架构 §10.1 定义的接口，
 | `weightVersion` | `'v1.4-gmkg-scenario-weights-unvalidated-initial-1'`（呼应GMKG总架构§11.1"待验证初始参数"标注） |
 | `datasetVersion` | `'v1.4-dataset-binance-spot-klines-only'` |
 | `dataVintageRefs` | 引用的6条`DataVintageRef.vintageId`（ETH+BTC×15m/1h/4h各一条，见§8.4） |
+| `klineWindowRefs`（P1-3新增） | 6个`KlineWindowRef`对象（ETH+BTC×15m/1h/4h各一个完整输入窗口审计引用，见§8.4a），补充`dataVintageRefs`只记单根K线版本、不足以证明特征计算实际用了哪一段历史序列的缺口 |
 | `featureValuesUsed` | 见§8.5 |
 | `featureEngineVersion` | `'v1.4-po-feature-engine-1'` |
 | `contentHash` | 见§8.5 |
 
 ### 7. 方向、幅度与情景生成（V1.4具体冻结）
 
-### 7.1 `directionThreshold` 口径（红线，已冻结，不留白）
+### 7.1 `directionThreshold` 口径（红线，P1-2，CEO已冻结裁决：4H ATR平方根时间缩放，取代draft-1的15分钟ATR固定倍数方案）
+
+**背景**：draft-1用15分钟ATR直接乘固定系数（2.0/3.5）再套24H/72H的clamp下限，实践中系数偏小、下限偏高，会导致多数情况下`directionThreshold`长期贴着clamp下限，不能真实反映24H/72H尺度上应有的预期波动范围（15分钟尺度的短期噪音与24/72小时尺度的真实波动幅度不是同一量纲，简单倍数缩放没有时间尺度依据）。CEO本轮冻结为"4小时ATR + 平方根时间缩放"的规则型阈值公式：
 
 ```
-基准ATR = e15（ETH 15分钟analyzeKlines输出）的atr14，取referenceBar对应快照的值
-directionThreshold(24h) = clamp( 2.0 × 基准ATR / referencePrice , 0.008 , 0.05 )   // 0.8%–5%
-directionThreshold(72h) = clamp( 3.5 × 基准ATR / referencePrice , 0.015 , 0.08 )   // 1.5%–8%
+volatilityUnit = e4.atr14 / referencePrice
+  （e4 = ETH 4小时analyzeKlines输出，取referenceBar对应的、已收盘4小时K线计算出的ATR14；
+   referencePrice = ForecastSnapshot.referencePrice，即referenceBar[15分钟]的收盘价）
+
+24H：
+  rawThreshold = volatilityUnit × sqrt(24 / 4)     // = volatilityUnit × sqrt(6)
+  directionThreshold = clamp(rawThreshold, 0.008, 0.05)   // thresholdFloor=0.008，thresholdCeiling=0.05
+
+72H：
+  rawThreshold = volatilityUnit × sqrt(72 / 4)     // = volatilityUnit × sqrt(18)
+  directionThreshold = clamp(rawThreshold, 0.015, 0.08)   // thresholdFloor=0.015，thresholdCeiling=0.08
 ```
 
-**口径类型**：相对`referencePrice`的百分比，但由ATR驱动动态调整并做上下限clamp（避免极端低波动期阈值过小导致噪音全部误判为UP/DOWN，也避免极端高波动期阈值过大导致RANGE占比失真）。`directionThresholdVersion = 'v1.4-direction-threshold-1'`——版本冻结规则同GMKG总架构§10.3：口径/数值只能随算法版本一起变化，同版本内不得动态调整。
+**冻结规则（红线）**：
+
+1. `volatilityUnit`使用的`atr14`**必须**来自**已收盘**的4小时K线（`e4.atr14`），**不得**使用未收盘4小时K线计算出的ATR值——理由：24H/72H是远长于15分钟的推演尺度，用与之量级更接近的4小时波动率做时间缩放基准，比直接挪用15分钟噪音级别的ATR更符合"用什么尺度的历史波动去外推什么尺度的未来区间"这一统计常识；
+2. 时间缩放使用**平方根法则**（`sqrt(目标小时数/基准小时数)`）——这是波动率随时间平方根增长的经典统计近似（布朗运动/随机游走假设下标准差随`sqrt(t)`增长），不是任意选择的系数，24H相对4H基准是`sqrt(6)≈2.449`倍，72H是`sqrt(18)≈4.243`倍；
+3. 该字段**仍是规则型阈值，不是校准概率**——平方根时间缩放是一个合理的**规则设计**，不构成"经过历史校准验证在ETH/BTC上确实成立"的统计结论，`directionThreshold`的地位与GMKG总架构§8.2"规则型权重≠统计概率"红线适用范围一致；
+4. **必须保存以下字段**（供审计追溯与未来重新标定）：
+   ```ts
+   {
+     rawThreshold: number,             // clamp前的原始计算值
+     directionThreshold: number,       // clamp后实际使用的值
+     thresholdFloor: number,           // 本次使用的下限（24H=0.008，72H=0.015）
+     thresholdCeiling: number,         // 本次使用的上限（24H=0.05，72H=0.08）
+     thresholdFormulaVersion: 'v1.4-threshold-formula-2'   // 见下方版本号，取代draft-1的directionThresholdVersion
+   }
+   ```
+5. **`e4.atr14`无效时（数据不足以计算4小时ATR）不得猜测阈值**——此时`operatingMode`直接归入`INSUFFICIENT_DATA`（或触发§3.0`DATA_BLOCKED`，视具体缺失原因而定），不得用15分钟ATR退而求其次替代计算，也不得用固定默认值填充`directionThreshold`；
+6. `thresholdFormulaVersion = 'v1.4-threshold-formula-2'`（取代draft-1的`directionThresholdVersion = 'v1.4-direction-threshold-1'`，字段改名以避免与旧版本混淆）——版本冻结规则同GMKG总架构§10.3：公式/系数/clamp边界只能随该版本号一起变化，同版本内不得动态调整。
 
 ### 7.2 UP/DOWN/RANGE 判定与MFE/MAE/区间覆盖
 
@@ -403,11 +465,28 @@ predictionId = `GMKG-${instrument}-${horizon}-${referenceBarRef.closeTime}-${alg
 
 去重键 = `predictionId`本身（因为其构成已经唯一覆盖"相同referenceBar+相同instrument+相同horizon+相同algorithmVersion"）。写入前必须先查询是否已存在同`predictionId`的记录，存在则拒绝新建（返回已有记录，不覆盖，不追加重复项）。
 
-### 8.3 `schemaVersion` 与迁移
+### 8.3 `schemaVersion`、迁移与存储保留策略（P0-5，CEO已冻结裁决，取代draft-1"约1500条优先淘汰已完成旧快照"方案）
 
-`ForecastSnapshot`存储对象增加顶层`schemaVersion: 'v1.4-forecastsnapshot-1'`字段（不在GMKG总架构接口定义内，是存储层元数据，供未来字段增删时的迁移判据，做法比照`V1_2_FORECAST_SPEC.md`已确立的`ForecastLogEntry.schemaVersion`模式）。`ForecastOutcomeEvent`存储对象同样增加`schemaVersion: 'v1.4-outcomeevent-1'`。迁移函数/损坏数据默认拒绝/最大存储量/超限处理/JSON导出的具体实现规则见`V1_4_CODEX_IMPLEMENTATION_TASK.md`（本文档只声明"必须有"，不重复定义"怎么写代码"）。
+**背景**：draft-1曾设计"存储超过约1500条时优先淘汰已完成回填、时间最早的`ForecastSnapshot`"这一自动淘汰机制。CEO本轮裁决**撤销**此设计——`ForecastSnapshot`/`ForecastOutcomeEvent`/`ProxyTransitionRecord`/`ErrorAttribution`是**验证审计证据**，不是可随意轮转的缓存数据，不能为了腾出存储空间而静默销毁历史验证链路的一部分。
 
-**红线**：损坏数据默认**拒绝**写入/读取（不静默容忍脏数据）；**不得静默删除未验证的预测**（`ForecastOutcomeEvent`尚未回填的`ForecastSnapshot`，超出存储上限时必须先淘汰**已完成回填**、时间最早的记录，不得优先淘汰未回填记录）；**不得用结果覆盖原始预测**（GMKG总架构§10.1核心红线的重申）。
+`ForecastSnapshot`存储对象增加顶层`schemaVersion: 'v1.4-forecastsnapshot-1'`字段（不在GMKG总架构接口定义内，是存储层元数据，供未来字段增删时的迁移判据，做法比照`V1_2_FORECAST_SPEC.md`已确立的`ForecastLogEntry.schemaVersion`模式）。`ForecastOutcomeEvent`存储对象同样增加`schemaVersion: 'v1.4-outcomeevent-1'`。
+
+**冻结规则（红线）**：
+
+1. **不得自动删除任何已经进入验证链路的历史记录**——`ForecastSnapshot`/`ForecastOutcomeEvent`/`ProxyTransitionRecord`/`ErrorAttribution`一旦写入，只能通过用户主动、明确的操作删除（如显式的"清空历史"二次确认，且该操作本身超出V1.4本轮范围，本文档不定义此类操作），**不存在**任何"容量超限自动淘汰"的代码路径；
+2. **不得出现孤儿数据**——不得出现"存在`ForecastOutcomeEvent`但对应`predictionId`的`ForecastSnapshot`已被删除"，也不得出现"`ForecastSnapshot`本应被回填但因存储策略被意外整体移除"这类不完整验证链路的情形；
+3. **写入必须是事务式/原子式语义**——单次写入操作（无论是新增`ForecastSnapshot`还是追加`ForecastOutcomeEvent`/`ProxyTransitionRecord`/`ErrorAttribution`）**要么全部成功，要么全部不写**，禁止出现"这条记录写了一半""关联的几张表只有部分更新成功"的部分写入状态；
+4. **遇到`QuotaExceededError`或容量预警时**：
+   - **保留全部已有数据**，不得为腾出空间而删除任何既有记录；
+   - 设置顶层状态 `storageHealth = 'STORAGE_BLOCKED'`；
+   - **停止创建新的`ForecastSnapshot`**（新的24H/72H预测生成请求直接返回阻塞结果，不尝试写入、不静默丢弃请求本身，需明确告知"存储已满"这一原因）；
+   - UI**必须**明确提示用户"存储空间已满，请先导出JSON备份"（具体文案由`V1_4_CODEX_IMPLEMENTATION_TASK.md`/UI实现阶段定稿，语义不得偏离"先备份、不得清空"）；
+   - **不得**通过删除旧证据来让系统"继续正常运行"——`storageHealth='STORAGE_BLOCKED'`是一个需要用户干预（导出+可能的主动清理）才能解除的状态，不是系统自动恢复的状态；
+5. **JSON导出必须包含可以恢复完整验证链路的全部相关对象**——导出内容至少覆盖`ForecastSnapshot`/`ForecastOutcomeEvent`/`ProxyTransitionRecord`/`ErrorAttribution`四类记录的全集，导出文件本身即是"验证链路的完整快照"，具备离线恢复能力；
+6. **V1.4明确定位为短期本地原型**——当前`localStorage`存储方案的容量限制是**已知且被接受**的短期局限，长期历史存储能力（不受浏览器`localStorage`容量约束）**推迟到**未来版本的`IndexedDB`本地存储或GMKG总架构§16.3定义的服务器架构，V1.4阶段不因为"localStorage太小"就违反§8.3第1-4条红线去做妥协；
+7. 迁移函数（`schemaVersion`不匹配时的字段补齐）与损坏数据默认拒绝的具体实现规则见`V1_4_CODEX_IMPLEMENTATION_TASK.md`（本文档只声明"必须有""必须遵守以上红线"，不重复定义"怎么写代码"）。
+
+**红线（重申）**：损坏数据默认**拒绝**写入/读取（不静默容忍脏数据）；**不得用结果覆盖原始预测**（GMKG总架构§10.1核心红线的重申）；**不得静默删除任何验证审计证据**（本节核心新增红线，取代draft-1的自动淘汰设计）。
 
 ### 8.4 `dataVintageRefs` 具体填充
 
@@ -426,9 +505,36 @@ sourceId = 'binance-spot-rest'
 sourceRef = 'binance-spot-klines'（唯一权威采集所有者标识，供未来接入其他数据源时的§6.4数据所有权表复用）
 ```
 
+### 8.4a `KlineWindowRef`：完整输入窗口审计引用（红线，P1-3新增，取代"每symbol/timeframe只保存一条DataVintageRef"的不足）
+
+**背景**：`DataVintageRef`（§8.4）只对每个`symbol`/`timeframe`记录**一根**已收盘K线的版本信息，无法证明EMA/ATR/Swing等衍生特征实际使用了**哪一段**历史K线序列——这些特征通常需要回看20/50根甚至更多历史K线（如`recentHigh50`/`swingHighs`），仅凭单根K线的`vintageId`不足以支撑"未来复现"或"审计追溯"。CEO本轮冻结新增`KlineWindowRef`结构，专门解决"输入窗口"的可审计性问题：
+
+```ts
+interface KlineWindowRef {
+  symbol: 'BTCUSDT' | 'ETHUSDT';
+  timeframe: '15m' | '1h' | '4h';
+  firstOpenTime: number;             // 窗口内第一根（最早）K线的openTime
+  lastCloseTime: number;              // 窗口内最后一根（最新，即referenceBar对应周期那根）K线的closeTime
+  closedBarCount: number;             // 窗口内已收盘K线总数
+  firstBarKey: string;                // 窗口内第一根K线的barKey（见GMKG总架构§10.1 BarRef.barKey格式）
+  lastBarKey: string;                 // 窗口内最后一根K线的barKey
+  contentHash: string;                // 覆盖窗口内全部K线（按序）实际参与特征计算的内容哈希，见下方规则
+  source: 'BINANCE_SPOT';
+  fetchedAt: number;                  // 本次实际拉取/组装该窗口的时间
+}
+```
+
+**冻结规则（红线）**：
+
+1. 每条`ForecastSnapshot`固定包含**六个**`KlineWindowRef`（`ETH`+`BTC` × `15m`/`1h`/`4h`，字段名建议`klineWindowRefs: KlineWindowRef[]`，长度恒为6）；
+2. `contentHash`**必须**覆盖实际参与特征计算的、按时间顺序排列的K线内容（至少含每根K线的`openTime`/`closeTime`/`open`/`high`/`low`/`close`/`volume`），不得只对"窗口边界"（首尾各一根）计算哈希而假装覆盖了中间内容；
+3. **必须只包含已收盘K线**——窗口构造时若混入未收盘K线（如实时价格所在的进行中K线），视为违反本节红线，`KlineWindowRef`不得包含它；
+4. `ForecastSnapshot`**继续保留**`featureValuesUsed`（实际特征数值）与`featureEngineVersion`（§6输出字段表已定义），`KlineWindowRef`是**新增的补充审计层**，回答"这些特征数值是从哪一段原始K线序列算出来的"，不替代`featureValuesUsed`（后者是"算出来的结果"，前者是"算这个结果用的原始输入范围及其内容指纹"），也不替代`referenceBarRef`/`targetBarRef`（后两者是24H/72H路径定位的定盘K线引用，`KlineWindowRef`是特征计算的输入窗口引用，二者服务于不同目的，不得互相替代）；
+5. **确定性要求**：相同的输入窗口（同一段K线序列）必须产生相同的`contentHash`；窗口内**任意**一根参与计算的K线内容发生变化（无论是新增、缺失还是数值修订），`contentHash`必须相应改变——这是`contentHash`作为审计指纹的存在意义，若无法保证这一点则不得声称已实现`KlineWindowRef`。
+
 ### 8.5 `featureValuesUsed`/`contentHash`
 
-`featureValuesUsed`固定包含：`e4`/`e1`的§4.1输入特征清单全部字段的实际数值快照（不是引用）、`directionThreshold`计算所用的`基准ATR`值、`referencePrice`。`contentHash` = 对`featureValuesUsed`+`algorithmVersion`+`weightVersion`+`datasetVersion`四者JSON序列化后取SHA-256（具体哈希算法由`V1_4_CODEX_IMPLEMENTATION_TASK.md`确定实现方式，本文档只冻结"用于计算hash的输入集合"）。
+`featureValuesUsed`固定包含：`e4`/`e1`的§4.1输入特征清单全部字段的实际数值快照（不是引用）、`volatilityUnit`计算所用的`e4.atr14`值（见§7.1，取代draft-1"基准ATR"的模糊表述——本轮起`directionThreshold`公式基准明确为4小时ATR，不是15分钟ATR）、`referencePrice`。`ForecastSnapshot.contentHash`（快照级，区别于§8.4a`KlineWindowRef.contentHash`——窗口级）= 对`featureValuesUsed`+`algorithmVersion`+`weightVersion`+`datasetVersion`四者JSON序列化后取SHA-256（具体哈希算法由`V1_4_CODEX_IMPLEMENTATION_TASK.md`确定实现方式，本文档只冻结"用于计算hash的输入集合"）。
 
 ---
 
@@ -479,20 +585,28 @@ V1.4 `ForecastOutcomeEvent`回填时，`pathDataComplete`九项不变量、`endp
 - GMKG（V1.4的24H/72H预测）只提供背景展示，不能补发交易许可；
 - `readinessLevel`/`readinessCeiling`只由§12.1定义的预测证据/数据质量/时间尺度/历史校准状态决定，**不读取任何账户余额、保证金、冷却期、回撤锁定状态**——V1.4的24H/72H`ActionPermission`生成函数在设计上不接受账户对象作为输入参数，从函数签名层面杜绝账户状态影响`readinessLevel`的可能性（比GMKG总架构§11.4的"红线约束"更进一步的工程落地方式，具体签名见`V1_4_CODEX_IMPLEMENTATION_TASK.md`）。
 
-### 12.3 `fusionStateAtGeneration`/`fusionState` 取值（V1.4具体规则）
+### 12.3 `fusionStateAtGeneration`/`fusionState` 取值（红线，CEO已冻结裁决，P0-1，取代draft-1的S0-S7标签借用方案）
 
-V1.4阶段广度眼未真实运行，无法产生真正的融合裁决（GMKG总架构§9冲突裁决场景1-4均要求`environmentPermission`等广度眼输出作为输入）。V1.4 `fusionState`**直接等于**`proxyState`对应的方向倾向映射（不产生`'CONFLICTED'`）：
+**背景**：draft-1曾把`fusionState`映射为`'S2_BULL_EXPANSION'`/`'S0_ACCUMULATION'`/`'S4_DISTRIBUTION'`/`'S5_BEAR_EXPANSION'`/`'S6_CAPITULATION'`等**正式状态命名**，即使附有"仅作展示标签"的免责声明，仍构成"代理判断冒充正式状态"的实质风险——用户看到字面命名即可能望文生义。CEO本轮已裁决**彻底废除**这一借用方案，不留任何过渡态或折衷方案。
 
+**冻结规则（红线，逐条不得违反）**：
+
+1. V1.4只运行`PRICE_ONLY_MODE`（`INSUFFICIENT_DATA`时不产生本节任何字段，见§3.1）；
+2. `TargetState.primaryState`恒为`'UNKNOWN'`（GMKG总架构§7.0a既有红线，本节重申）；
+3. **`fusionState`恒为`'UNKNOWN'`**——不借用`S0_ACCUMULATION`...`S7_REPAIR_RANGE`中任何一个，也不使用`'CONFLICTED'`；
+4. **`fusionStateAtGeneration`恒为`'UNKNOWN'`**（`ForecastSnapshot`快照字段，与上一条同步冻结）；
+5. V1.4的24H/72H预测输出中，唯一携带方向倾向信息的字段是`proxyState`（`PriceOnlyStateId`，`PO_*`枚举）与`scenarioWeights`（规则型情景权重），`fusionState`/`primaryState`不承载任何方向信息；
+6. **不得用`'CONFLICTED'`代替`'UNKNOWN'`**——`'CONFLICTED'`（GMKG总架构§9场景4）的语义是"广度眼/精度眼/单眼三方证据经融合中枢综合后发现互相矛盾"，这要求三方**都已真实运行**且产生了可比较的输出；V1.4广度眼根本未运行，不存在"三眼发生冲突"这一事实，用`'CONFLICTED'`描述"某只眼没开"是语义误用，必须用`'UNKNOWN'`（"未评估"）而非`'CONFLICTED'`（"评估后发现冲突"）；
+7. **不得新增任何"伪正式状态"**——不得发明新的展示态枚举值试图变相恢复方向标签借用的效果（如"`S2_LIKE`""`BULL_STRUCTURE_TAG`"等），`fusionState`字段值空间在V1.4阶段实质上是单一常量`'UNKNOWN'`；
+8. **不得修改`GMKG_DRAGONFLY_ARCHITECTURE.md`里的正式类型**——`FusionStateId`/`TargetStateId`/`FormalStateId`的类型定义本身不变，本节只冻结"V1.4阶段这些类型的字段在实践中恒取哪个值"，不改变类型的可能取值范围；
+9. **UI必须展示固定文案**："**融合状态：未评估（广度眼未运行）**"——与`proxyState`/`operatingMode='PRICE_ONLY_MODE'`/`primaryState='UNKNOWN'`同一视觉区块展示，不得省略、不得改写措辞、不得降低视觉权重使其难以被注意到；
+10. `ForecastSnapshot.fusionStateAtGeneration`/`ForecastResult.fusionState`/示例JSON/`V1_4_CODEX_IMPLEMENTATION_TASK.md`/`V1_4_ACCEPTANCE_TESTS.md`/`V1_4_ARCHITECTURE_REVIEW.md`必须同步体现本节规则，不得任何一处遗留旧的S0-S7映射表述（见本文档变更记录与`V1_4_ARCHITECTURE_REVIEW.md`本轮P0/P1关闭表）。
+
+```ts
+// V1.4阶段实际类型收窄（不修改GMKG总架构定义本身，只是V1.4运行时的实际取值范围）：
+fusionState: 'UNKNOWN'            // FusionStateId类型不变，V1.4运行时恒取此值
+fusionStateAtGeneration: 'UNKNOWN'
 ```
-fusionState = 
-  proxyState ∈ {PO_BREAKOUT_UP_STRUCTURE, PO_TREND_UP_STRUCTURE} → 'S2_BULL_EXPANSION'（仅作展示标签借用，不代表FULL_STATE_MODE正式判定，见下方红线）
-  proxyState ∈ {PO_BREAKDOWN_STRUCTURE, PO_TREND_DOWN_STRUCTURE} → 'S5_BEAR_EXPANSION'
-  proxyState ∈ {PO_RANGE_LOW_STRUCTURE, PO_RANGE_RECOVERY_STRUCTURE, PO_UNKNOWN} → 'S0_ACCUMULATION'（占位，不代表正式积累判定）
-  proxyState === PO_STALL_HIGH_STRUCTURE → 'S4_DISTRIBUTION'（占位）
-  proxyState === PO_SHARP_DROP_STRUCTURE → 'S6_CAPITULATION'（占位）
-```
-
-**红线（必须在UI/日志中同时展示，防止误导）**：此处`fusionState`借用`FusionStateId`枚举值**仅作展示标签**，**必须**在同一UI区域/同一日志记录中**同时**展示`operatingMode='PRICE_ONLY_MODE'`与`targetState.primaryState='UNKNOWN'`，明确告知用户这是"基于价格结构代理推断的展示标签，不是GMKG总架构定义的正式八状态判定"。若`V1_4_ARCHITECTURE_REVIEW.md`审查认为这一借用方式仍有误导风险，应改为定义`fusionState = 'CONFLICTED'`恒定占位或专门的过渡展示值，具体裁决见该文档。
 
 ---
 
@@ -504,7 +618,7 @@ V1.4的`ForecastSnapshot`/`ForecastOutcomeEvent`/`ErrorAttribution`记录，是`
 
 ## 14. 禁止事项清单（V1.4全文强制，汇总）
 
-不得声称已接入§2.2列出的任何数据；不得在`PRICE_ONLY_MODE`下输出S0-S7正式状态或`FormalTransitionRecord`；不得使用暗示衍生品/链上/新闻数据的措辞；不得让`calibratedProbabilities`在V1.4阶段非null；不得让`scenarioWeights`三项之和不为100或含非法数值；不得让`readinessLevel`超过`'ALLOW_TEST'`（`readinessCeiling`红线）；不得让账户状态影响`readinessLevel`；不得创建`WATCHLIST`/`EXECUTABLE`或调用四个交易门控函数；不得用24H/72H结果覆盖既有15m/1h/4h预测日志；不得静默删除未回填的预测快照；不得用结果覆盖`ForecastSnapshot`原始字段；不得在数据不完整时对路径类指标填0或近似值；不得连接真实交易账户、读取API密钥、发送真实订单。
+不得声称已接入§2.2列出的任何数据；不得在`PRICE_ONLY_MODE`下输出S0-S7正式状态或`FormalTransitionRecord`；不得使用暗示衍生品/链上/新闻数据的措辞；不得让`fusionState`/`fusionStateAtGeneration`借用S0-S7或`CONFLICTED`标签（§12.3红线，恒为`'UNKNOWN'`）；不得用未经服务器时间校正的本地`Date.now()`判定K线已收盘、不得用"本地时间减安全边际"作为替代方案（§3.0红线）；服务器时间不可用时不得猜测`referenceBar`或沿用旧预测时间，必须`DATA_BLOCKED`并fail closed；不得把价格剧烈波动直接归因为`exogenous_shock`（该值在V1.4恒为`NOT_EVALUABLE`，见`V1_4_HISTORICAL_VALIDATION_SPEC.md`§5.1/§5.2a）；不得让`calibratedProbabilities`在V1.4阶段非null；不得让`scenarioWeights`三项之和不为100或含非法数值；不得让`readinessLevel`超过`'ALLOW_TEST'`（`readinessCeiling`红线）；不得让账户状态影响`readinessLevel`；不得创建`WATCHLIST`/`EXECUTABLE`或调用四个交易门控函数；不得用24H/72H结果覆盖既有15m/1h/4h预测日志；**不得静默删除任何已进入验证链路的历史记录**（`ForecastSnapshot`/`ForecastOutcomeEvent`/`ProxyTransitionRecord`/`ErrorAttribution`，§8.3红线，取代此前"淘汰已完成旧快照"的表述）；不得允许部分写入或产生孤儿数据；存储超限时不得继续删除数据维持运行，必须`storageHealth='STORAGE_BLOCKED'`并停止生成新预测；不得用结果覆盖`ForecastSnapshot`原始字段；不得在数据不完整时对路径类指标填0或近似值；不得连接真实交易账户、读取API密钥、发送真实订单。
 
 ---
 
@@ -513,3 +627,4 @@ V1.4的`ForecastSnapshot`/`ForecastOutcomeEvent`/`ErrorAttribution`记录，是`
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.4-spec-draft-1 | 2026-07-18 | 初稿：基于`GMKG_DRAGONFLY_ARCHITECTURE.md`（main@a3d7aea）确立V1.4核心规范，冻结PO_*九状态具体判定规则、24H/72H时间尺度与Binance边界实测结论、directionThreshold口径、scenarioWeights归一化算法、predictionId生成与去重、ActionPermission填值规则、与既有15m/1h/4h展示关系 |
+| v1.4-spec-draft-2 | 2026-07-18 | CEO本轮冻结裁决：①§12.3彻底删除fusionState借用S0-S7标签的设计，恒为`'UNKNOWN'`，UI固定展示"融合状态：未评估"（P0-1）；②新增§3.0/§3.0.1服务器时间前置门禁，撤销"本地时间减安全边际"备选方案，服务器时间不可用时`DATA_BLOCKED`并fail closed（P0-2）；③重写§8.3存储保留策略，撤销"1500条优先淘汰已完成快照"设计，改为不删除历史+`storageHealth='STORAGE_BLOCKED'`+原子写入（P0-5）；④§7.1 `directionThreshold`公式改为4H已收盘ATR+平方根时间缩放，取代15分钟ATR固定倍数方案（P1-2）；⑤新增§8.4a `KlineWindowRef`六窗口审计引用结构（P1-3）；⑥核对`v1-core.js`源码后订正§4.1/§4.2三处`firstResistance`/`firstSupport`误用`.lower/.upper`的字段形状错误，改用`buildSRZones(e4)`结果；同步更新§6输出字段表、§14禁止事项清单 |

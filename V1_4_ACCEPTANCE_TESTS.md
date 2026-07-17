@@ -1,6 +1,6 @@
 # V1_4_ACCEPTANCE_TESTS.md — V1.4 验收测试
 
-版本：v1.4-tests-draft-1
+版本：v1.4-tests-draft-2（CEO本轮冻结裁决关闭P0-1至P0-5/P1-1至P1-4后同步更新，29个功能类别/112条为唯一权威总数）
 基线：`main` @ `a3d7aea`
 角色：本文档是 V1.4 验收测试的唯一权威清单，供未来 Codex 实施完成后逐条勾选。本轮**不创建任何测试代码**，只定义测试规范。每条测试包含：ID / 严重等级 / 前置条件 / 输入 / 步骤 / 预期结果 / 自动或人工 / 对应规范条款。
 
@@ -30,7 +30,9 @@
 | T3.1 | P0 | 需要网络 | `GET klines?symbol=ETHUSDT&interval=15m&limit=5` | 实测响应，计算`closeTime-openTime` | 恒等于`899999`（=900000-1） | 自动（联网） | V1_4_FORECAST_DATA_SPEC.md§5.3 |
 | T3.2 | P0 | 同上 | 相邻两根K线 | 计算`下一根openTime - 上一根closeTime` | 恒等于`1` | 自动（联网） | 同上 |
 | T3.3 | P1 | 需要网络 | `GET klines?symbol=BTCUSDT&interval=4h&limit=5` | 同T3.1方法应用于4h周期 | `closeTime-openTime`恒等于`14399999` | 自动（联网） | 同上 |
-| T3.4 | P0 | 需要网络；本地时钟人为调快2分钟（测试环境模拟） | 请求`GET /api/v3/time`获取Binance服务器时间，并与本地`Date.now()`对比 | 调用`referenceBar`选取逻辑 | "已收盘"判定必须以K线自身`closeTime`与**服务器时间**比较，不得使用本地`Date.now()`直接比较；本地时钟偏快场景下不得选中实际尚未真正收盘（相对服务器时间）的K线作为`referenceBar` | 自动（联网+时钟模拟） | V1_4_ARCHITECTURE_REVIEW.md P0-1 |
+| T3.4 | P0 | 需要网络；本地时钟人为调快2分钟（测试环境模拟） | 请求`GET /api/v3/time`获取Binance服务器时间，并与本地`Date.now()`对比 | 调用`referenceBar`选取逻辑 | "已收盘"判定必须以K线自身`closeTime`与`(Date.now()+offset)`（服务器时间坐标系）比较，不得使用未经偏移校正的`Date.now()`直接比较；本地时钟偏快场景下不得选中实际尚未真正收盘（相对服务器时间）的K线作为`referenceBar` | 自动（联网+时钟模拟） | V1_4_FORECAST_DATA_SPEC.md§3.0 |
+| T3.5 | P0 | 模拟`GET /api/v3/time`请求失败/超时 | 网络异常mock | 调用`buildForecastSnapshot`生成流程 | 返回`DATA_BLOCKED`，`generationBlockedReason='SERVER_TIME_UNAVAILABLE'`；不产生新`ForecastSnapshot`；不沿用上一次`referenceBarRef`/`generatedAt`；不产生`operatingMode`判断 | 自动（mock） | V1_4_FORECAST_DATA_SPEC.md§3.0/§3.0.1 |
+| T3.6 | P1 | — | 检查代码中是否存在"本地时间减安全边际"的实现路径 | 全文代码审查 | 不存在此路径（该方案已被CEO撤销，不是合法实现选项） | 人工代码审查 | V1_4_FORECAST_DATA_SPEC.md§3.0第5点 |
 
 ## T4. `PRICE_ONLY_MODE` 与 `primaryState=UNKNOWN`
 
@@ -180,7 +182,12 @@
 |---|---|---|---|---|---|---|---|
 | T21.1 | P1 | 构造旧`schemaVersion`数据 | — | 调用`load*`函数 | 自动迁移补齐字段，写回新版本 | 自动 | V1_4_CODEX_IMPLEMENTATION_TASK.md§4.1 |
 | T21.2 | P0 | 构造损坏JSON（非法语法/关键字段类型错误） | — | 调用`load*`函数 | 默认拒绝，返回空集合，不抛未捕获异常 | 自动 | 同上 |
-| T21.3 | P1 | 存储条数超过上限 | 新增记录 | 触发容量控制 | 优先淘汰已完成回填、时间最早的记录，未回填记录不被淘汰 | 自动 | V1_4_FORECAST_DATA_SPEC.md§8.3 |
+| T21.3 | P0 | 模拟`QuotaExceededError`（存储写满） | 尝试新增记录 | 触发容量异常处理 | **不删除任何既有记录**；`storageHealth`置为`'STORAGE_BLOCKED'`；已有全部数据保持不变 | 自动（mock） | V1_4_FORECAST_DATA_SPEC.md§8.3（P0-5，取代draft-1"优先淘汰已完成旧快照"方案） |
+| T21.4 | P0 | `storageHealth='STORAGE_BLOCKED'` | 请求生成新的24H/72H`ForecastSnapshot` | 调用外层持久化生成函数 | 拒绝写入，返回明确的阻塞原因，**不产生**新记录，不静默丢弃请求 | 自动 | 同上 |
+| T21.5 | P0 | 模拟"关联表写入中途失败"（如`ForecastSnapshot`写入成功后`ProxyTransitionRecord`写入失败） | — | 调用`persistForecastBundleAtomically` | 要么两者都成功持久化，要么两者都不写入；**不产生**只有其中一个成功的孤儿状态 | 自动（mock） | V1_4_FORECAST_DATA_SPEC.md§8.3第3-4点 |
+| T21.6 | P0 | 检查现有全部`ForecastOutcomeEvent`记录 | — | 逐条核对`predictionId`是否存在对应`ForecastSnapshot` | 100%存在，不出现"只有Outcome没有Snapshot"的孤儿记录 | 自动 | 同上 |
+| T21.7 | P1 | `storageHealth='STORAGE_BLOCKED'`后 | 触发JSON导出 | 调用导出函数 | 导出内容包含阻塞前**全部**`ForecastSnapshot`/`ForecastOutcomeEvent`/`ProxyTransitionRecord`/`ErrorAttribution`记录，无缺失 | 自动 | V1_4_FORECAST_DATA_SPEC.md§8.3第5点 |
+| T21.8 | P2 | `storageHealth='STORAGE_BLOCKED'` | 检查UI | 人工查看页面提示 | 明确展示"存储空间已满，请先导出JSON备份"字样 | 人工 | V1_4_CODEX_IMPLEMENTATION_TASK.md§4.2 |
 
 ## T22. JSON/CSV 导出安全
 
@@ -231,7 +238,32 @@
 |---|---|---|---|---|---|---|---|
 | T27.1 | P1 | — | `attributeError`函数源码 | 静态审查函数实现 | 判定逻辑（§5.1对照表）以常量/固定映射表形式存在，不存在依据运行时输入动态改写判定规则本身的代码路径（区别于"依据输入选择已冻结规则的分支"这一正常行为） | 人工代码审查 | V1_4_HISTORICAL_VALIDATION_SPEC.md§5.3 |
 | T27.2 | P1 | — | `attributionRuleVersion`字段 | 检查生成的`ErrorAttribution`记录 | 恒为`'v1.4-attribution-rule-1'`（当前唯一版本），历史记录中不出现同版本号对应不同判定结果的情况 | 自动 | 同上 |
-| T27.3 | P1 | — | `notEvaluableCauses`字段 | 检查V1.4阶段生成的全部`ErrorAttribution`记录 | 均包含`V1_4_HISTORICAL_VALIDATION_SPEC.md`§5.1标注"否，标注NOT_EVALUABLE"的全部枚举值（`environment_misread`/`formal_transition_misread`/`fusion_weight_error`/`action_permission_error`/`execution_or_risk_param_error`，`data_revision`视当前是否触发而定） | 自动 | 同上 |
+| T27.3 | P1 | — | `notEvaluableCauses`字段 | 检查V1.4阶段生成的全部`ErrorAttribution`记录 | 均包含`V1_4_HISTORICAL_VALIDATION_SPEC.md`§5.1标注"否，标注NOT_EVALUABLE"的全部枚举值（`environment_misread`/`formal_transition_misread`/`fusion_weight_error`/`action_permission_error`/`execution_or_risk_param_error`/**`exogenous_shock`**，`data_revision`视当前是否触发而定） | 自动 | 同上 |
+| T27.4 | P0 | 构造评估窗口内出现远超`directionThreshold`数倍的单向剧烈波动 | 极端价格路径 | 调用`attributeError` | `primaryCause`/`secondaryCauses`**均不得**出现`'exogenous_shock'`；`'exogenous_shock'`必须出现在`notEvaluableCauses`中 | 自动 | V1_4_HISTORICAL_VALIDATION_SPEC.md§5.1/§5.2a（P0-4） |
+| T27.5 | P1 | 同上 | 同上 | 检查`unexplainedExtremeMove`字段 | 存在且为`true`，`observedMagnitude`/`thresholdMultiple`为具体数值；该字段不出现在`primaryCause`/`secondaryCauses`枚举取值范围内 | 自动 | 同上 |
+| T27.6 | P1 | — | 全部V1.4代码路径 | 全文关键词扫描`primaryCause`/`secondaryCauses`赋值逻辑 | 不存在任何把`'exogenous_shock'`赋给`primaryCause`/`secondaryCauses`的代码路径 | 人工代码审查 | 同上 |
+
+## T28. `effectiveSampleCount` 标准区间调度算法（确定性，对应P0-3）
+
+| ID | 严重等级 | 前置条件 | 输入 | 步骤 | 预期结果 | 自动/人工 | 规范条款 |
+|---|---|---|---|---|---|---|---|
+| T28.1 | P0 | 构造固定样本集合（含人工可推算的重叠/不重叠targetStartTime/targetEndTime组合） | 5条ETH-24h样本，已知重叠关系 | 调用`computeEffectiveSampleCount` | 选中结果与人工按§3.2算法逐步推算的结果**完全一致**（含确定性排序） | 自动 | V1_4_HISTORICAL_VALIDATION_SPEC.md§3.2 |
+| T28.2 | P0 | 构造`targetEndTime`相同但`targetStartTime`不同的两条样本 | — | 调用排序步骤 | 按`targetStartTime`升序打破并列，结果确定不含糊 | 自动 | 同上 |
+| T28.3 | P0 | — | 同一样本集合重复调用多次 | 比较多次调用结果 | 完全相同（算法本身无随机性、无隐藏状态） | 自动 | 同上 |
+| T28.4 | P0 | 构造ETH-24h与ETH-72h混合样本集合 | — | 调用函数并检查分组 | 24H/72H分别独立计算，不混用同一`effectiveSampleCount` | 自动 | V1_4_HISTORICAL_VALIDATION_SPEC.md§3.3 |
+| T28.5 | P1 | 同一批样本，分别以`directionEligibleForStatistics`与`pathEligibleForStatistics`为筛选字段调用 | — | 比较两次调用结果 | 两个`effectiveSampleCount`可以不同，互不覆盖，分别独立报告 | 自动 | V1_4_HISTORICAL_VALIDATION_SPEC.md§3.2第2步 |
+| T28.6 | P1 | — | 检查生成触发代码 | 静态审查24H/72H生成触发逻辑 | 24H触发间隔`>=4小时`，72H触发间隔`>=24小时`；不存在把72H改为每12小时触发的代码路径 | 人工代码审查 | V1_4_HISTORICAL_VALIDATION_SPEC.md§1.1（P1-4） |
+| T28.7 | P1 | 构造`effectiveSampleCount`低于§4门槛的场景 | — | 检查统计报告 | 明确展示"样本不足，仅供描述性参考"字样，不得省略或通过放宽筛选条件掩盖样本不足 | 自动+人工 | V1_4_HISTORICAL_VALIDATION_SPEC.md§4/§1.1 |
+
+## T29. 纯计算层与存储层隔离（对应P1-1）
+
+| ID | 严重等级 | 前置条件 | 输入 | 步骤 | 预期结果 | 自动/人工 | 规范条款 |
+|---|---|---|---|---|---|---|---|
+| T29.1 | P0 | — | `buildForecastSnapshot`函数签名 | 静态审查 | 不包含`storage`参数 | 人工代码审查 | V1_4_CODEX_IMPLEMENTATION_TASK.md§3.1 |
+| T29.2 | P0 | — | 相同的`instrument`/`horizon`/`referenceBarRef`/`targetBarRef`/`klineWindowRefs`/`decision`/`serverTimeInfo`/`algorithmVersion`输入，调用两次 | 比较两次输出 | 完全相同的`ForecastSnapshot`（含相同`contentHash`） | 自动 | 同上 |
+| T29.3 | P0 | — | 调用`buildForecastSnapshot`过程中mock/监控`localStorage`读写 | 执行调用 | 无任何`localStorage.getItem`/`setItem`调用发生 | 自动（mock监控） | 同上 |
+| T29.4 | P0 | — | `classifyProxyState`/`computeScenarioWeights`/`generatePredictionId`/`computeDirectionThreshold`/`computeKlineWindowRef`/`buildOutcomeEvent`函数签名 | 静态审查全部§3.1函数 | 均不包含`storage`参数 | 人工代码审查 | 同上 |
+| T29.5 | P1 | 同一`predictionId`已存在快照 | 重复调用生成编排函数`generateForecastSnapshotOrchestrated` | — | 幂等由`findForecastSnapshotByPredictionId`（持久化层）保证返回既有记录，`buildForecastSnapshot`本身被调用与否不影响最终返回同一记录 | 自动 | V1_4_CODEX_IMPLEMENTATION_TASK.md§3.3 |
 
 ---
 
@@ -241,7 +273,7 @@
 |---|---|
 | T1 未来数据泄漏与availableAt边界 | 3 |
 | T2 Vintage修订与已收盘K线判定 | 2 |
-| T3 Binance时间边界（真实REST） | 4 |
+| T3 Binance时间边界（真实REST+服务器时间校验） | 6 |
 | T4 PRICE_ONLY_MODE与primaryState=UNKNOWN | 3 |
 | T5 proxyState不冒充正式状态 | 3 |
 | T6 代理与正式统计隔离 | 3 |
@@ -259,16 +291,18 @@
 | T18 scenarioWeights合计100/NaN-Infinity拒绝 | 3 |
 | T19 calibratedProbability恒为null | 3 |
 | T20 ForecastSnapshot不可变/追加/幂等/去重 | 4 |
-| T21 Schema迁移/损坏/超限 | 3 |
+| T21 Schema迁移/损坏/超限/QuotaExceeded不删除历史/原子写入 | 8 |
 | T22 JSON/CSV导出安全 | 2 |
 | T23 ActionPermission显示专属 | 6 |
 | T24 V1.3.1回归/页面关闭限制 | 3 |
 | T25 API失败降级/真实REST/合成K线 | 3 |
 | T26 旧功能不回归汇总 | 4 |
-| T27 误差归因规则不可变性 | 3 |
-| **合计（27个功能类别）** | **90** |
+| T27 误差归因规则不可变性/exogenous_shock隔离 | 6 |
+| T28 effectiveSampleCount标准区间调度算法（确定性） | 7 |
+| T29 纯计算层与存储层隔离 | 5 |
+| **合计（29个功能类别）** | **112** |
 
-（初稿26个功能类别83条；对应`V1_4_ARCHITECTURE_REVIEW.md`独立复审发现的P0-1/P1-3两项测试缺口，追加T3.4与T27共4条，最终27个功能类别、90条为唯一权威总数。）
+（初稿26个功能类别83条；第二轮复审追加T3.4/T27共4条，累计27个功能类别90条；本轮（CEO冻结裁决P0-1至P0-5/P1-1至P1-4）追加T3.5/T3.6、T21.4-T21.8、T27.4-T27.6、T28全部7条、T29全部5条，累计**29个功能类别、112条为唯一权威总数**。）
 
 ---
 
@@ -277,3 +311,4 @@
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.4-tests-draft-1 | 2026-07-18 | 初稿：26个功能类别，共83条可执行/可判定测试用例，覆盖未来数据泄漏、PRICE_ONLY_MODE边界、路径完整性九不变量、nullable类型、两类统计分母、情景权重不变量、校准概率隔离、快照不可变性、ActionPermission显示专属隔离、V1.1-V1.3.1回归；同轮追加T3.4（referenceBar服务器时间校验）与T27（误差归因规则不可变性，3条），响应`V1_4_ARCHITECTURE_REVIEW.md`发现的P0-1/P1-3缺口，累计27个功能类别、90条为唯一权威总数 |
+| v1.4-tests-draft-2 | 2026-07-18 | CEO本轮冻结裁决P0-1至P0-5/P1-1至P1-4后同步更新：T3新增T3.5（服务器时间不可用fail closed）/T3.6（无本地时间减安全边际实现路径），T4.2更新排除S0-S7残留；T21新增T21.4-T21.8（QuotaExceeded不删除历史/原子写入/无孤儿记录/导出完整性/UI提示，对应P0-5）；T27新增T27.4-T27.6（exogenous_shock隔离，对应P0-4）；新增T28全部7条（effectiveSampleCount标准区间调度确定性算法，对应P0-3）；新增T29全部5条（纯计算层与存储层隔离，对应P1-1）；T15.4更新指向新directionThreshold公式（对应P1-2）；累计**29个功能类别、112条为唯一权威总数** |
