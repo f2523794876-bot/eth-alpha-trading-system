@@ -1,6 +1,6 @@
 # GMKG_DRAGONFLY_ARCHITECTURE.md — ETH Alpha GMKG「蜻蜓复眼」总架构规范
 
-版本：gmkg-draft-2（CEO复审关闭P0×4/P1×6后的修订版，见文末变更记录）
+版本：gmkg-draft-3（CEO第二轮复审关闭新P0×2/新P1×5后的修订版，见文末变更记录）
 基线：`main` @ `6a90a1e`（含 v1.3.1，PR #5 已合并，tag `v1.3.1` 存在）
 角色：本文档是 GMKG（下称「蜻蜓复眼架构」）的**顶层目标架构规范**，回答"这套系统未来应该长成什么样"，**不是**"v1.3.1 现在已经做到了什么"的声明。本轮**只交付本文档**，不修改任何 HTML/JS/测试/正式业务代码，不创建 V1.4 六份实施文档，不开始任何编码。
 
@@ -211,7 +211,7 @@ interface EventSnapshot {
 }
 ```
 
-**状态迁移必须记录真实经过时间（红线）**：`TransitionRecord`（§8.4）新增 `elapsedTimeMs` 字段，记录 `fromState` 判定时刻到 `toState` 判定时刻之间的**真实经过时间**，不得假设固定5分钟步长——一次事件触发的即时重算（`event-triggered forecast`）可能在远小于5分钟的时间内产生新的状态判定，若把它当作与常规5分钟帧等长的"一步"处理，会让迁移模型的时间尺度假设失真。
+**状态迁移必须记录真实经过时间（红线）**：`FormalTransitionRecord`/`ProxyTransitionRecord`（§8.4，两者均含此字段）新增 `elapsedTimeMs` 字段，记录 `fromState`/`fromProxyState` 判定时刻到 `toState`/`toProxyState` 判定时刻之间的**真实经过时间**，不得假设固定5分钟步长——一次事件触发的即时重算（`event-triggered forecast`）可能在远小于5分钟的时间内产生新的状态判定，若把它当作与常规5分钟帧等长的"一步"处理，会让迁移模型的时间尺度假设失真。
 
 ---
 
@@ -299,10 +299,11 @@ interface WorldState {
 **类型拆分（P1-1修订，红线）**：`TargetState.primaryState`/`secondaryState` **只能使用 `TargetStateId`（S0-S7 + `UNKNOWN`）**，**不得**包含 `CONFLICTED`——`CONFLICTED` 是融合中枢层面综合广度眼/精度眼/迁移三方之后才可能出现的判断（见§9场景4），不是精度眼单独判定目标自身状态时会用到的值，两者类型上必须分离：
 
 ```ts
-type TargetStateId =
+type FormalStateId =    // P0-NEW-1修订：拆出纯S0-S7子集，不含UNKNOWN，专供§8.4 FormalTransitionRecord使用
   | 'S0_ACCUMULATION' | 'S1_BREAKOUT_PREP' | 'S2_BULL_EXPANSION' | 'S3_OVERHEATED'
-  | 'S4_DISTRIBUTION' | 'S5_BEAR_EXPANSION' | 'S6_CAPITULATION' | 'S7_REPAIR_RANGE'
-  | 'UNKNOWN';   // 数据不足以给出任何S0-S7正式判定时使用（见§7.0a INSUFFICIENT_DATA/PRICE_ONLY_MODE规则），不是"第9个正式状态"
+  | 'S4_DISTRIBUTION' | 'S5_BEAR_EXPANSION' | 'S6_CAPITULATION' | 'S7_REPAIR_RANGE';
+
+type TargetStateId = FormalStateId | 'UNKNOWN';   // 数据不足以给出任何S0-S7正式判定时使用（见§7.0a INSUFFICIENT_DATA/PRICE_ONLY_MODE规则），'UNKNOWN'不是"第9个正式状态"
 
 type FusionStateId = TargetStateId | 'CONFLICTED';   // 仅融合中枢（§9/§13）使用，精度眼/单眼输出禁止使用此类型
 ```
@@ -559,21 +560,41 @@ P(S[t+1] = j | S[t] = i, X[t])
 3. 人工复核（对§7.5标记的低可能迁移，人工介入判断是否为真实转折或数据异常）；
 4. `calibratedProbability` 恒为 `null`（与 `V1_2_FORECAST_SPEC.md`§12"日志中`calibratedProbability`永远为null"红线完全同源，GMKG 延续而非重新发明这条规则）。
 
-### 8.4 迁移记录结构
+### 8.4 迁移记录结构（P0-NEW-1修订：正式迁移与代理迁移拆分为两个互不兼容的结构）
+
+**P0-NEW-1 red line 背景**：draft-2 的 `TransitionRecord.fromState/toState` 类型为 `TargetStateId`（含`UNKNOWN`），但§7.0a/§17.1已要求`PRICE_ONLY_MODE`下记录`PriceOnlyStateId`代理迁移——`PriceOnlyStateId`并不是`TargetStateId`的子集，两者类型不兼容，且draft-2曾写"记录UNKNOWN↔自身"这种无验证意义的占位迁移（一个状态到它自身、且是`UNKNOWN`这个非正式值，不携带任何可供未来校准的信息）。draft-3 起拆分为两个互斥结构，**并删除"UNKNOWN↔自身"这一设计**：
 
 ```ts
-interface TransitionRecord {
-  fromState: TargetStateId;          // P1-1修订：类型改为§6.3定义的TargetStateId（不含CONFLICTED，迁移只发生在真实目标状态之间）
-  toState: TargetStateId;
-  elapsedTimeMs: number;              // P1-3修订：fromState判定时刻到toState判定时刻的真实经过时间，不假设固定5分钟步长；event-triggered forecast（§4.5）产生的判定可能远小于常规帧间隔
-  transitionWeight: number;          // 规则型权重，0-100，非概率
+interface FormalTransitionRecord {
+  fromState: FormalStateId;           // 只能是S0-S7，不含UNKNOWN/CONFLICTED/PO_*（见§6.3 FormalStateId）
+  toState: FormalStateId;
+  elapsedTimeMs: number;               // 真实经过时间，见§4.5
+  transitionWeight: number;           // 规则型权重，0-100，非概率
   probabilityStatus: 'rule_based' | 'similarity_based' | 'calibrated';  // 见§8.5
   calibratedProbability: number | null;  // 未满足校准条件前恒为null，红线同§8.2
-  sampleSize: number | null;         // 历史相似状态支持度的样本数，rule_based模式下为null
-  calibrationVersion: string | null; // 对应哪一版校准流程产出，未校准为null
-  evidenceRefs: string[];            // 支持该迁移权重判断的证据引用
+  sampleSize: number | null;
+  calibrationVersion: string | null;
+  evidenceRefs: string[];
+  statsGroup: 'FULL_STATE_STATS';     // 固定值，只能由operatingMode='FULL_STATE_MODE'时的真实状态判定产生（见§7.0a）
+}
+
+interface ProxyTransitionRecord {
+  fromProxyState: PriceOnlyStateId;   // 只能是PriceOnlyStateId（见§6.3），字段名与FormalTransitionRecord区分（fromProxyState≠fromState），杜绝混淆
+  toProxyState: PriceOnlyStateId;
+  elapsedTimeMs: number;
+  transitionWeight: number;           // 规则型权重，同样非概率
+  probabilityStatus: 'rule_based' | 'similarity_based';  // 代理迁移不进入正式校准流程，不使用'calibrated'状态
+  calibratedProbability: null;        // 恒为null——代理迁移永远不产出正式校准概率，不是"未满足门槛暂时为null"，是结构性永久null
+  sampleSize: number | null;
+  evidenceRefs: string[];
+  statsGroup: 'PROXY_STATS';          // 固定值，只能由operatingMode='PRICE_ONLY_MODE'时产生
 }
 ```
+
+**红线（P0-NEW-1核心）**：
+1. `FormalTransitionRecord` 只能在 `operatingMode='FULL_STATE_MODE'` 时产生，进入 `FULL_STATE_STATS` 统计分组；`ProxyTransitionRecord` 只能在 `operatingMode='PRICE_ONLY_MODE'` 时产生，进入 `PROXY_STATS` 统计分组——**两个分组永不合并**，`ProxyTransitionRecord` 永远不得混入正式八状态迁移率或校准概率的分母（呼应§7.0a"代理状态不得混入未来FULL_STATE_MODE正式状态准确率分母"红线，本节是该红线在迁移记录层面的延伸）。
+2. **`operatingMode='INSUFFICIENT_DATA'` 时不生成任何迁移记录**（既不生成`FormalTransitionRecord`也不生成`ProxyTransitionRecord`）——数据不足以判断当前状态时，"状态之间发生了迁移"这一命题本身无法成立，不得记录。
+3. **删除"UNKNOWN↔自身"迁移设计**——`UNKNOWN`不是`FormalStateId`的成员，不会出现在`FormalTransitionRecord`中；`PRICE_ONLY_MODE`下也不存在"记录代理层面`UNKNOWN`到`UNKNOWN`的迁移"这种操作，因为`TargetState.primaryState`在该模式下恒为`UNKNOWN`只是"正式判定字段的占位值"，真正携带信息的是`proxyState`，迁移记录只围绕`proxyState`的变化（即`ProxyTransitionRecord`）展开，不围绕恒定不变的`primaryState='UNKNOWN'`展开。
 
 ### 8.5 `calibratedProbability` 由 `null` 变为数值的门槛（红线）
 
@@ -651,11 +672,21 @@ CONFLICTED和gateStatus='WAIT'本身就是合法的、且往往是最诚实的�
 
 **红线**：15m/1h/4h 是 V1.1/V1.2 **已经真实运行**的既有层级，GMKG **不重新定义、不修改**这三个既有时间尺度的算法或数据结构（呼应§1命名消歧的既有代码保护原则）。GMKG 新增的是 24H/72H 两个更长的推演尺度，二者**独立生成、独立验证**，且短期回撤与中期上涨可以同时成立、不强行合并为一个方向（呼应§9场景2）。
 
-### 10.1 `ForecastSnapshot` 与 `ForecastOutcomeEvent` 拆分（P0-2修订，唯一权威定义）
+### 10.1 `ForecastSnapshot` 与 `ForecastOutcomeEvent` 拆分（P0-2/P0-NEW-2/P1-NEW-3/P1-NEW-5修订，唯一权威定义）
 
-**P0-2 red line 背景**：draft-1 的 `LongHorizonForecastLog` 把"生成时就确定的预测内容"和"预测到期后才知道的实际结果"揉在同一个接口里、用一堆 `xxx: T | null` 字段占位，容易在实现时被误写成"原地更新同一条记录"，也没有明确定义方向判定规则、起止K线、MFE/MAE口径、去重幂等规则。draft-2 拆成两个独立对象，`ForecastSnapshot` 生成后**不可变**，`ForecastOutcomeEvent` 预测到期后**只追加、不覆盖**：
+**P0-2 red line 背景**：draft-1 的 `LongHorizonForecastLog` 把"生成时就确定的预测内容"和"预测到期后才知道的实际结果"揉在同一个接口里、用一堆 `xxx: T | null` 字段占位，容易在实现时被误写成"原地更新同一条记录"，也没有明确定义方向判定规则、起止K线、MFE/MAE口径、去重幂等规则。draft-2 拆成两个独立对象，`ForecastSnapshot` 生成后**不可变**，`ForecastOutcomeEvent` 预测到期后**只追加、不覆盖**。draft-3 进一步补上路径K线完整性（P0-NEW-2）、RANGE专属指标（P1-NEW-1）、区间覆盖细分（P1-NEW-2）、情景权重不变量（P1-NEW-3）、定盘K线的显式索引契约（P1-NEW-5）：
 
 ```ts
+interface BarRef {                     // P1-NEW-5新增：统一的K线引用结构，取代draft-2裸露的{symbol,timeframe,closeTime}
+  symbol: 'ETH' | 'BTC';
+  timeframe: '15m';
+  openTime: number;                    // ms epoch
+  closeTime: number;                   // ms epoch；与openTime的精确边界关系（是否openTime+timeframeMs-1）须在实现规范中统一，见§10.2红线
+  timeframeMs: number;                 // 固定900000（15分钟），显式携带以避免下游硬编码
+  sequenceIndex: number;               // 相对该ForecastSnapshot.referenceBarRef的相对序号：referenceBar自身=0，其后第1根=1，……第96/288根=targetBar，见§10.2
+  barKey: string;                      // 可复现的唯一标识，如 `${symbol}-15m-${closeTime}`，供缺口检测/去重使用
+}
+
 interface ForecastSnapshot {
   predictionId: string;                // 唯一标识，全系统的可复现锚点
   instrument: 'BTC' | 'ETH';
@@ -665,16 +696,17 @@ interface ForecastSnapshot {
   targetStartTime: number;             // 见§10.2起止时间定义
   targetEndTime: number;
   referencePrice: number;              // 生成时刻使用的已收盘K线收盘价，见§10.2
-  referenceBarRef: { symbol: 'ETH' | 'BTC'; timeframe: '15m'; closeTime: number };  // 起点定盘K线引用
-  targetBarRef: { symbol: 'ETH' | 'BTC'; timeframe: '15m'; closeTime: number };     // 终点定盘K线引用（生成时预先算好，供日后回填定位，见§10.2）
+  referenceBarRef: BarRef;             // 起点定盘K线引用，sequenceIndex恒为0
+  targetBarRef: BarRef;                // 终点定盘K线引用，sequenceIndex恒为96（24H）或288（72H），生成时预先算好，供日后回填定位
+  expectedBarCount: number;            // = 96（24H）或288（72H），目标路径应含的bar总数，见§10.5
   expectedDirection: 'UP' | 'DOWN' | 'RANGE';
   directionThreshold: number;          // 冻结的RANGE阈值，见§10.3
   targetStateAtGeneration: TargetStateId;      // 生成时刻的TargetState.primaryState快照（P1-1类型），供复现追溯
   fusionStateAtGeneration: FusionStateId;      // 生成时刻的融合状态快照
-  candidateTrajectories: TrajectoryScenarios;   // 见§11.2
-  scenarioWeights: { baseline: number; upside: number; downside: number };
+  candidateTrajectories: TrajectoryScenarios;   // 见§11.2（含P0-NEW-1的TransitionBundle）
+  scenarioWeights: { baseline: number; upside: number; downside: number };  // 见下方P1-NEW-3不变量
   probabilityStatus: 'rule_based' | 'similarity_based' | 'calibrated';
-  calibratedProbabilities: Record<string, number | null>;   // 未校准时全部为null，红线同§8.2/§8.5
+  calibratedProbabilities: Record<string, number | null>;   // 未校准时全部为null，红线同§8.2/§8.5；与scenarioWeights是两个不同字段，不得复用同一存储位置（见下方P1-NEW-3红线）
   expectedPriceZones: { baseline: [number, number]; upside: [number, number]; downside: [number, number] };
   triggerConditions: string[];
   invalidationConditions: string[];
@@ -693,68 +725,131 @@ interface ForecastOutcomeEvent {
   predictionId: string;                // 外键关联ForecastSnapshot，只读引用，不得反向修改被引用的Snapshot
   evaluatedAt: number;
   actualStartPrice: number;            // = referenceBarRef对应K线收盘价，理论上应等于ForecastSnapshot.referencePrice，评估时重新核对而非直接照抄，用于发现数据不一致
-  actualEndPrice: number;              // = targetBarRef对应K线收盘价
-  actualHigh: number;                  // targetStartTime到targetEndTime区间内的最高价（见§10.4 MFE/MAE定义）
-  actualLow: number;
-  actualReturn: number;                // = (actualEndPrice - referencePrice) / referencePrice，基准固定用ForecastSnapshot.referencePrice，不用actualStartPrice（见§10.3）
-  actualDirection: 'UP' | 'DOWN' | 'RANGE';
-  directionCorrect: boolean | null;    // dataComplete=false时恒为null，不参与统计
-  rangeCovered: boolean | null;        // actualEndPrice是否落在expectedPriceZones对应情景区间内；dataComplete=false时为null
-  mfe: number;                          // 见§10.4
-  mae: number;
+  actualEndPrice: number;              // = targetBarRef对应K线收盘价（仅endpointDataComplete=true时有意义，见下）
+  actualReturn: number;                // = (actualEndPrice - referencePrice) / referencePrice，基准固定用ForecastSnapshot.referencePrice（见§10.3）；仅endpointDataComplete=true时有意义
+  actualDirection: 'UP' | 'DOWN' | 'RANGE' | null;   // P0-NEW-2修订：endpointDataComplete=true时才可计算，否则null，不得填近似值
+  directionCorrect: boolean | null;    // directionEligibleForStatistics=false时恒为null，见下
+  // ---- 区间覆盖细分（P1-NEW-2修订，取代draft-2单一的rangeCovered） ----
+  endpointInBaselineZone: boolean | null;              // 终点actualEndPrice是否落在baseline情景区间内
+  endpointInAnyScenarioZone: boolean | null;           // 终点是否落入baseline/upside/downside任一冻结情景区间
+  realizedRangeInsideExpectedEnvelope: boolean | null; // actualLow与actualHigh是否均位于expectedEnvelope（见下）内，仅pathDataComplete=true时可计算
+  expectedEnvelopeTouched: boolean | null;             // 实际路径是否至少进入过expectedEnvelope，仅pathDataComplete=true时可计算
+  // ---- 路径类指标：仅pathDataComplete=true时非null（P0-NEW-2修订，禁止填0或近似值） ----
+  actualHigh: number | null;
+  actualLow: number | null;
+  mfe: number | null;                  // 见§10.4；expectedDirection='RANGE'时恒为null，见§10.4a
+  mae: number | null;
+  // ---- RANGE专属路径指标（P1-NEW-1新增，仅expectedDirection='RANGE'且pathDataComplete=true时非null） ----
+  upperExcursion: number | null;
+  lowerExcursion: number | null;
+  maxAbsoluteExcursion: number | null;
+  rangeBreachExcursion: number | null;
   invalidationTriggered: boolean;
-  dataComplete: boolean;               // targetBarRef等定位所需K线是否完整可得，见§10.5
-  eligibleForStatistics: boolean;      // = dataComplete && 无其他排除原因，见§10.5
-  exclusionReasons: string[];
+  // ---- 路径K线完整性（P0-NEW-2新增） ----
+  expectedBarCount: number;            // = ForecastSnapshot.expectedBarCount，冗余存一份供独立审计
+  observedBarCount: number;            // 评估时刻实际观测到的、目标路径内的bar数
+  missingBarRefs: BarRef[];            // 具体缺失的bar列表（sequenceIndex+barKey均需可辨识），不得只记数量
+  endpointDataComplete: boolean;       // 仅表示起点(referenceBarRef)与终点(targetBarRef)两根K线存在，不代表路径完整
+  pathDataComplete: boolean;           // 目标时间窗内全部expectedBarCount根K线均完整（= missingBarRefs.length===0）
+  pathEligibleForStatistics: boolean;  // = pathDataComplete && 无其他排除原因；MFE/MAE/区间覆盖类统计只能用此字段筛选后的样本
+  directionEligibleForStatistics: boolean;  // = endpointDataComplete && 无其他排除原因；方向准确率统计用此字段筛选，与pathEligibleForStatistics相互独立，不得混用
+  exclusionReasons: string[];          // 必须包含具体缺失bar的barKey/sequenceIndex引用，不得只写泛化原因
   evaluationVersion: string;           // 评估逻辑本身的版本号，独立于algorithmVersion（评估公式迭代不代表预测算法变化）
 }
 ```
 
 **红线（P0-2核心）**：`ForecastOutcomeEvent` **不得覆盖 `ForecastSnapshot`**——两者是两张独立的表/两类独立的不可变记录，只通过 `predictionId` 关联查询，任何实现代码都不允许"回填结果时顺便改写快照里的字段"。
 
-### 10.2 目标起止时间与定盘K线（红线，统一口径）
+**红线（P0-NEW-2核心，数据不完整时禁止填0或近似值）**：
+- `endpointDataComplete` 只表示起点和终点两根K线存在，**不等于**路径完整；`pathDataComplete` 才表示目标时间窗内全部 `expectedBarCount` 根K线完整；
+- `actualDirection`/`actualReturn`/`directionCorrect` 可以在 `endpointDataComplete=true` 时计算（只需要起止两个点）；
+- `actualHigh`/`actualLow`/`mfe`/`mae`/RANGE专属四项/区间覆盖四项中依赖路径最高最低价的部分，**只有 `pathDataComplete=true` 才能计算**，否则**必须为 `null`**，**不得**填0或用起止两点近似代替真实的路径最高/最低价；
+- **不得只检查 `targetBarRef` 就声称"完整"**——`targetBarRef` 存在只保证 `endpointDataComplete` 的终点部分，`pathDataComplete` 必须逐根核对 `expectedBarCount` 根bar是否都在，缺一根都不算完整；
+- 正式的综合统计（方向×区间联合评估）分母要求 `pathDataComplete=true`；如果只需要保留"仅验证方向正确性"的样本，必须使用独立的 `directionEligibleForStatistics` 字段筛选，**不得**和 `pathEligibleForStatistics` 混用同一个分母；
+- `exclusionReasons` 必须记录具体缺失的bar（通过 `missingBarRefs` 的 `barKey`/`sequenceIndex`），不得只写"数据不完整"这类泛化文案。
+
+**情景权重不变量（P1-NEW-3新增，红线）**：`scenarioWeights.{baseline,upside,downside}` 必须满足：
+1. 三项均为有限数（`Number.isFinite`），**不允许** `NaN`、`Infinity`、负值；
+2. 每项取值范围 `[0, 100]`；
+3. 三项之和必须**恰好等于100**；允许计算过程中出现的极小浮点误差（如`99.9999997`），但必须在写入 `ForecastSnapshot` 前完成**归一化**（按比例缩放三项使之和为100）与**舍入**（四舍五入到整数或约定精度，舍入产生的余差记入权重最大的一项，避免"四舍五入后三项之和变成99或101"这一常见bug），具体归一化/舍入算法由实现规范冻结，本文档只规定"必须存在且必须保证和恒等于100"这一约束；
+4. `scenarioWeights` 是**规则型情景权重**，不是概率——`calibratedProbabilities` 是校准概率的**唯一合法载体**（见§8.2/§8.5），两者**不得共用同一字段**、不得互相复制赋值，`scenarioWeights` 未校准前后都不会变成概率，只有 `calibratedProbabilities` 会在满足§8.5门槛后从 `null` 变为数值。
+
+### 10.2 目标起止时间与定盘K线（红线，统一口径，P1-NEW-5修订）
 
 延续 `V1_2_FORECAST_SPEC.md`§12.1 已确立的"1 bar = 固定15分钟"传统，24H/72H 同样以15分钟K线为最小定位单位（24H = 96 bars，72H = 288 bars），不另立新的时间单位体系：
 
 ```
-targetStartTime = ForecastSnapshot.referenceBarRef 对应的15分钟K线收盘时间（即生成本次预测时最后一根已收盘K线的closeTime）
-targetEndTime（24H）= targetStartTime + 96×15分钟
-targetEndTime（72H）= targetStartTime + 288×15分钟
-targetBarRef = targetEndTime时刻对应的、已收盘的15分钟K线引用（生成快照时即可预先算出该指向哪一根未来K线，供评估阶段直接定位，不需要评估时重新推算）
-referencePrice = referenceBarRef对应K线的收盘价（不用生成时刻的"当前价"，理由与V1.1/V1.2既有的"必须用已收盘K线做正式判断"红线一致，防止用未收盘的盘中价格做基准）
+referenceBar = 预测生成时最后一根已收盘的15分钟K线，sequenceIndex恒为0
+targetStartTime = referenceBar的收盘时间（即targetStartTime与referenceBar的closeTime相同，是路径的起点锚，不是路径的第一个bar）
+目标路径 = referenceBar收盘后的下一根bar（sequenceIndex=1）开始，向后连续的bar序列
+  24H路径：sequenceIndex 1..96（含96根bar）
+  72H路径：sequenceIndex 1..288（含288根bar）
+targetBar = 目标路径的最后一根bar：24H时sequenceIndex=96，72H时sequenceIndex=288
+targetEndTime = targetBar的收盘时间
+referencePrice = referenceBar的收盘价（不用生成时刻的"当前价"，理由与V1.1/V1.2既有的"必须用已收盘K线做正式判断"红线一致，防止用未收盘的盘中价格做基准）
 ```
+
+**红线（P1-NEW-5核心）**：
+1. **不得把 `referenceBar`（`sequenceIndex=0`）重复计入目标路径**——目标路径是 `sequenceIndex 1..96/288`，不包含 `sequenceIndex=0`；`expectedBarCount=96`（或288）指的就是这个不含referenceBar的路径长度；
+2. **使用bar序号（`sequenceIndex`）定位优先于单纯毫秒加法**——实现时必须沿着实际的K线序列逐根前进（每一根bar的`openTime`应等于前一根bar的`closeTime`+1ms或按官方约定的边界关系，见下条），而不是仅凭"`targetStartTime + N×15分钟`"这个算术结果去盲目假设那个时间点必然存在一根bar——如果历史上该处发生过数据缺口，纯毫秒加法会静默定位到错误的、并不存在的时间点，而按`sequenceIndex`遍历真实序列能让缺口在遍历过程中被直接发现（对应§10.1 `missingBarRefs`的产生方式）；
+3. **UTC、`closeTime`端点及可能的1毫秒边界必须在实现规范中统一**——不同交易所/数据源对"K线收盘时间"的精确定义可能是`openTime+timeframeMs`或`openTime+timeframeMs-1`（Binance实际返回哪一种需要在`V1_4_CODEX_IMPLEMENTATION_TASK.md`或等价实施工单中用真实API响应核实并写死，本文档只标注这是一个必须显式约定、不得含糊假设的边界问题，不在架构层面替实现层做出选择）。
 
 ### 10.3 方向判定规则（`UP`/`DOWN`/`RANGE`，红线，必须版本冻结）
 
 ```
-actualReturn = (actualEndPrice − ForecastSnapshot.referencePrice) / ForecastSnapshot.referencePrice
+actualReturn = (actualEndPrice − ForecastSnapshot.referencePrice) / ForecastSnapshot.referencePrice   （仅endpointDataComplete=true时计算）
 
 UP：   actualReturn >= +directionThreshold
 DOWN： actualReturn <= −directionThreshold
 RANGE：−directionThreshold < actualReturn < +directionThreshold
 
 expectedDirection 使用同一套规则、同一个directionThreshold，在生成ForecastSnapshot时由算法预先给出（不是评估时才决定）
-directionCorrect = (dataComplete === true) ? (actualDirection === expectedDirection) : null
+directionCorrect = (directionEligibleForStatistics === true) ? (actualDirection === expectedDirection) : null
 ```
 
 **`directionThreshold` 如何冻结（红线）**：`directionThreshold` 的口径（相对 `referencePrice` 的固定百分比，或相对生成时刻ATR的倍数）**必须**在 `algorithmVersion` 冻结的同一时刻一并选定并写入版本说明，**不得**在同一算法版本内动态调整阈值口径或数值；未来若认为阈值需要调整，必须递增 `algorithmVersion`（呼应`V1_2_FORECAST_SPEC.md`§12.2版本号红线的同一纪律，不重复发明新规则）。
 
-### 10.4 MFE/MAE 计算口径（红线，相对 `referencePrice` 与 `expectedDirection`）
+### 10.4 MFE/MAE 计算口径（红线，相对 `referencePrice` 与 `expectedDirection`，P1-NEW-1修订：RANGE不再借用方向语义的MFE/MAE）
 
 ```
-若 expectedDirection = 'UP'：
+若 expectedDirection = 'UP'（仅pathDataComplete=true时计算，否则mfe/mae为null）：
   mfe = (actualHigh − referencePrice) / referencePrice   （最大有利：价格向上偏离基准的最大幅度）
   mae = (referencePrice − actualLow) / referencePrice    （最大不利：价格向下偏离基准的最大幅度）
-若 expectedDirection = 'DOWN'：
+若 expectedDirection = 'DOWN'（同上前提）：
   mfe = (referencePrice − actualLow) / referencePrice
   mae = (actualHigh − referencePrice) / referencePrice
-若 expectedDirection = 'RANGE'：
-  mfe/mae 按"任一方向的最大有利/不利变动"取绝对值中的较大者定义，须在evaluationVersion说明中明确写出具体取法，不得含糊
 ```
 
-### 10.5 缺失K线的统计排除规则（红线，呼应V1.3"estimated交易排除于验证统计"同一哲学）
+**若 `expectedDirection = 'RANGE'`（P1-NEW-1核心，冻结公式，不再留待evaluationVersion决定）**：
 
-若评估时刻 `targetBarRef` 对应的K线仍然缺失（数据源缺口未回补，或尚未到达该时间点），`dataComplete=false`，`eligibleForStatistics=false`，`exclusionReasons` 必须记录具体原因（如`'target_bar_missing'`/`'target_bar_not_yet_closed'`）。**缺失K线的记录不得进入正式方向准确率/区间覆盖率统计分母**——这与 `V1_3_PAPER_TRADING_SPEC.md` 已确立的"estimated交易排除于验证统计"是同一类工程纪律的延伸，不重新发明。
+```
+mfe = null                                                    （RANGE本身没有方向，不得强行套用带方向语义的"有利/不利"）
+mae = null
+upperExcursion = (actualHigh − referencePrice) / referencePrice        （仅pathDataComplete=true时计算，否则为null）
+lowerExcursion = (referencePrice − actualLow) / referencePrice
+maxAbsoluteExcursion = max(upperExcursion, lowerExcursion)
+rangeBreachExcursion = max(0, maxAbsoluteExcursion − directionThreshold)   （实际路径偏离基准的最大幅度，相对RANGE判定阈值超出了多少；0表示全程未突破RANGE阈值）
+```
+
+**红线**：`expectedDirection='RANGE'` 时 `mfe`/`mae` **恒为 `null`**，不得伪造一个"有利方向"——RANGE情景的成立前提就是"不预期明确方向"，继续输出`mfe`/`mae`会隐含"其实是有方向的"这一矛盾语义，四项RANGE专属指标（`upperExcursion`/`lowerExcursion`/`maxAbsoluteExcursion`/`rangeBreachExcursion`）才是RANGE场景下唯一合法的路径评估指标。
+
+### 10.4a 区间覆盖指标定义（P1-NEW-2新增）
+
+```
+expectedEnvelope = { lower: min(baseline.lower, upside.lower, downside.lower), upper: max(baseline.upper, upside.upper, downside.upper) }
+  （三类情景冻结区间合并后的总下沿到总上沿，取自ForecastSnapshot.expectedPriceZones）
+
+endpointInBaselineZone            = actualEndPrice ∈ [baseline.lower, baseline.upper]                       （仅检查终点，endpointDataComplete=true时可计算）
+endpointInAnyScenarioZone         = actualEndPrice ∈ baseline区间 ∪ upside区间 ∪ downside区间任一          （同上前提）
+realizedRangeInsideExpectedEnvelope = (actualLow >= expectedEnvelope.lower) && (actualHigh <= expectedEnvelope.upper)   （要求路径最高最低价均在包络内，仅pathDataComplete=true时可计算）
+expectedEnvelopeTouched            = 实际路径([actualLow, actualHigh])与expectedEnvelope存在交集             （表示路径是否至少进入过预测包络，仅pathDataComplete=true时可计算）
+```
+
+数据不完整（对应前提条件不满足）时，四个字段均为 `null`，不得填 `false` 冒充"确认未覆盖"。
+
+### 10.5 缺失K线的统计排除规则（红线，呼应V1.3"estimated交易排除于验证统计"同一哲学，P0-NEW-2修订）
+
+若评估时刻目标路径内任意一根bar（`sequenceIndex 1..expectedBarCount`）缺失（数据源缺口未回补，或尚未到达该时间点），该bar被记入 `missingBarRefs`，`pathDataComplete=false`；若仅 `referenceBarRef`/`targetBarRef` 两个端点其中之一缺失，则 `endpointDataComplete=false`（此时 `pathDataComplete` 必然也为false，因为端点本身就是路径的一部分）。`exclusionReasons` 必须记录具体原因（如`'bar_missing:sequenceIndex=47'`/`'target_bar_not_yet_closed'`）。**缺失K线的记录不得进入正式方向准确率/区间覆盖率统计分母**——方向准确率使用 `directionEligibleForStatistics` 筛选，区间覆盖/MFE/MAE类使用 `pathEligibleForStatistics` 筛选，二者独立判定、独立使用，这与 `V1_3_PAPER_TRADING_SPEC.md` 已确立的"estimated交易排除于验证统计"是同一类工程纪律的延伸，不重新发明。
 
 ### 10.6 幂等回填（红线）
 
@@ -770,15 +865,22 @@ directionCorrect = (dataComplete === true) ? (actualDirection === expectedDirect
 
 **可以研究乘法融合**（如各维度作为独立的"折扣因子"相乘，一票否决类维度用接近0的因子体现），但初始的示例权重分配（如环境25%、目标40%、迁移25%、其他10%）**只能标记为待验证初始参数**，**不能称为真实有效权重**——这些数字目前没有任何历史校准依据，只是架构设计阶段用来说明"融合逻辑长什么样"的占位说明，实现时必须在代码注释与日志字段中明确标注 `fusionWeightVersion: 'unvalidated-initial-1'` 这类版本号，防止被误当作"已经调好的生产参数"。
 
-### 11.2 `TrajectoryScenarios`（单眼输出，供融合中枢消费）
+### 11.2 `TrajectoryScenarios`（单眼输出，供融合中枢消费，P0-NEW-1修订）
+
+**P0-NEW-1延伸**：`transitionWeights: TransitionRecord[]` 这一单一字段已随§8.4拆分为不兼容的 `FormalTransitionRecord`/`ProxyTransitionRecord` 两种结构而失效。改用判别联合（discriminated union）明确当前携带哪一种，**不得**同时出现两种、也不得用一个宽松的联合数组掩盖"当前到底是哪个运行模式产出的"这一事实：
 
 ```ts
+type TransitionBundle =
+  | { kind: 'formal'; records: FormalTransitionRecord[] }   // 仅operatingMode='FULL_STATE_MODE'
+  | { kind: 'proxy'; records: ProxyTransitionRecord[] }      // 仅operatingMode='PRICE_ONLY_MODE'
+  | { kind: 'none' };                                        // operatingMode='INSUFFICIENT_DATA'，见§8.4红线2
+
 interface TrajectoryScenarios {
   jointStateRef: string;             // 对应JointState快照引用
   baselineScenario: ScenarioDetail;
   upsideScenario: ScenarioDetail;
   downsideScenario: ScenarioDetail;
-  transitionWeights: TransitionRecord[];  // 见§8.4
+  transitions: TransitionBundle;      // 见上，取代draft-2的transitionWeights: TransitionRecord[]
   probabilityStatus: 'rule_based' | 'similarity_based' | 'calibrated';
 }
 
@@ -791,9 +893,11 @@ interface ScenarioDetail {
 }
 ```
 
+**红线**：读取 `TrajectoryScenarios.transitions` 的任何下游代码，**必须**先判别 `kind` 字段再决定如何处理 `records`，不得假设 `records` 的元素类型固定；`kind='formal'` 的记录才允许流入§8.5校准流程与正式八状态迁移率统计，`kind='proxy'` 的记录只能流入`PROXY_STATS`，`kind='none'` 时不产生任何迁移侧的展示或统计输入。
+
 ### 11.3 融合中枢输入维度清单
 
-环境支持度（`WorldState.environmentPermission`+`regimeConfidence`）、目标内部状态（`TargetState`全量）、状态迁移权重（`TransitionRecord[]`）、事件冲击（`StateFrame.eventState`）、数据质量（`StateFrame.dataQuality`）、来源可信度（§16数据源健康状态的延伸）、历史表现（该算法版本过往校准结果，未校准前为空）、时间尺度（15m/1h/4h/24h/72h 分别处理，不混算）、风险边界（账户侧状态，只读引用，见§2红线3）。
+环境支持度（`WorldState.environmentPermission`+`regimeConfidence`）、目标内部状态（`TargetState`全量）、状态迁移权重（`TransitionBundle`，见§11.2判别联合，`kind='formal'`/`'proxy'`/`'none'`三选一）、事件冲击（`StateFrame.eventState`）、数据质量（`StateFrame.dataQuality`）、来源可信度（§16数据源健康状态的延伸）、历史表现（该算法版本过往校准结果，未校准前为空）、时间尺度（15m/1h/4h/24h/72h 分别处理，不混算）、风险边界（账户侧状态，只读引用，见§2红线3）。
 
 ### 11.4 预测结果与行动许可分离（红线复述，落实为两个输出接口）
 
@@ -813,7 +917,7 @@ interface ForecastResult {
   baselineScenario: ScenarioDetail;
   upsideScenario: ScenarioDetail;
   downsideScenario: ScenarioDetail;
-  transitionWeights: TransitionRecord[];
+  transitions: TransitionBundle;       // P0-NEW-1修订：取代draft-2的transitionWeights: TransitionRecord[]，见§11.2 TransitionBundle判别联合
   probabilityStatus: 'rule_based' | 'similarity_based' | 'calibrated';
   calibratedProbabilities: Record<string, number | null>;  // 未校准时全部为null，红线同§8.2/§8.5
   priceZones: { baseline: [number, number]; upside: [number, number]; downside: [number, number] };
@@ -837,12 +941,12 @@ type GateStatus = 'OPEN' | 'WAIT' | 'BLOCKED';                                  
 
 interface ActionPermission {
   readinessLevel: ReadinessLevel;
-  readinessCeiling: ReadinessLevel;     // 本次理论上限（原draft-1的permissionCeiling），账户/风控可以把readinessLevel往下压，不能突破此上限向上抬
+  readinessCeiling: ReadinessLevel;     // 本次理论上限（原draft-1的permissionCeiling），见下方P1-NEW-4红线：只由预测证据/数据质量/时间尺度/历史校准状态决定
   gateStatus: GateStatus;               // 与readinessLevel独立正交：即使readinessLevel='ALLOW_EXECUTION'，gateStatus仍可能是'BLOCKED'（如账户冷却期），表示"情景已就绪，但当前闸门不开放"
   blockingReasons: string[];            // gateStatus='BLOCKED'时必填
-  restrictionReasons: string[];         // readinessLevel被readinessCeiling压低时的原因
+  restrictionReasons: string[];         // readinessLevel被readinessCeiling压低时的原因（只能是预测/数据侧原因，不得是账户侧原因，见下方红线）
   waitingForSignals: string[];          // gateStatus='WAIT'时必填
-  riskConditions: string[];
+  riskConditions: string[];             // 账户/风控相关记录，只读展示，不反向影响readinessLevel/readinessCeiling，见下方红线
   mode: 'DISPLAY_ONLY' | 'AUDIT_ONLY';  // 见§12红线6：V1.4阶段（24H/72H专属，见§12开篇范围声明）恒为其一，不接入模拟撮合
 }
 ```
@@ -851,6 +955,12 @@ interface ActionPermission {
 - `readinessCeiling` 只约束 `readinessLevel`（`readinessLevel` 不得超过 `readinessCeiling`），**不约束** `gateStatus`；
 - `gateStatus` 可以在任意 `readinessLevel` 取值上独立生效——`gateStatus='BLOCKED'` 或 `'WAIT'` 时，无论 `readinessLevel` 多高，都不构成"可以行动"的结论；只有 `gateStatus='OPEN'` 且 `readinessLevel` 达到相应档位，两个条件同时满足才具备行动意义；
 - 因此对外展示/消费 `ActionPermission` 时，**必须同时读取两个字段**，不得只看 `readinessLevel` 就判断"可以做什么"。
+
+**红线（P1-NEW-4修订：账户状态不得改变`readinessLevel`）**：
+- `readinessLevel`/`readinessCeiling` **只能**由预测证据（情景权重、支持/反对证据强度）、数据质量（§6.3 `FeatureCompleteness`）、时间尺度（该horizon本身的性质）、历史校准状态（§8.5 `isCalibrated`/校准样本量）四类因素决定；
+- 账户余额、保证金占用、冷却期、回撤锁定、反向信号冷却等**只允许影响 `gateStatus`**，**不得**降低或提高 `readinessLevel`/`readinessCeiling`——这与draft-2 `readinessCeiling` 注释中"账户/风控可以把readinessLevel往下压"的表述矛盾，本轮予以撤销更正：账户状态从未被允许触碰 `readinessLevel`/`readinessCeiling`，只能触碰 `gateStatus`；
+- `riskConditions` 字段**只用于记录**账户风险状况供审计参考，是**只读展示**，不构成计算 `readinessLevel`/`readinessCeiling` 的输入；
+- 当 `gateStatus∈{WAIT,BLOCKED}` 时否决行动，但**原始 `readinessLevel` 必须保持不变**——这使得事后审计可以准确复原"预测本身已经就绪到什么程度，但账户当时不允许行动"这一区分，若账户状态被允许污染`readinessLevel`，这条审计能力会永久丢失。
 
 **红线**：`ForecastResult` 一旦生成即为该次预测的不可变事实（呼应§2红线3），`ActionPermission` 可以在后续 tick 因账户状态变化而重新评估、重新产出新的许可对象，但**不得**回头修改已生成的 `ForecastResult`——这与 `ForecastResult` 需要更新（如数据到期需要重新算一版）是两回事：更新意味着生成一条**新的** `ForecastResult` 记录（新的 `generatedAt`），而不是原地修改旧记录。
 
@@ -897,6 +1007,9 @@ interface ActionPermission {
   "targetStartTime": 1752768000000,
   "targetEndTime": 1752854400000,
   "referencePrice": 3250.0,
+  "referenceBarRef": { "symbol": "ETH", "timeframe": "15m", "openTime": 1752767100000, "closeTime": 1752768000000, "timeframeMs": 900000, "sequenceIndex": 0, "barKey": "ETH-15m-1752768000000" },
+  "targetBarRef": { "symbol": "ETH", "timeframe": "15m", "openTime": 1752853500000, "closeTime": 1752854400000, "timeframeMs": 900000, "sequenceIndex": 96, "barKey": "ETH-15m-1752854400000" },
+  "expectedBarCount": 96,
   "environment": {
     "growthRegime": "expansion",
     "liquidityRegime": "tightening",
@@ -925,7 +1038,14 @@ interface ActionPermission {
   "trajectory": {
     "baselineScenario": { "id": "CONTINUATION_WITH_COOLING", "text": "延续上行但杠杆指标提示需警惕透支，规则型权重支持震荡上探" },
     "upsideScenario": { "id": "BREAKOUT_CONTINUATION", "text": "若现货驱动持续增强，可能延续突破" },
-    "downsideScenario": { "id": "LEVERAGE_UNWIND_PULLBACK", "text": "若资金费率/OI回落，可能出现去杠杆回调" }
+    "downsideScenario": { "id": "LEVERAGE_UNWIND_PULLBACK", "text": "若资金费率/OI回落，可能出现去杠杆回调" },
+    "transitions": {
+      "kind": "formal",
+      "records": [
+        { "fromState": "S2_BULL_EXPANSION", "toState": "S3_OVERHEATED", "elapsedTimeMs": 300000, "transitionWeight": 35, "probabilityStatus": "rule_based", "calibratedProbability": null, "sampleSize": null, "calibrationVersion": null, "evidenceRefs": ["资金费率连续走高"], "statsGroup": "FULL_STATE_STATS" },
+        { "fromState": "S2_BULL_EXPANSION", "toState": "S2_BULL_EXPANSION", "elapsedTimeMs": 300000, "transitionWeight": 50, "probabilityStatus": "rule_based", "calibratedProbability": null, "sampleSize": null, "calibrationVersion": null, "evidenceRefs": ["现货驱动仍占主导"], "statsGroup": "FULL_STATE_STATS" }
+      ]
+    }
   },
   "probabilityStatus": "rule_based",
   "scenarioWeight": { "baseline": 45, "upside": 30, "downside": 25, "note": "规则型情景权重，非统计概率，未经历史校准" },
@@ -952,7 +1072,7 @@ interface ActionPermission {
   "dataVintageRefs": ["ETH-15m-close-1752768000000-rev0", "US-FUNDING-RATE-1752767700000-rev0", "..."],
   "featureEngineVersion": "gmkg-feature-engine-unimplemented",
   "contentHash": "示例简化，正式实现须为featureValuesUsed+版本三元组计算实际哈希",
-  "algorithmVersion": "gmkg-draft-2-unimplemented",
+  "algorithmVersion": "gmkg-draft-3-unimplemented",
   "weightVersion": "gmkg-fusion-weights-unvalidated-initial-1",
   "datasetVersion": "gmkg-dataset-not-yet-collected"
 }
@@ -967,6 +1087,9 @@ interface ActionPermission {
   "horizon": "24h",
   "generatedAt": 1752768000000,
   "referencePrice": 3250.0,
+  "referenceBarRef": { "symbol": "ETH", "timeframe": "15m", "openTime": 1752767100000, "closeTime": 1752768000000, "timeframeMs": 900000, "sequenceIndex": 0, "barKey": "ETH-15m-1752768000000" },
+  "targetBarRef": { "symbol": "ETH", "timeframe": "15m", "openTime": 1752853500000, "closeTime": 1752854400000, "timeframeMs": 900000, "sequenceIndex": 96, "barKey": "ETH-15m-1752854400000" },
+  "expectedBarCount": 96,
   "environment": {
     "growthRegime": "uncertain",
     "liquidityRegime": "uncertain",
@@ -994,6 +1117,14 @@ interface ActionPermission {
     "note": "profileCompleteness=1.0是因为A组6项本身齐全（当前唯一数据源），但fullArchitectureCompleteness=0.125（6/48）如实反映B-G组尚未接入，二者不得混为一谈，见P1-2红线"
   },
   "fusionState": "S2_BULL_EXPANSION",
+  "trajectory": {
+    "transitions": {
+      "kind": "proxy",
+      "records": [
+        { "fromProxyState": "PO_TREND_UP_STRUCTURE", "toProxyState": "PO_TREND_UP_STRUCTURE", "elapsedTimeMs": 300000, "transitionWeight": 60, "probabilityStatus": "rule_based", "calibratedProbability": null, "sampleSize": null, "evidenceRefs": ["价格结构延续上行"], "statsGroup": "PROXY_STATS" }
+      ]
+    }
+  },
   "actionPermission": {
     "readinessLevel": "OBSERVE",
     "readinessCeiling": "PREPARE",
@@ -1004,7 +1135,7 @@ interface ActionPermission {
     "riskConditions": [],
     "mode": "DISPLAY_ONLY"
   },
-  "algorithmVersion": "gmkg-draft-2-unimplemented",
+  "algorithmVersion": "gmkg-draft-3-unimplemented",
   "weightVersion": "gmkg-fusion-weights-unvalidated-initial-1",
   "datasetVersion": "gmkg-dataset-binance-klines-only"
 }
@@ -1018,9 +1149,11 @@ interface ActionPermission {
 
 ### 14.1 不可变快照（每次正式预测必须保存，P0-2/P1-4修订）
 
-呼应 `V1_2_FORECAST_SPEC.md`§12 已确立的"日志必须完整到能独立复现"原则，GMKG 每次正式预测的不可变快照即§10.1 `ForecastSnapshot`（24H/72H）——本节不再重复罗列字段清单，直接以 `ForecastSnapshot` 为唯一权威结构：当时广度指标状态、当时精度指标状态、原始数据引用（`dataVintageRefs`，含 `availableAt`/`vintageId`，见§4.3）、数据截止时间、联合状态快照（`targetStateAtGeneration`/`fusionStateAtGeneration`）、候选迁移、情景权重、校准状态、预计价格区间、触发条件、失效条件、算法/权重/数据集版本、以及P1-4新增的可复现性字段（`featureValuesUsed`/`featureEngineVersion`/`contentHash`）全部在生成时一次性冻结写入。
+呼应 `V1_2_FORECAST_SPEC.md`§12 已确立的"日志必须完整到能独立复现"原则，GMKG 每次正式预测的不可变快照即§10.1 `ForecastSnapshot`（24H/72H）——本节不再重复罗列字段清单，直接以 `ForecastSnapshot` 为唯一权威结构：当时广度指标状态、当时精度指标状态、原始数据引用（`dataVintageRefs`，含 `availableAt`/`vintageId`，见§4.3）、数据截止时间、联合状态快照（`targetStateAtGeneration`/`fusionStateAtGeneration`）、候选迁移（`candidateTrajectories.transitions`，携带§11.2 `TransitionBundle` 判别联合，`kind='formal'`/`'proxy'`/`'none'` 三选一，不混装）、情景权重（含§10.1 P1-NEW-3不变量）、校准状态、预计价格区间、触发条件、失效条件、算法/权重/数据集版本、以及P1-4新增的可复现性字段（`featureValuesUsed`/`featureEngineVersion`/`contentHash`）全部在生成时一次性冻结写入。
 
 **红线**：原始预测**不可被后续结果覆盖**——`ForecastSnapshot`生成后是冻结记录，24H/72H实际结果、方向准确率、区间覆盖率、MFE/MAE等"事后才能知道"的字段，**不属于`ForecastSnapshot`本身**，而是记录在独立的 `ForecastOutcomeEvent`（§10.1）中，通过 `predictionId` 外键关联，**必须通过独立的追加事件回填**，不得原地修改 `ForecastSnapshot` 的任何字段值，这是防止"用后来的结果反向篡改历史预测"的结构性保证，与`V1_3_PAPER_TRADING_SPEC.md`"建仓快照冻结"、`V1_2_FORECAST_SPEC.md`§12.2"版本号红线"是同一类工程哲学的延伸。误差归因（§15 `ErrorAttribution`）同样通过 `predictionId` 关联的独立记录存在，不内嵌进 `ForecastSnapshot`。
+
+**统计分母的独立性（P0-NEW-2/P0-NEW-1跨章节一致性核对项）**：本闭环中"更新迁移模型"必须只使用 `TransitionBundle.kind='formal'` 的 `FormalTransitionRecord`（进入 `FULL_STATE_STATS`），`kind='proxy'` 的记录永远不参与该模型更新（呼应§8.4/§7.0a红线）；"实际结果"统计同样区分 `directionEligibleForStatistics`（方向准确率分母）与 `pathEligibleForStatistics`（区间覆盖/MFE-MAE分母），两个分母独立维护，不得合并成一个笼统的"有效样本数"。
 
 **`availableAt`/`vintage` 贯穿回放与校准（红线，跨章节一致性核对项）**：`ForecastSnapshot.dataVintageRefs` 记录的每个 `vintageId` 都可回溯到§4.3 `DataVintageRef` 的完整时间契约；历史回放/walk-forward（§8.5）验证任一历史 `ForecastSnapshot` 的正确性时，必须能够仅凭 `dataVintageRefs`（而非重新查询"当前最新数据"）重建当时模型实际看到的输入，这是`availableAt<=forecastCreatedAt`红线（§4.3/§8.5）在存储层面的落地保证。
 
@@ -1093,13 +1226,13 @@ interface ErrorAttribution {
 
 本节只提出建议范围，**不创建六份V1.4实施文档，不开始编码**，具体六份文档的撰写留待 CEO 另行批准后启动。
 
-### 17.1 V1.4 必须实现（【V1.4可实施最小范围】，P0-3/P0-2/P1-2/P1-5修订）
+### 17.1 V1.4 必须实现（【V1.4可实施最小范围】，P0-3/P0-2/P1-2/P1-5/P0-NEW-1/P0-NEW-2/P1-NEW-1至5修订）
 
 1. 四系统接口的**类型定义**（`WorldState`/`TargetState`/`TrajectoryScenarios`/`ForecastResult`/`ActionPermission`的TypeScript接口，作为纯规范，不要求所有字段都有真实数据源支撑）；
 2. 统一状态帧格式（§4.4 `StateFrame`结构定义，允许多数字段初期为空/`missing`，只要求结构存在）；
 3. 数据时间和质量契约（§4.3 `DataVintageRef`全字段——`observationPeriod`/`publishedAt`/`availableAt`/`firstAvailableAt`/`fetchedAt`/`revisionNumber`/`vintageId`——的写入规则，即使当前只有Binance K线一个数据源，也要按此契约记录，为未来扩展预留一致的写入习惯；`DataRevisionEvent`追加式修订机制同步落地，即使当前K线数据本身极少触发修订）；
 4. **运行模式与代理状态初稿（P0-3修订，取代draft-1错误表述"用A组实现八状态"）**——当前基线**只能**落地 `PRICE_ONLY_MODE`：用A组（价格与成交结构）特征输出 `proxyState`（`PriceOnlyStateId`，带`PO_`前缀），`primaryState`恒为`'UNKNOWN'`，**不得**输出任何S0-S7正式状态判定；§7.1的`FULL_STATE_MODE`正式判定逻辑作为**类型与规则的完整定义**先行落地（供未来B-G组数据到位后直接复用，不需要重新设计），但其判定函数在V1.4阶段不会被真实调用产生结果；
-5. 迁移记录结构（§8.4 `TransitionRecord`结构落地为可写入的日志格式，含`elapsedTimeMs`真实经过时间字段，初期只产出`probabilityStatus='rule_based'`的记录，且`fromState`/`toState`限定在`PriceOnlyStateId`层面的代理迁移或`TargetStateId`的`UNKNOWN`↔自身，不产出真正的S0-S7间迁移）；
+5. **迁移记录结构（P0-NEW-1修订：只落地`ProxyTransitionRecord`，不产出`FormalTransitionRecord`）**——§8.4 `ProxyTransitionRecord`结构落地为可写入的日志格式（`fromProxyState`/`toProxyState`均为`PriceOnlyStateId`），含`elapsedTimeMs`真实经过时间字段，初期只产出`probabilityStatus='rule_based'`的记录，`statsGroup`恒为`'PROXY_STATS'`；`FormalTransitionRecord`的**类型与规则**先行落地供未来复用，但当前基线只运行`PRICE_ONLY_MODE`，不会产生任何真实的`FormalTransitionRecord`实例（`INSUFFICIENT_DATA`下两种记录都不产生，见§8.4红线2）；`TrajectoryScenarios.transitions`（§11.2 `TransitionBundle`）当前恒为`{kind:'proxy',records:[...]}`或`{kind:'none'}`；
 6. **历史预测不可变快照（P0-2修订，取代draft-1单一`LongHorizonForecastLog`）**——`ForecastSnapshot`（§10.1）结构落地，含`predictionId`/`dataVintageRefs`/`featureValuesUsed`/`contentHash`等P1-4可复现性字段；
 7. **实际结果回填（P0-2修订）**——`ForecastOutcomeEvent`（§10.1）独立结构落地，只追加不覆盖，幂等回填函数（§10.6），缺失K线排除统计分母（§10.5）；
 8. 误差归因结构（§15.2结构落地为可写入的日志格式，初期允许`primaryCause`判定规则很粗糙，但规则本身必须先定义、随代码一起冻结）；
@@ -1109,7 +1242,12 @@ interface ErrorAttribution {
 12. **完整度口径拆分落地（P1-2修订）**——`FeatureCompleteness`（`activeProfile`/`profileCompleteness`/`fullArchitectureCompleteness`/`criticalFeatureCompleteness`/`missingCriticalFeatures`）取代单一完整度数字，`PRICE_ONLY_MODE`下`criticalFeatureCompleteness`应可合理达到较高值（因为A组本身完整），不得被`fullArchitectureCompleteness`的低值拖累到无法展示任何有意义信息；
 13. 使用当前Binance数据运行最小闭环（用A组价格/成交特征跑通"生成`ForecastSnapshot`→（等待）`ForecastOutcomeEvent`回填→误差归因→（暂不更新模型）"这条链路的**端到端存在性**，不追求准确率，只追求"闭环本身能跑通、数据不泄漏、快照不可变、幂等"这几条结构性要求）；
 14. 为未来240+48项数据预留接口（`WorldState`/`TargetState`的字段结构提前按§5/§6定义好，即使多数字段初期为`null`/`missing`）；
-15. §6.4 数据所有权表在类型/字段命名层面落地（即使B-G组大部分字段当前为`missing`，`sourceRef`命名约定必须从一开始就统一，避免未来接入时才发现广度眼/精度眼各自建了一套字段名）。
+15. §6.4 数据所有权表在类型/字段命名层面落地（即使B-G组大部分字段当前为`missing`，`sourceRef`命名约定必须从一开始就统一，避免未来接入时才发现广度眼/精度眼各自建了一套字段名）；
+16. **`BarRef`统一引用结构与序号定位（P1-NEW-5修订）**——§10.1 `BarRef`（`openTime`/`closeTime`/`timeframeMs`/`sequenceIndex`/`barKey`）落地，`referenceBarRef`/`targetBarRef`均改用此结构；实现时必须先核实Binance K线`closeTime`的精确边界约定（`openTime+timeframeMs`还是`openTime+timeframeMs-1`），写入实施工单，不得含糊假设；
+17. **路径K线完整性字段（P0-NEW-2修订）**——`ForecastOutcomeEvent`的`expectedBarCount`/`observedBarCount`/`missingBarRefs`/`endpointDataComplete`/`pathDataComplete`/`pathEligibleForStatistics`/`directionEligibleForStatistics`全部落地；`actualHigh`/`actualLow`/`mfe`/`mae`类型为`number|null`，数据不完整时严格为`null`，不得填0或近似值；
+18. **RANGE专属路径指标与区间覆盖细分（P1-NEW-1/P1-NEW-2修订）**——`upperExcursion`/`lowerExcursion`/`maxAbsoluteExcursion`/`rangeBreachExcursion`（§10.4）与`endpointInBaselineZone`/`endpointInAnyScenarioZone`/`realizedRangeInsideExpectedEnvelope`/`expectedEnvelopeTouched`（§10.4a）落地，取代单一的`rangeCovered`；
+19. **情景权重不变量校验（P1-NEW-3修订）**——`scenarioWeights`写入`ForecastSnapshot`前必须校验有限性/范围/求和为100，并实现归一化+舍入算法（具体算法在实施工单中冻结）；
+20. **`readinessLevel`不受账户状态影响的实现约束（P1-NEW-4修订）**——`ActionPermission`计算函数中，账户/风控相关输入只允许写入`gateStatus`/`riskConditions`，不得出现任何"账户余额/冷却期→修改readinessLevel或readinessCeiling"的代码路径，V1.4阶段应有对应的单元测试断言这一隔离（正式测试代码留待未来实施阶段编写，本文档不创建测试文件）。
 
 ### 17.2 V1.4 只预留接口（不实现真实数据接入）
 
@@ -1127,13 +1265,13 @@ interface ErrorAttribution {
 
 ## 18. 安全边界（重申，贯穿全文，本节做最终汇总）
 
-继续禁止：真实交易；连接交易所账户；读取API密钥或私钥；发送订单；盈利保证；伪造概率（`calibratedProbability`未满足§8.5门槛前恒为null）；使用未来数据（§4.3`availableAt`红线/§8.2/§14.1数据泄漏防线）；覆盖历史预测（§10.1/§14.1`ForecastSnapshot`不可变红线）；削弱v1.3.1门控（§12逐条映射红线）；把候选数据源写成已经接入（全文【标注】体系的存在意义）；把目标架构写成当前已实现功能（同上，§7.0a/§13并排示例是这条红线的具体落实）；把同一份原始数据重复采集后双重计权（§6.4数据所有权红线）；把`PRICE_ONLY_MODE`代理判断包装成`FULL_STATE_MODE`正式状态（§7.0a/§7.0b红线）；让24H/72H判断绕过既有15分钟交易生命周期创建`WATCHLIST`/`EXECUTABLE`（§12红线）。
+继续禁止：真实交易；连接交易所账户；读取API密钥或私钥；发送订单；盈利保证；伪造概率（`calibratedProbability`未满足§8.5门槛前恒为null）；使用未来数据（§4.3`availableAt`红线/§8.2/§14.1数据泄漏防线）；覆盖历史预测（§10.1/§14.1`ForecastSnapshot`不可变红线）；削弱v1.3.1门控（§12逐条映射红线）；把候选数据源写成已经接入（全文【标注】体系的存在意义）；把目标架构写成当前已实现功能（同上，§7.0a/§13并排示例是这条红线的具体落实）；把同一份原始数据重复采集后双重计权（§6.4数据所有权红线）；把`PRICE_ONLY_MODE`代理判断包装成`FULL_STATE_MODE`正式状态（§7.0a/§7.0b红线）；让24H/72H判断绕过既有15分钟交易生命周期创建`WATCHLIST`/`EXECUTABLE`（§12红线）；把`ProxyTransitionRecord`混入`FULL_STATE_STATS`或正式校准分母（§8.4红线）；在路径K线不完整时对`actualHigh`/`actualLow`/`mfe`/`mae`等字段填0或近似值而非`null`（§10.1/§10.5红线）；让`scenarioWeights`三项之和不等于100或含NaN/Infinity/负值（§10.1情景权重不变量红线）；让账户/风控状态修改`readinessLevel`或`readinessCeiling`（§11.4红线，账户状态只能影响`gateStatus`）。
 
 ---
 
-## 19. 文档完成后自检（P0×4/P1×6修订后，逐项如实填写，不再直接写"全部通过"）
+## 19. 文档完成后自检（两轮CEO复审共关闭P0×6/P1×11后，逐项如实填写，不再直接写"全部通过"）
 
-### 19.1 CEO本轮复审 P0/P1 十项关闭核对表
+### 19.1 CEO第一轮复审 P0/P1 十项关闭核对表
 
 | # | 问题 | 关闭方式 | 关闭位置 |
 |---|---|---|---|
@@ -1141,24 +1279,36 @@ interface ErrorAttribution {
 | P0-2 | 预测日志缺少正式验证所需字段 | `LongHorizonForecastLog`拆分为`ForecastSnapshot`（不可变）+`ForecastOutcomeEvent`（追加），定义方向判定规则/RANGE阈值冻结/起止K线/MFE-MAE口径/缺失K线排除/幂等回填 | §10.1-10.6 |
 | P0-3 | A组数据不能支持完整八状态 | 新增`FULL_STATE_MODE`/`PRICE_ONLY_MODE`/`INSUFFICIENT_DATA`三运行模式，逐状态列出最低数据组/能否识别/降级输出/统计分组，`primaryState`非FULL_STATE_MODE下恒为`UNKNOWN`，§17.1第4条错误表述已修正 | §7.0a、§7.0b、§17.1第4条 |
 | P0-4 | 24H/72H许可不得直接升级现有15分钟交易信号 | 重写§12：范围声明限定为24H/72H专属；不得单独创建WATCHLIST/EXECUTABLE；不得直接调用四个交易门控函数；`mode`字段恒为`DISPLAY_ONLY`/`AUDIT_ONLY` | §12全节重写 |
-| P1-1 | TargetState误用含CONFLICTED的类型 | 拆分`TargetStateId`（S0-S7+UNKNOWN）与`FusionStateId`（含CONFLICTED），`ForecastResult`新增`fusionState`字段，`TargetState.primaryState`/`TransitionRecord`统一改用`TargetStateId` | §6.3、§7.4、§8.4、§9场景4、§11.4 |
+| P1-1 | TargetState误用含CONFLICTED的类型 | 拆分`TargetStateId`（S0-S7+UNKNOWN）与`FusionStateId`（含CONFLICTED），`ForecastResult`新增`fusionState`字段，`TargetState.primaryState`统一改用`TargetStateId`（`TransitionRecord`本身已在第二轮P0-NEW-1中进一步拆分为`FormalStateId`专用的`FormalTransitionRecord`，见§19.1b） | §6.3、§7.4、§8.4、§9场景4、§11.4 |
 | P1-2 | 数据完整度简单用"已获得指标数÷48" | 新增`FeatureCompleteness`（`activeProfile`/`profileCompleteness`/`fullArchitectureCompleteness`/`criticalFeatureCompleteness`/`missingCriticalFeatures`），行动许可与置信度改为主要参考`criticalFeatureCompleteness` | §6.3、§13.2示例 |
-| P1-3 | 事件帧被当作普通迁移步数插入288帧序列 | `EventSnapshot`独立时间戳体系与存储，`StateFrame.eventState`只存引用，`TransitionRecord`新增`elapsedTimeMs`真实经过时间字段 | §4.2、§4.5、§8.4 |
+| P1-3 | 事件帧被当作普通迁移步数插入288帧序列 | `EventSnapshot`独立时间戳体系与存储，`StateFrame.eventState`只存引用，迁移记录（第二轮拆分后的`FormalTransitionRecord`/`ProxyTransitionRecord`）均新增`elapsedTimeMs`真实经过时间字段 | §4.2、§4.5、§8.4 |
 | P1-4 | 原始数据引用不足以保证可复现 | `ForecastSnapshot`新增`featureValuesUsed`/`featureEngineVersion`/`contentHash`，与`dataVintageRefs`共同保证"即使来源后续修订/删除也能重建当时输入" | §10.1、§14.1 |
 | P1-5 | 六档行动许可假设简单线性顺序 | 拆分为`readinessLevel`（四档线性）与`gateStatus`（OPEN/WAIT/BLOCKED独立轴），`readinessCeiling`只约束前者 | §11.4、§9场景4、§12、§13示例 |
 | P1-6 | 广度眼/精度眼数据所有权重叠 | 新增§6.4数据所有权表，逐项冻结8个易重叠指标的唯一权威采集所有者与下游只读引用方式，`DataVintageRef.sourceRef`作为去重落地字段 | §6.4、§4.3 |
+
+### 19.1b CEO第二轮复审 新P0×2/新P1×5 关闭核对表
+
+| # | 问题 | 关闭方式 | 关闭位置 |
+|---|---|---|---|
+| P0-NEW-1 | 正式状态迁移与代理状态迁移类型冲突 | 拆出`FormalStateId`（S0-S7，不含UNKNOWN）；`TransitionRecord`拆分为`FormalTransitionRecord`（仅FULL_STATE_MODE产生，进`FULL_STATE_STATS`）与`ProxyTransitionRecord`（仅PRICE_ONLY_MODE产生，`fromProxyState`/`toProxyState`为`PriceOnlyStateId`，进`PROXY_STATS`）；`INSUFFICIENT_DATA`不产生迁移记录；删除"UNKNOWN↔自身"设计；`TrajectoryScenarios.transitions`改为`TransitionBundle`判别联合（`kind:'formal'\|'proxy'\|'none'`） | §6.3、§8.4、§11.2、§11.4、§13示例、§14.1、§17.1第5条 |
+| P0-NEW-2 | 路径K线完整性不足 | `ForecastOutcomeEvent`新增`expectedBarCount`/`observedBarCount`/`missingBarRefs`/`endpointDataComplete`/`pathDataComplete`/`pathEligibleForStatistics`/`directionEligibleForStatistics`；`actualHigh`/`actualLow`/`mfe`/`mae`改为`number\|null`，路径不完整时严格为null；方向类统计与路径类统计分母彻底分离 | §10.1、§10.5、§17.1第17条 |
+| P1-NEW-1 | RANGE方向MFE/MAE公式未冻结 | 冻结RANGE专属指标`upperExcursion`/`lowerExcursion`/`maxAbsoluteExcursion`/`rangeBreachExcursion`公式；`expectedDirection='RANGE'`时`mfe`/`mae`恒为null，不借用带方向语义的公式 | §10.4、§10.4a |
+| P1-NEW-2 | 区间覆盖指标含糊 | `rangeCovered`拆分为`endpointInBaselineZone`/`endpointInAnyScenarioZone`/`realizedRangeInsideExpectedEnvelope`/`expectedEnvelopeTouched`，并定义`expectedEnvelope`（三情景区间合并总下沿到总上沿） | §10.1、§10.4a |
+| P1-NEW-3 | 情景权重缺乏不变量 | 冻结`scenarioWeights`不变量：三项均为有限数、范围0-100、禁止NaN/Infinity/负值、和恒为100（含归一化+舍入规则）；重申`scenarioWeights`≠`calibratedProbabilities`，不得复用字段 | §10.1 |
+| P1-NEW-4 | 账户状态可能改变readinessLevel | 撤销draft-2"账户/风控可以把readinessLevel往下压"的错误注释；明确`readinessLevel`/`readinessCeiling`只由预测证据/数据质量/时间尺度/历史校准状态决定，账户状态只影响`gateStatus`，`riskConditions`仅供只读展示 | §11.4 |
+| P1-NEW-5 | 15分钟K线边界与索引规则未冻结 | 新增`BarRef`（`openTime`/`closeTime`/`timeframeMs`/`sequenceIndex`/`barKey`）；`referenceBar`固定`sequenceIndex=0`且不计入目标路径；目标路径为`sequenceIndex 1..96/288`；要求按`sequenceIndex`遍历定位而非纯毫秒加法；标注`closeTime`边界约定须在实施工单中用真实API核实冻结 | §10.1、§10.2 |
 
 ### 19.2 逐项自检（如实反映修订后状态，不再统一写"通过"）
 
 | # | 自检项 | 结论 |
 |---|---|---|
 | 1 | 四系统职责是否互不重叠 | 达标——见§3非重叠性核对表；§6.4进一步关闭了广度眼/精度眼之间此前未察觉的8项数据所有权重叠 |
-| 2 | 预测融合与行动许可是否分离 | 达标——见§11.4 `ForecastResult`/`ActionPermission`两个独立接口；`ActionPermission`内部本轮进一步拆分为`readinessLevel`/`gateStatus`两个正交字段，分离粒度比draft-1更细 |
+| 2 | 预测融合与行动许可是否分离 | 达标——见§11.4 `ForecastResult`/`ActionPermission`两个独立接口；`ActionPermission`内部拆分为`readinessLevel`/`gateStatus`两个正交字段；第二轮进一步撤销了"账户可压低readinessLevel"的错误表述，账户状态现在只能触及`gateStatus`，分离边界比draft-2更严格（P1-NEW-4） |
 | 3 | 240和48项是否标记为目标架构 | 达标——§5/§6开篇均有【目标架构】/【仍需研究/授权/付费】现实标注；§13.2新增示例进一步用具体数字（`fullArchitectureCompleteness=0.125`）量化"当前差距有多大"，比draft-1的文字声明更难被忽视 |
 | 4 | 300帧是否包含as-of时间和数据质量 | 达标——见§4.3/§4.4 `DataVintageRef`完整七字段时间契约、`StateFrame.dataQuality`；§4.5关闭了draft-1"事件插入288帧序列"的错误表述 |
-| 5 | 八状态是否具备可计算方向 | **部分达标，如实标注差距**——`FULL_STATE_MODE`下§7.1定义了每状态的完整可计算规则；但当前v1.3.1基线只有A组数据，只能运行在`PRICE_ONLY_MODE`，无法产出真正的S0-S7判定，该差距已通过§7.0a/§7.0b/§13.2明确标注，不再像draft-1那样含糊带过 |
+| 5 | 八状态是否具备可计算方向 | **部分达标，如实标注差距**——`FULL_STATE_MODE`下§7.1定义了每状态的完整可计算规则，其迁移记录（`FormalTransitionRecord`）类型与统计分组也已在第二轮冻结（§8.4）；但当前v1.3.1基线只有A组数据，只能运行在`PRICE_ONLY_MODE`，只产生`ProxyTransitionRecord`，无法产出真正的S0-S7判定或正式迁移率，该差距已通过§7.0a/§7.0b/§8.4/§13.2明确标注，不再像draft-1那样含糊带过 |
 | 6 | 规则权重是否与概率严格分离 | 达标——见§8.2/§8.5/§11.1/§13示例，`calibratedProbability`全文恒为null（未校准场景） |
-| 7 | 24H和72H是否独立验证 | 达标——见§10.1 `ForecastSnapshot`/`ForecastOutcomeEvent`独立结构，§9场景2允许方向不同；本轮新增了方向判定规则、MFE/MAE口径、缺失K线排除等此前缺失的验证细节 |
+| 7 | 24H和72H是否独立验证 | 达标——见§10.1 `ForecastSnapshot`/`ForecastOutcomeEvent`独立结构，§9场景2允许方向不同；第二轮进一步补齐了路径K线完整性判定（`pathDataComplete`/`endpointDataComplete`）、RANGE专属指标、区间覆盖四分法、情景权重不变量、`BarRef`序号定位规则，此前"用targetBarRef存在就声称完整"的隐患已关闭（P0-NEW-2/P1-NEW-1/P1-NEW-2/P1-NEW-3/P1-NEW-5） |
 | 8 | 冲突状态是否允许WAIT | 达标——见§9场景4 `fusionState='CONFLICTED'`/`gateStatus='WAIT'`/`readinessLevel`强制降为`OBSERVE`/`waitingForSignals` |
 | 9 | 误差归因是否防止事后解释 | 达标——见§15.3"归因规则必须结果发生前预先定义"；§14.1补充说明`ErrorAttribution`同样通过`predictionId`独立记录，不内嵌`ForecastSnapshot` |
 | 10 | 是否保留v1.3.1全部安全门控 | 达标——见§12全节重写后的红线1-10，源码已核实（`buildTradeProposal`/`processTradeGate`/信号快照字段）；本轮额外关闭了"24H/72H许可绕过既有信号创建"这一此前未覆盖的风险点（P0-4） |
@@ -1174,3 +1324,4 @@ interface ErrorAttribution {
 |---|---|---|
 | gmkg-draft-1 | 2026-07-17 | 初稿：冻结GMKG四系统核心原则、命名消歧（与既有蜻蜓捕猎模型区分）、360度/300帧工程定义、广度眼12域240项、精度眼48项、单眼八状态模型、迁移模型与概率红线、冲突裁决四场景、时间尺度、融合中枢双输出、与v1.3.1行动许可兼容映射、最终输出快照示例、验证学习闭环、误差归因、架构现实边界、V1.4最小范围建议、安全边界与自检 |
 | gmkg-draft-2 | 2026-07-17 | CEO正文复审关闭P0×4/P1×6：①新增`DataVintageRef`七字段时间/版本契约+`DataRevisionEvent`追加式修订，冻结`availableAt<=forecastCreatedAt`防泄漏红线（P0-1）；②`LongHorizonForecastLog`拆分为不可变的`ForecastSnapshot`与追加式的`ForecastOutcomeEvent`，定义方向判定/RANGE阈值冻结/起止K线/MFE-MAE口径/缺失K线排除/幂等回填（P0-2）；③新增`FULL_STATE_MODE`/`PRICE_ONLY_MODE`/`INSUFFICIENT_DATA`三运行模式与逐状态最低数据组表，修正"用A组实现八状态"错误表述（P0-3）；④重写§12，24H/72H许可限定为`DISPLAY_ONLY`/`AUDIT_ONLY`，明确不得绕过既有15分钟交易生命周期创建WATCHLIST/EXECUTABLE或直接调用四个交易门控函数（P0-4）；⑤拆分`TargetStateId`与`FusionStateId`（P1-1）；⑥新增`FeatureCompleteness`四层完整度取代单一数字（P1-2）；⑦`EventSnapshot`独立时间栅格，`TransitionRecord`新增`elapsedTimeMs`（P1-3）；⑧`ForecastSnapshot`新增`featureValuesUsed`/`featureEngineVersion`/`contentHash`可复现性字段（P1-4）；⑨`ActionPermission`拆分为`readinessLevel`/`gateStatus`两个正交字段（P1-5）；⑩新增§6.4数据所有权表关闭8项广度眼/精度眼采集重叠（P1-6）；同步更新§13示例（并排展示FULL_STATE_MODE与PRICE_ONLY_MODE）、§17 V1.4范围、§19自检（改为逐项如实填写并新增P0/P1关闭核对表） |
+| gmkg-draft-3 | 2026-07-17 | CEO第二轮正文复审关闭新P0×2/新P1×5：①拆出`FormalStateId`（S0-S7不含UNKNOWN），`TransitionRecord`拆分为`FormalTransitionRecord`（仅FULL_STATE_MODE，进FULL_STATE_STATS）与`ProxyTransitionRecord`（仅PRICE_ONLY_MODE，`fromProxyState`/`toProxyState`为PriceOnlyStateId，进PROXY_STATS），INSUFFICIENT_DATA不产生迁移记录，删除"UNKNOWN↔自身"设计，`TrajectoryScenarios.transitions`改为`TransitionBundle`判别联合（P0-NEW-1）；②`ForecastOutcomeEvent`新增`expectedBarCount`/`observedBarCount`/`missingBarRefs`/`endpointDataComplete`/`pathDataComplete`/`pathEligibleForStatistics`/`directionEligibleForStatistics`，`actualHigh`/`actualLow`/`mfe`/`mae`改为`number|null`且路径不完整时严格为null（P0-NEW-2）；③冻结RANGE专属`upperExcursion`/`lowerExcursion`/`maxAbsoluteExcursion`/`rangeBreachExcursion`公式，RANGE下mfe/mae恒为null（P1-NEW-1）；④`rangeCovered`拆分为`endpointInBaselineZone`/`endpointInAnyScenarioZone`/`realizedRangeInsideExpectedEnvelope`/`expectedEnvelopeTouched`并定义`expectedEnvelope`（P1-NEW-2）；⑤冻结`scenarioWeights`有限性/范围/求和为100的不变量，重申与`calibratedProbabilities`不共用字段（P1-NEW-3）；⑥撤销"账户可压低readinessLevel"的错误表述，明确账户状态只影响`gateStatus`（P1-NEW-4）；⑦新增`BarRef`统一引用结构与`sequenceIndex`定位规则，`referenceBar`不重复计入目标路径（P1-NEW-5）；同步更新§8.4、§10.1-10.5、§11.2、§11.4、§13两个示例JSON、§14.1、§17.1、§18安全边界、§19自检（新增19.1b核对表） |
