@@ -1,0 +1,10 @@
+'use strict';const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict');let passed=0,failed=0;function test(n,f){try{f();passed++;console.log('PASS '+n)}catch(e){failed++;console.error('FAIL '+n+': '+e.message)}}const h=fs.readFileSync(path.join(__dirname,'../eth-dynamic-trading-dashboard.html'),'utf8');
+for(const id of ['tradeGateDiagnosticsSection','gateData','gatePermission','gatePlans','gateConclusion','gateReasons','gateStats','gateStorageWarning','gateExportJson','gateExportCsv'])test('诊断DOM '+id,()=>assert.match(h,new RegExp(`id="${id}"`)));
+for(const text of ['自动交易诊断中心','本轮最终结论','全部拒绝原因','拒绝原因统计','总评估次数','生成方向次数','建议存档次数','等待触发次数','实际开仓尝试次数','成功模拟开仓次数'])test('诊断中文文案 '+text,()=>assert.match(h,new RegExp(text)));
+test('生产事件调用统一诊断流水线',()=>assert.match(h,/document\.addEventListener\('v11decision'[\s\S]*D\.processTradeGate/));
+test('数据失效写入当前失败诊断',()=>assert.match(h,/window\.invalidateDashboard=[\s\S]*D\.recordFailedEvaluation/));
+test('JSON与CSV导出真实接线',()=>{assert.match(h,/D\.exportDiagnosticsJSON\(localStorage\)/);assert.match(h,/D\.exportDiagnosticsCSV\(localStorage\)/)});
+test('三类档案中文说明齐全',()=>{assert.match(h,/OBSERVATION/);assert.match(h,/WATCHLIST/);assert.match(h,/EXECUTABLE/)});
+test('自定义v11decision事件仍由刷新生产路径派发',()=>assert.match(h,/dispatchEvent\(new CustomEvent\('v11decision'/));
+test('旧静默串联已被统一流水线替换',()=>assert.doesNotMatch(h,/S\.recordSignalIfEligible\(lastDecision[\s\S]{0,300}A\.tickAutoEngine/));
+console.log(`RESULT passed=${passed} failed=${failed}`);if(failed)process.exitCode=1;
