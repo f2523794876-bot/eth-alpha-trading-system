@@ -1,6 +1,6 @@
 # GMKG_DRAGONFLY_ARCHITECTURE.md — ETH Alpha GMKG「蜻蜓复眼」总架构规范
 
-版本：gmkg-draft-3（CEO第二轮复审关闭新P0×2/新P1×5后的修订版，见文末变更记录）
+版本：gmkg-draft-4（CEO第三轮复审关闭机械性P1（P1-NEW-6）后的最终修订版，见文末变更记录）
 基线：`main` @ `6a90a1e`（含 v1.3.1，PR #5 已合并，tag `v1.3.1` 存在）
 角色：本文档是 GMKG（下称「蜻蜓复眼架构」）的**顶层目标架构规范**，回答"这套系统未来应该长成什么样"，**不是**"v1.3.1 现在已经做到了什么"的声明。本轮**只交付本文档**，不修改任何 HTML/JS/测试/正式业务代码，不创建 V1.4 六份实施文档，不开始任何编码。
 
@@ -724,17 +724,17 @@ interface ForecastOutcomeEvent {
   outcomeEventId: string;
   predictionId: string;                // 外键关联ForecastSnapshot，只读引用，不得反向修改被引用的Snapshot
   evaluatedAt: number;
-  actualStartPrice: number;            // = referenceBarRef对应K线收盘价，理论上应等于ForecastSnapshot.referencePrice，评估时重新核对而非直接照抄，用于发现数据不一致
-  actualEndPrice: number;              // = targetBarRef对应K线收盘价（仅endpointDataComplete=true时有意义，见下）
-  actualReturn: number;                // = (actualEndPrice - referencePrice) / referencePrice，基准固定用ForecastSnapshot.referencePrice（见§10.3）；仅endpointDataComplete=true时有意义
-  actualDirection: 'UP' | 'DOWN' | 'RANGE' | null;   // P0-NEW-2修订：endpointDataComplete=true时才可计算，否则null，不得填近似值
+  actualStartPrice: number | null;     // P1-NEW-6修订：= referenceBarRef对应K线收盘价；referenceBarRef缺失时严格为null，不得沿用referencePrice或其他价格填充
+  actualEndPrice: number | null;       // = targetBarRef对应K线收盘价；targetBarRef缺失时严格为null，不得填0或近似值
+  actualReturn: number | null;         // = (actualEndPrice - referencePrice) / referencePrice；只有actualStartPrice/actualEndPrice均非null且endpointDataComplete=true时才计算，否则为null（见§10.3）
+  actualDirection: 'UP' | 'DOWN' | 'RANGE' | null;   // endpointDataComplete=true时才可计算，否则null，不得填近似值
   directionCorrect: boolean | null;    // directionEligibleForStatistics=false时恒为null，见下
   // ---- 区间覆盖细分（P1-NEW-2修订，取代draft-2单一的rangeCovered） ----
   endpointInBaselineZone: boolean | null;              // 终点actualEndPrice是否落在baseline情景区间内
   endpointInAnyScenarioZone: boolean | null;           // 终点是否落入baseline/upside/downside任一冻结情景区间
   realizedRangeInsideExpectedEnvelope: boolean | null; // actualLow与actualHigh是否均位于expectedEnvelope（见下）内，仅pathDataComplete=true时可计算
   expectedEnvelopeTouched: boolean | null;             // 实际路径是否至少进入过expectedEnvelope，仅pathDataComplete=true时可计算
-  // ---- 路径类指标：仅pathDataComplete=true时非null（P0-NEW-2修订，禁止填0或近似值） ----
+  // ---- 路径类指标：仅pathDataComplete=true时非null（禁止填0或近似值） ----
   actualHigh: number | null;
   actualLow: number | null;
   mfe: number | null;                  // 见§10.4；expectedDirection='RANGE'时恒为null，见§10.4a
@@ -744,14 +744,14 @@ interface ForecastOutcomeEvent {
   lowerExcursion: number | null;
   maxAbsoluteExcursion: number | null;
   rangeBreachExcursion: number | null;
-  invalidationTriggered: boolean;
-  // ---- 路径K线完整性（P0-NEW-2新增） ----
+  invalidationTriggered: boolean | null;   // P1-NEW-6修订：只有pathDataComplete=true（完整路径可验证失效条件是否被触发）时才是boolean，否则为null，不得默认填false
+  // ---- 路径K线完整性（P0-NEW-2新增，不变量见§10.5九项） ----
   expectedBarCount: number;            // = ForecastSnapshot.expectedBarCount，冗余存一份供独立审计
   observedBarCount: number;            // 评估时刻实际观测到的、目标路径内的bar数
   missingBarRefs: BarRef[];            // 具体缺失的bar列表（sequenceIndex+barKey均需可辨识），不得只记数量
-  endpointDataComplete: boolean;       // 仅表示起点(referenceBarRef)与终点(targetBarRef)两根K线存在，不代表路径完整
-  pathDataComplete: boolean;           // 目标时间窗内全部expectedBarCount根K线均完整（= missingBarRefs.length===0）
-  pathEligibleForStatistics: boolean;  // = pathDataComplete && 无其他排除原因；MFE/MAE/区间覆盖类统计只能用此字段筛选后的样本
+  endpointDataComplete: boolean;       // 仅表示起点(referenceBarRef)与终点(targetBarRef)两根K线均存在，不代表路径完整，也不由pathDataComplete推出（见§10.5引用边界修正）
+  pathDataComplete: boolean;           // 目标时间窗sequenceIndex 1..expectedBarCount全部满足§10.5九项不变量才为true
+  pathEligibleForStatistics: boolean;  // = pathDataComplete && endpointDataComplete && 无其他排除原因；MFE/MAE/区间覆盖/RANGE专属/invalidationTriggered类统计只能用此字段筛选后的样本（这些指标的计算基准referencePrice来自referenceBarRef，属于endpointDataComplete而非pathDataComplete的检查范围，两者须同时满足）
   directionEligibleForStatistics: boolean;  // = endpointDataComplete && 无其他排除原因；方向准确率统计用此字段筛选，与pathEligibleForStatistics相互独立，不得混用
   exclusionReasons: string[];          // 必须包含具体缺失bar的barKey/sequenceIndex引用，不得只写泛化原因
   evaluationVersion: string;           // 评估逻辑本身的版本号，独立于algorithmVersion（评估公式迭代不代表预测算法变化）
@@ -760,12 +760,14 @@ interface ForecastOutcomeEvent {
 
 **红线（P0-2核心）**：`ForecastOutcomeEvent` **不得覆盖 `ForecastSnapshot`**——两者是两张独立的表/两类独立的不可变记录，只通过 `predictionId` 关联查询，任何实现代码都不允许"回填结果时顺便改写快照里的字段"。
 
-**红线（P0-NEW-2核心，数据不完整时禁止填0或近似值）**：
-- `endpointDataComplete` 只表示起点和终点两根K线存在，**不等于**路径完整；`pathDataComplete` 才表示目标时间窗内全部 `expectedBarCount` 根K线完整；
-- `actualDirection`/`actualReturn`/`directionCorrect` 可以在 `endpointDataComplete=true` 时计算（只需要起止两个点）；
+**红线（P0-NEW-2/P1-NEW-6核心，数据不完整时禁止填0、近似值或默认值）**：
+- `endpointDataComplete` 只表示起点(`referenceBarRef`)和终点(`targetBarRef`)两根K线均存在，**不等于**路径完整，也**不由** `pathDataComplete` 推出（两者检查范围不同，见§10.5红线2）；`pathDataComplete` 才表示目标时间窗内全部 `expectedBarCount` 根K线满足§10.5九项不变量；
+- `actualStartPrice`/`actualEndPrice` 各自独立地在对应的bar（`referenceBarRef`/`targetBarRef`）缺失时严格为 `null`，**不得**沿用`referencePrice`、沿用上一次评估值或填0；
+- `actualReturn`/`actualDirection`/`directionCorrect` 只有 `actualStartPrice`与`actualEndPrice`均非null且 `endpointDataComplete=true` 时才计算，否则为 `null`（只需要起止两个点，不需要路径中间的bar）；
 - `actualHigh`/`actualLow`/`mfe`/`mae`/RANGE专属四项/区间覆盖四项中依赖路径最高最低价的部分，**只有 `pathDataComplete=true` 才能计算**，否则**必须为 `null`**，**不得**填0或用起止两点近似代替真实的路径最高/最低价；
+- `invalidationTriggered` 只有 `pathDataComplete=true`（完整路径才能确认失效条件在路径中任一点是否被触发）时才是 `boolean`，否则**必须为 `null`**，**不得**默认填 `false` 冒充"确认未触发"；
 - **不得只检查 `targetBarRef` 就声称"完整"**——`targetBarRef` 存在只保证 `endpointDataComplete` 的终点部分，`pathDataComplete` 必须逐根核对 `expectedBarCount` 根bar是否都在，缺一根都不算完整；
-- 正式的综合统计（方向×区间联合评估）分母要求 `pathDataComplete=true`；如果只需要保留"仅验证方向正确性"的样本，必须使用独立的 `directionEligibleForStatistics` 字段筛选，**不得**和 `pathEligibleForStatistics` 混用同一个分母；
+- 正式的路径类统计（MFE/MAE/区间覆盖/RANGE专属/`invalidationTriggered`）分母要求 `pathEligibleForStatistics=true`（即 `pathDataComplete && endpointDataComplete` 同时成立，见§10.5红线2）；方向类统计只需要 `directionEligibleForStatistics=true`；两个分母独立判定，**不得**混用；
 - `exclusionReasons` 必须记录具体缺失的bar（通过 `missingBarRefs` 的 `barKey`/`sequenceIndex`），不得只写"数据不完整"这类泛化文案。
 
 **情景权重不变量（P1-NEW-3新增，红线）**：`scenarioWeights.{baseline,upside,downside}` 必须满足：
@@ -797,11 +799,14 @@ referencePrice = referenceBar的收盘价（不用生成时刻的"当前价"，�
 ### 10.3 方向判定规则（`UP`/`DOWN`/`RANGE`，红线，必须版本冻结）
 
 ```
-actualReturn = (actualEndPrice − ForecastSnapshot.referencePrice) / ForecastSnapshot.referencePrice   （仅endpointDataComplete=true时计算）
-
-UP：   actualReturn >= +directionThreshold
-DOWN： actualReturn <= −directionThreshold
-RANGE：−directionThreshold < actualReturn < +directionThreshold
+若 actualStartPrice !== null 且 actualEndPrice !== null 且 endpointDataComplete === true：
+  actualReturn = (actualEndPrice − ForecastSnapshot.referencePrice) / ForecastSnapshot.referencePrice
+  UP：   actualReturn >= +directionThreshold
+  DOWN： actualReturn <= −directionThreshold
+  RANGE：−directionThreshold < actualReturn < +directionThreshold
+否则：
+  actualReturn = null
+  actualDirection = null
 
 expectedDirection 使用同一套规则、同一个directionThreshold，在生成ForecastSnapshot时由算法预先给出（不是评估时才决定）
 directionCorrect = (directionEligibleForStatistics === true) ? (actualDirection === expectedDirection) : null
@@ -812,7 +817,7 @@ directionCorrect = (directionEligibleForStatistics === true) ? (actualDirection 
 ### 10.4 MFE/MAE 计算口径（红线，相对 `referencePrice` 与 `expectedDirection`，P1-NEW-1修订：RANGE不再借用方向语义的MFE/MAE）
 
 ```
-若 expectedDirection = 'UP'（仅pathDataComplete=true时计算，否则mfe/mae为null）：
+若 expectedDirection = 'UP'（仅pathEligibleForStatistics=true，即pathDataComplete且endpointDataComplete同时成立时计算，否则mfe/mae为null，见§10.1红线）：
   mfe = (actualHigh − referencePrice) / referencePrice   （最大有利：价格向上偏离基准的最大幅度）
   mae = (referencePrice − actualLow) / referencePrice    （最大不利：价格向下偏离基准的最大幅度）
 若 expectedDirection = 'DOWN'（同上前提）：
@@ -825,7 +830,7 @@ directionCorrect = (directionEligibleForStatistics === true) ? (actualDirection 
 ```
 mfe = null                                                    （RANGE本身没有方向，不得强行套用带方向语义的"有利/不利"）
 mae = null
-upperExcursion = (actualHigh − referencePrice) / referencePrice        （仅pathDataComplete=true时计算，否则为null）
+upperExcursion = (actualHigh − referencePrice) / referencePrice        （仅pathEligibleForStatistics=true时计算，否则为null）
 lowerExcursion = (referencePrice − actualLow) / referencePrice
 maxAbsoluteExcursion = max(upperExcursion, lowerExcursion)
 rangeBreachExcursion = max(0, maxAbsoluteExcursion − directionThreshold)   （实际路径偏离基准的最大幅度，相对RANGE判定阈值超出了多少；0表示全程未突破RANGE阈值）
@@ -841,15 +846,44 @@ expectedEnvelope = { lower: min(baseline.lower, upside.lower, downside.lower), u
 
 endpointInBaselineZone            = actualEndPrice ∈ [baseline.lower, baseline.upper]                       （仅检查终点，endpointDataComplete=true时可计算）
 endpointInAnyScenarioZone         = actualEndPrice ∈ baseline区间 ∪ upside区间 ∪ downside区间任一          （同上前提）
-realizedRangeInsideExpectedEnvelope = (actualLow >= expectedEnvelope.lower) && (actualHigh <= expectedEnvelope.upper)   （要求路径最高最低价均在包络内，仅pathDataComplete=true时可计算）
-expectedEnvelopeTouched            = 实际路径([actualLow, actualHigh])与expectedEnvelope存在交集             （表示路径是否至少进入过预测包络，仅pathDataComplete=true时可计算）
+realizedRangeInsideExpectedEnvelope = (actualLow >= expectedEnvelope.lower) && (actualHigh <= expectedEnvelope.upper)   （要求路径最高最低价均在包络内，仅pathEligibleForStatistics=true时可计算）
+expectedEnvelopeTouched            = 实际路径([actualLow, actualHigh])与expectedEnvelope存在交集             （表示路径是否至少进入过预测包络，仅pathEligibleForStatistics=true时可计算）
 ```
 
 数据不完整（对应前提条件不满足）时，四个字段均为 `null`，不得填 `false` 冒充"确认未覆盖"。
 
-### 10.5 缺失K线的统计排除规则（红线，呼应V1.3"estimated交易排除于验证统计"同一哲学，P0-NEW-2修订）
+### 10.5 路径完整性判定与缺失K线的统计排除规则（红线，呼应V1.3"estimated交易排除于验证统计"同一哲学，P1-NEW-6修订：`pathDataComplete`九项不变量+`referenceBar`归属澄清）
 
-若评估时刻目标路径内任意一根bar（`sequenceIndex 1..expectedBarCount`）缺失（数据源缺口未回补，或尚未到达该时间点），该bar被记入 `missingBarRefs`，`pathDataComplete=false`；若仅 `referenceBarRef`/`targetBarRef` 两个端点其中之一缺失，则 `endpointDataComplete=false`（此时 `pathDataComplete` 必然也为false，因为端点本身就是路径的一部分）。`exclusionReasons` 必须记录具体原因（如`'bar_missing:sequenceIndex=47'`/`'target_bar_not_yet_closed'`）。**缺失K线的记录不得进入正式方向准确率/区间覆盖率统计分母**——方向准确率使用 `directionEligibleForStatistics` 筛选，区间覆盖/MFE/MAE类使用 `pathEligibleForStatistics` 筛选，二者独立判定、独立使用，这与 `V1_3_PAPER_TRADING_SPEC.md` 已确立的"estimated交易排除于验证统计"是同一类工程纪律的延伸，不重新发明。
+#### 10.5.0 `referenceBar` 与目标路径的边界澄清（P1-NEW-6修订，纠正draft-3含糊表述）
+
+**draft-3曾写"端点本身就是路径的一部分"，这句话把`referenceBar`（起点端点）也算作了目标路径的一部分，与§10.2"目标路径=sequenceIndex 1..N，不含sequenceIndex=0的referenceBar"这一定义相矛盾。本节予以澄清，不再含糊**：
+
+1. **`referenceBar`（`sequenceIndex=0`）是路径计算的基准，不属于`sequenceIndex 1..expectedBarCount`的目标路径**——它提供`referencePrice`这一计算基准，本身不是路径完整性检查的对象；
+2. **`referenceBar`缺失会使`endpointDataComplete=false`**（因为`endpointDataComplete`定义为"起点+终点两根K线均存在"，`referenceBar`是起点），**但不直接导致`pathDataComplete=false`**——`pathDataComplete`只检查`sequenceIndex 1..expectedBarCount`范围内的bar是否齐全，`referenceBar`不在这个检查范围内，理论上可以出现"`referenceBar`缺失但`sequenceIndex 1..N`全部完整"这一情形，此时`pathDataComplete=true`但`endpointDataComplete=false`；
+3. **目标路径完整性（`pathDataComplete`）单独检查`sequenceIndex 1..N`**，与`referenceBar`是否存在无关，见下方九项不变量；
+4. **正式路径评估（MFE/MAE/区间覆盖/RANGE专属/`invalidationTriggered`）同时要求`referencePrice`有效（即`endpointDataComplete=true`，因为`referencePrice`来自`referenceBar`）和目标路径完整（`pathDataComplete=true`）**——两个条件独立、都必须满足，这正是`pathEligibleForStatistics = pathDataComplete && endpointDataComplete && 无其他排除原因`（见§10.1）的设计原因：`pathDataComplete=true`只保证"路径本身完整"，不保证"计算路径指标所需的基准价格也存在"，必须两者同时成立。
+
+#### 10.5.1 `pathDataComplete=true` 的九项不变量（P1-NEW-6新增，全部满足才能为true）
+
+1. `observedBarCount === expectedBarCount`；
+2. `missingBarRefs.length === 0`；
+3. `sequenceIndex` 完整覆盖 `1..expectedBarCount`，不允许有缺口；
+4. `sequenceIndex` 没有重复；
+5. `barKey` 没有重复；
+6. K线按时间严格递增（后一根bar的`openTime`不早于前一根bar的`closeTime`）；
+7. `targetBarRef` 对应的bar其 `sequenceIndex === expectedBarCount`（即目标路径的最后一根就是`targetBarRef`本身，不是路径之外的另一根bar）；
+8. 路径内所有bar均已收盘（不使用盘中未收盘K线拼凑路径）；
+9. 不存在 `estimated`、`synthetic` 或未经验证的回补bar（呼应`V1_3_PAPER_TRADING_SPEC.md`"estimated交易排除于验证统计"同一哲学——路径评估只能用真实、已验证的K线，不能用插值/估算值填补缺口再声称"完整"）。
+
+**任意一项不满足**：
+- `pathDataComplete = false`；
+- `pathEligibleForStatistics = false`；
+- 依赖路径的指标（`actualHigh`/`actualLow`/`mfe`/`mae`/RANGE专属四项/`realizedRangeInsideExpectedEnvelope`/`expectedEnvelopeTouched`/`invalidationTriggered`）**全部为 `null`**，不得填0、近似值或默认值；
+- `exclusionReasons` 必须记录具体触发了九项中的哪一项、涉及哪根bar（如`'bar_missing:sequenceIndex=47'`/`'sequence_gap:missing 12-15'`/`'duplicate_sequenceIndex:47'`/`'duplicate_barKey:ETH-15m-...'`/`'non_monotonic_time:sequenceIndex=30'`/`'target_bar_index_mismatch'`/`'bar_not_closed:sequenceIndex=96'`/`'estimated_bar_rejected:sequenceIndex=12'`），不得只写"数据不完整"这类泛化文案。
+
+#### 10.5.2 缺失K线的统计排除规则
+
+若评估时刻目标路径内任意一根bar（`sequenceIndex 1..expectedBarCount`）缺失（数据源缺口未回补，或尚未到达该时间点），该bar被记入 `missingBarRefs`，`pathDataComplete=false`；若 `referenceBarRef`/`targetBarRef` 任一缺失，则 `endpointDataComplete=false`（`referenceBar`缺失与路径是否完整相互独立，见§10.5.0）。`exclusionReasons` 必须记录具体原因。**缺失K线的记录不得进入正式方向准确率/区间覆盖率统计分母**——方向准确率使用 `directionEligibleForStatistics` 筛选，路径类统计使用 `pathEligibleForStatistics` 筛选，二者独立判定、独立使用，这与 `V1_3_PAPER_TRADING_SPEC.md` 已确立的"estimated交易排除于验证统计"是同一类工程纪律的延伸，不重新发明。
 
 ### 10.6 幂等回填（红线）
 
@@ -1226,7 +1260,7 @@ interface ErrorAttribution {
 
 本节只提出建议范围，**不创建六份V1.4实施文档，不开始编码**，具体六份文档的撰写留待 CEO 另行批准后启动。
 
-### 17.1 V1.4 必须实现（【V1.4可实施最小范围】，P0-3/P0-2/P1-2/P1-5/P0-NEW-1/P0-NEW-2/P1-NEW-1至5修订）
+### 17.1 V1.4 必须实现（【V1.4可实施最小范围】，P0-3/P0-2/P1-2/P1-5/P0-NEW-1/P0-NEW-2/P1-NEW-1至6修订）
 
 1. 四系统接口的**类型定义**（`WorldState`/`TargetState`/`TrajectoryScenarios`/`ForecastResult`/`ActionPermission`的TypeScript接口，作为纯规范，不要求所有字段都有真实数据源支撑）；
 2. 统一状态帧格式（§4.4 `StateFrame`结构定义，允许多数字段初期为空/`missing`，只要求结构存在）；
@@ -1244,7 +1278,7 @@ interface ErrorAttribution {
 14. 为未来240+48项数据预留接口（`WorldState`/`TargetState`的字段结构提前按§5/§6定义好，即使多数字段初期为`null`/`missing`）；
 15. §6.4 数据所有权表在类型/字段命名层面落地（即使B-G组大部分字段当前为`missing`，`sourceRef`命名约定必须从一开始就统一，避免未来接入时才发现广度眼/精度眼各自建了一套字段名）；
 16. **`BarRef`统一引用结构与序号定位（P1-NEW-5修订）**——§10.1 `BarRef`（`openTime`/`closeTime`/`timeframeMs`/`sequenceIndex`/`barKey`）落地，`referenceBarRef`/`targetBarRef`均改用此结构；实现时必须先核实Binance K线`closeTime`的精确边界约定（`openTime+timeframeMs`还是`openTime+timeframeMs-1`），写入实施工单，不得含糊假设；
-17. **路径K线完整性字段（P0-NEW-2修订）**——`ForecastOutcomeEvent`的`expectedBarCount`/`observedBarCount`/`missingBarRefs`/`endpointDataComplete`/`pathDataComplete`/`pathEligibleForStatistics`/`directionEligibleForStatistics`全部落地；`actualHigh`/`actualLow`/`mfe`/`mae`类型为`number|null`，数据不完整时严格为`null`，不得填0或近似值；
+17. **路径K线完整性字段（P0-NEW-2/P1-NEW-6修订）**——`ForecastOutcomeEvent`的`expectedBarCount`/`observedBarCount`/`missingBarRefs`/`endpointDataComplete`/`pathDataComplete`/`pathEligibleForStatistics`/`directionEligibleForStatistics`全部落地，`pathDataComplete`按§10.5.1九项不变量实现（序号覆盖/无重复/时间严格递增/目标bar索引匹配/全部已收盘/无estimated或synthetic回补bar等）；`actualStartPrice`/`actualEndPrice`/`actualReturn`/`actualHigh`/`actualLow`/`mfe`/`mae`类型为`number|null`，`invalidationTriggered`类型为`boolean|null`，数据不完整时严格为`null`，不得填0、近似值或默认`false`；`referenceBar`不计入`pathDataComplete`检查范围，其缺失只影响`endpointDataComplete`，两者独立判定，路径类统计分母`pathEligibleForStatistics`要求二者同时成立（§10.5.0）；
 18. **RANGE专属路径指标与区间覆盖细分（P1-NEW-1/P1-NEW-2修订）**——`upperExcursion`/`lowerExcursion`/`maxAbsoluteExcursion`/`rangeBreachExcursion`（§10.4）与`endpointInBaselineZone`/`endpointInAnyScenarioZone`/`realizedRangeInsideExpectedEnvelope`/`expectedEnvelopeTouched`（§10.4a）落地，取代单一的`rangeCovered`；
 19. **情景权重不变量校验（P1-NEW-3修订）**——`scenarioWeights`写入`ForecastSnapshot`前必须校验有限性/范围/求和为100，并实现归一化+舍入算法（具体算法在实施工单中冻结）；
 20. **`readinessLevel`不受账户状态影响的实现约束（P1-NEW-4修订）**——`ActionPermission`计算函数中，账户/风控相关输入只允许写入`gateStatus`/`riskConditions`，不得出现任何"账户余额/冷却期→修改readinessLevel或readinessCeiling"的代码路径，V1.4阶段应有对应的单元测试断言这一隔离（正式测试代码留待未来实施阶段编写，本文档不创建测试文件）。
@@ -1265,11 +1299,11 @@ interface ErrorAttribution {
 
 ## 18. 安全边界（重申，贯穿全文，本节做最终汇总）
 
-继续禁止：真实交易；连接交易所账户；读取API密钥或私钥；发送订单；盈利保证；伪造概率（`calibratedProbability`未满足§8.5门槛前恒为null）；使用未来数据（§4.3`availableAt`红线/§8.2/§14.1数据泄漏防线）；覆盖历史预测（§10.1/§14.1`ForecastSnapshot`不可变红线）；削弱v1.3.1门控（§12逐条映射红线）；把候选数据源写成已经接入（全文【标注】体系的存在意义）；把目标架构写成当前已实现功能（同上，§7.0a/§13并排示例是这条红线的具体落实）；把同一份原始数据重复采集后双重计权（§6.4数据所有权红线）；把`PRICE_ONLY_MODE`代理判断包装成`FULL_STATE_MODE`正式状态（§7.0a/§7.0b红线）；让24H/72H判断绕过既有15分钟交易生命周期创建`WATCHLIST`/`EXECUTABLE`（§12红线）；把`ProxyTransitionRecord`混入`FULL_STATE_STATS`或正式校准分母（§8.4红线）；在路径K线不完整时对`actualHigh`/`actualLow`/`mfe`/`mae`等字段填0或近似值而非`null`（§10.1/§10.5红线）；让`scenarioWeights`三项之和不等于100或含NaN/Infinity/负值（§10.1情景权重不变量红线）；让账户/风控状态修改`readinessLevel`或`readinessCeiling`（§11.4红线，账户状态只能影响`gateStatus`）。
+继续禁止：真实交易；连接交易所账户；读取API密钥或私钥；发送订单；盈利保证；伪造概率（`calibratedProbability`未满足§8.5门槛前恒为null）；使用未来数据（§4.3`availableAt`红线/§8.2/§14.1数据泄漏防线）；覆盖历史预测（§10.1/§14.1`ForecastSnapshot`不可变红线）；削弱v1.3.1门控（§12逐条映射红线）；把候选数据源写成已经接入（全文【标注】体系的存在意义）；把目标架构写成当前已实现功能（同上，§7.0a/§13并排示例是这条红线的具体落实）；把同一份原始数据重复采集后双重计权（§6.4数据所有权红线）；把`PRICE_ONLY_MODE`代理判断包装成`FULL_STATE_MODE`正式状态（§7.0a/§7.0b红线）；让24H/72H判断绕过既有15分钟交易生命周期创建`WATCHLIST`/`EXECUTABLE`（§12红线）；把`ProxyTransitionRecord`混入`FULL_STATE_STATS`或正式校准分母（§8.4红线）；在路径K线不完整时对`actualStartPrice`/`actualEndPrice`/`actualReturn`/`actualHigh`/`actualLow`/`mfe`/`mae`/`invalidationTriggered`等字段填0、近似值或默认`false`而非`null`（§10.1/§10.5红线）；让`scenarioWeights`三项之和不等于100或含NaN/Infinity/负值（§10.1情景权重不变量红线）；让账户/风控状态修改`readinessLevel`或`readinessCeiling`（§11.4红线，账户状态只能影响`gateStatus`）；把`referenceBar`算作`pathDataComplete`检查范围内的一部分，或反过来用`pathDataComplete=true`直接推出`endpointDataComplete=true`（§10.5.0红线，两者独立判定）。
 
 ---
 
-## 19. 文档完成后自检（两轮CEO复审共关闭P0×6/P1×11后，逐项如实填写，不再直接写"全部通过"）
+## 19. 文档完成后自检（三轮CEO复审共关闭P0×6/P1×12后，逐项如实填写，不再直接写"全部通过"）
 
 ### 19.1 CEO第一轮复审 P0/P1 十项关闭核对表
 
@@ -1298,6 +1332,12 @@ interface ErrorAttribution {
 | P1-NEW-4 | 账户状态可能改变readinessLevel | 撤销draft-2"账户/风控可以把readinessLevel往下压"的错误注释；明确`readinessLevel`/`readinessCeiling`只由预测证据/数据质量/时间尺度/历史校准状态决定，账户状态只影响`gateStatus`，`riskConditions`仅供只读展示 | §11.4 |
 | P1-NEW-5 | 15分钟K线边界与索引规则未冻结 | 新增`BarRef`（`openTime`/`closeTime`/`timeframeMs`/`sequenceIndex`/`barKey`）；`referenceBar`固定`sequenceIndex=0`且不计入目标路径；目标路径为`sequenceIndex 1..96/288`；要求按`sequenceIndex`遍历定位而非纯毫秒加法；标注`closeTime`边界约定须在实施工单中用真实API核实冻结 | §10.1、§10.2 |
 
+### 19.1c CEO第三轮复审 机械性P1（P1-NEW-6）关闭核对表
+
+| # | 问题 | 关闭方式 | 关闭位置 |
+|---|---|---|---|
+| P1-NEW-6 | `ForecastOutcomeEvent`可空类型不完整+`pathDataComplete`不变量缺失+`referenceBar`归属表述含糊 | `actualStartPrice`/`actualEndPrice`/`actualReturn`改为`number\|null`，`invalidationTriggered`改为`boolean\|null`，均按`endpointDataComplete`/`pathDataComplete`条件严格判定，不得填0/近似值/默认`false`；新增`pathDataComplete=true`九项不变量（序号覆盖/无重复序号/无重复barKey/时间严格递增/目标bar索引匹配/全部已收盘/无estimated或synthetic回补bar等）；新增§10.5.0澄清`referenceBar`不属于`sequenceIndex 1..N`目标路径，其缺失只影响`endpointDataComplete`，与`pathDataComplete`相互独立，路径类统计要求`pathEligibleForStatistics=pathDataComplete && endpointDataComplete`同时成立 | §10.1、§10.3、§10.4、§10.4a、§10.5.0、§10.5.1、§10.5.2、§17.1第17条、§18 |
+
 ### 19.2 逐项自检（如实反映修订后状态，不再统一写"通过"）
 
 | # | 自检项 | 结论 |
@@ -1308,7 +1348,7 @@ interface ErrorAttribution {
 | 4 | 300帧是否包含as-of时间和数据质量 | 达标——见§4.3/§4.4 `DataVintageRef`完整七字段时间契约、`StateFrame.dataQuality`；§4.5关闭了draft-1"事件插入288帧序列"的错误表述 |
 | 5 | 八状态是否具备可计算方向 | **部分达标，如实标注差距**——`FULL_STATE_MODE`下§7.1定义了每状态的完整可计算规则，其迁移记录（`FormalTransitionRecord`）类型与统计分组也已在第二轮冻结（§8.4）；但当前v1.3.1基线只有A组数据，只能运行在`PRICE_ONLY_MODE`，只产生`ProxyTransitionRecord`，无法产出真正的S0-S7判定或正式迁移率，该差距已通过§7.0a/§7.0b/§8.4/§13.2明确标注，不再像draft-1那样含糊带过 |
 | 6 | 规则权重是否与概率严格分离 | 达标——见§8.2/§8.5/§11.1/§13示例，`calibratedProbability`全文恒为null（未校准场景） |
-| 7 | 24H和72H是否独立验证 | 达标——见§10.1 `ForecastSnapshot`/`ForecastOutcomeEvent`独立结构，§9场景2允许方向不同；第二轮进一步补齐了路径K线完整性判定（`pathDataComplete`/`endpointDataComplete`）、RANGE专属指标、区间覆盖四分法、情景权重不变量、`BarRef`序号定位规则，此前"用targetBarRef存在就声称完整"的隐患已关闭（P0-NEW-2/P1-NEW-1/P1-NEW-2/P1-NEW-3/P1-NEW-5） |
+| 7 | 24H和72H是否独立验证 | 达标——见§10.1 `ForecastSnapshot`/`ForecastOutcomeEvent`独立结构，§9场景2允许方向不同；第二轮补齐了路径K线完整性判定（`pathDataComplete`/`endpointDataComplete`）、RANGE专属指标、区间覆盖四分法、情景权重不变量、`BarRef`序号定位规则；第三轮进一步冻结`pathDataComplete`九项不变量、把`actualStartPrice`/`actualEndPrice`/`actualReturn`/`invalidationTriggered`全部改为严格可空类型、并纠正`referenceBar`与目标路径的边界表述（§10.5.0），此前"用targetBarRef存在就声称完整"的隐患已彻底关闭（P0-NEW-2/P1-NEW-1至6） |
 | 8 | 冲突状态是否允许WAIT | 达标——见§9场景4 `fusionState='CONFLICTED'`/`gateStatus='WAIT'`/`readinessLevel`强制降为`OBSERVE`/`waitingForSignals` |
 | 9 | 误差归因是否防止事后解释 | 达标——见§15.3"归因规则必须结果发生前预先定义"；§14.1补充说明`ErrorAttribution`同样通过`predictionId`独立记录，不内嵌`ForecastSnapshot` |
 | 10 | 是否保留v1.3.1全部安全门控 | 达标——见§12全节重写后的红线1-10，源码已核实（`buildTradeProposal`/`processTradeGate`/信号快照字段）；本轮额外关闭了"24H/72H许可绕过既有信号创建"这一此前未覆盖的风险点（P0-4） |
@@ -1325,3 +1365,4 @@ interface ErrorAttribution {
 | gmkg-draft-1 | 2026-07-17 | 初稿：冻结GMKG四系统核心原则、命名消歧（与既有蜻蜓捕猎模型区分）、360度/300帧工程定义、广度眼12域240项、精度眼48项、单眼八状态模型、迁移模型与概率红线、冲突裁决四场景、时间尺度、融合中枢双输出、与v1.3.1行动许可兼容映射、最终输出快照示例、验证学习闭环、误差归因、架构现实边界、V1.4最小范围建议、安全边界与自检 |
 | gmkg-draft-2 | 2026-07-17 | CEO正文复审关闭P0×4/P1×6：①新增`DataVintageRef`七字段时间/版本契约+`DataRevisionEvent`追加式修订，冻结`availableAt<=forecastCreatedAt`防泄漏红线（P0-1）；②`LongHorizonForecastLog`拆分为不可变的`ForecastSnapshot`与追加式的`ForecastOutcomeEvent`，定义方向判定/RANGE阈值冻结/起止K线/MFE-MAE口径/缺失K线排除/幂等回填（P0-2）；③新增`FULL_STATE_MODE`/`PRICE_ONLY_MODE`/`INSUFFICIENT_DATA`三运行模式与逐状态最低数据组表，修正"用A组实现八状态"错误表述（P0-3）；④重写§12，24H/72H许可限定为`DISPLAY_ONLY`/`AUDIT_ONLY`，明确不得绕过既有15分钟交易生命周期创建WATCHLIST/EXECUTABLE或直接调用四个交易门控函数（P0-4）；⑤拆分`TargetStateId`与`FusionStateId`（P1-1）；⑥新增`FeatureCompleteness`四层完整度取代单一数字（P1-2）；⑦`EventSnapshot`独立时间栅格，`TransitionRecord`新增`elapsedTimeMs`（P1-3）；⑧`ForecastSnapshot`新增`featureValuesUsed`/`featureEngineVersion`/`contentHash`可复现性字段（P1-4）；⑨`ActionPermission`拆分为`readinessLevel`/`gateStatus`两个正交字段（P1-5）；⑩新增§6.4数据所有权表关闭8项广度眼/精度眼采集重叠（P1-6）；同步更新§13示例（并排展示FULL_STATE_MODE与PRICE_ONLY_MODE）、§17 V1.4范围、§19自检（改为逐项如实填写并新增P0/P1关闭核对表） |
 | gmkg-draft-3 | 2026-07-17 | CEO第二轮正文复审关闭新P0×2/新P1×5：①拆出`FormalStateId`（S0-S7不含UNKNOWN），`TransitionRecord`拆分为`FormalTransitionRecord`（仅FULL_STATE_MODE，进FULL_STATE_STATS）与`ProxyTransitionRecord`（仅PRICE_ONLY_MODE，`fromProxyState`/`toProxyState`为PriceOnlyStateId，进PROXY_STATS），INSUFFICIENT_DATA不产生迁移记录，删除"UNKNOWN↔自身"设计，`TrajectoryScenarios.transitions`改为`TransitionBundle`判别联合（P0-NEW-1）；②`ForecastOutcomeEvent`新增`expectedBarCount`/`observedBarCount`/`missingBarRefs`/`endpointDataComplete`/`pathDataComplete`/`pathEligibleForStatistics`/`directionEligibleForStatistics`，`actualHigh`/`actualLow`/`mfe`/`mae`改为`number|null`且路径不完整时严格为null（P0-NEW-2）；③冻结RANGE专属`upperExcursion`/`lowerExcursion`/`maxAbsoluteExcursion`/`rangeBreachExcursion`公式，RANGE下mfe/mae恒为null（P1-NEW-1）；④`rangeCovered`拆分为`endpointInBaselineZone`/`endpointInAnyScenarioZone`/`realizedRangeInsideExpectedEnvelope`/`expectedEnvelopeTouched`并定义`expectedEnvelope`（P1-NEW-2）；⑤冻结`scenarioWeights`有限性/范围/求和为100的不变量，重申与`calibratedProbabilities`不共用字段（P1-NEW-3）；⑥撤销"账户可压低readinessLevel"的错误表述，明确账户状态只影响`gateStatus`（P1-NEW-4）；⑦新增`BarRef`统一引用结构与`sequenceIndex`定位规则，`referenceBar`不重复计入目标路径（P1-NEW-5）；同步更新§8.4、§10.1-10.5、§11.2、§11.4、§13两个示例JSON、§14.1、§17.1、§18安全边界、§19自检（新增19.1b核对表） |
+| gmkg-draft-4 | 2026-07-18 | CEO第三轮复审关闭最后1项机械性P1（P1-NEW-6）：①`ForecastOutcomeEvent.actualStartPrice`/`actualEndPrice`/`actualReturn`改为`number\|null`，`invalidationTriggered`改为`boolean\|null`，均按`endpointDataComplete`/`pathDataComplete`条件严格判定为null，不得填0/近似值/默认false；②新增`pathDataComplete=true`九项不变量（`observedBarCount===expectedBarCount`、`missingBarRefs`为空、`sequenceIndex`完整覆盖且无重复、`barKey`无重复、时间严格递增、`targetBarRef`索引匹配`expectedBarCount`、全部已收盘、无estimated/synthetic回补bar），任一不满足则`pathDataComplete=false`且路径类指标全部为null；③新增§10.5.0澄清`referenceBar`（`sequenceIndex=0`）不属于`sequenceIndex 1..N`目标路径，其缺失只影响`endpointDataComplete`，与`pathDataComplete`相互独立判定，纠正draft-3"端点本身就是路径的一部分"的含糊表述；`pathEligibleForStatistics`定义同步更新为`pathDataComplete && endpointDataComplete && 无其他排除原因`；同步更新§10.1、§10.3、§10.4、§10.4a、§10.5、§17.1第17条、§18安全边界、§19自检（新增19.1c核对表，更新第7项自检） |
