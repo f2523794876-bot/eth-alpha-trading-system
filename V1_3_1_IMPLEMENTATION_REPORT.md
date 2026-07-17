@@ -37,3 +37,17 @@
 ## 环境说明
 
 开始时本地 `main` 与现有 `origin/main` 均为 `353e28d`（V1.3 merge）。在线 `git fetch` 因本机HTTPS Git helper/Xcode环境不可用而失败；开发基于已同步的本地远端跟踪基线完成。
+
+## 最终安全复审修复
+
+Claude复审指出：第一版OBSERVATION虽然不能直接开仓，但其结构完整时影子状态仍从`WAITING_TRIGGER`开始，后续K线可能把它变为`TRIGGERED`；如果新的当前决策许可通过，旧观察记录可能被升级并借用新许可开仓。
+
+最终规则改为：
+
+- 每条不可变信号快照固化`eligibleForTrigger`、`permissionAtCreation`、`worthBettingAtCreation`、`hardBlockedAtCreation`、`signalPermissionLevelAtCreation`、`opportunityBlockedAtCreation`。
+- OBSERVATION创建时任何许可证据不完整即`eligibleForTrigger=false`，影子状态只能是`OBSERVING/OBSERVATION_COMPLETED`，不能进入交易生命周期。
+- WATCHLIST必须在创建时已取得完整许可；未来触发只代表价格条件满足，当前许可仍须重新通过。
+- EXECUTABLE只由同一生产tick在创建时许可、当前许可、账户风控和反向冷却全部通过后升级。
+- 自动引擎再次校验原始许可字段、类别、方向延续和当前十九项门禁；未知或缺失字段默认拒绝。
+- V1.3 signal schema升级到`v1.3-signal-3`。旧记录缺少新增证据时统一迁移为不可触发OBSERVATION，不从历史结构反推许可。
+- 准确率统计只纳入创建时有许可、实际触发、`verified=true`且无未解决缺口的信号；胜负统计分母只使用已完成或已止损的可验证结果。
