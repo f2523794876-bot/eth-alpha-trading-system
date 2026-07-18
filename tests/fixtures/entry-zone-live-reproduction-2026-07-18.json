@@ -1,0 +1,47 @@
+{
+  "capturedAt": "2026-07-18T07:54:16.192Z",
+  "source": "Binance public REST via production buildDecision chain",
+  "symbol": "ETHUSDT",
+  "confirmedPrice": 1845.34,
+  "atr14": 2.445000000000001,
+  "beforeFix": {
+    "long": {
+      "displayEntryZone": "1,845.89 – 1,846.63",
+      "estimatedEntry": 1846.62675,
+      "parsedLower": 1,
+      "parsedUpper": 846.63,
+      "distanceUsdt": 998.7099999999999,
+      "distanceAtr": 408.4703476482615
+    },
+    "short": {
+      "displayEntryZone": "1,844.63 – 1,845.37",
+      "estimatedEntry": 1844.63325,
+      "parsedLower": 1,
+      "parsedUpper": 845.37,
+      "distanceUsdt": 999.9699999999999,
+      "distanceAtr": 408.98568507157444
+    }
+  },
+  "afterFix": {
+    "long": {
+      "structuredEntryZone": {
+        "lower": 1845.89325,
+        "upper": 1846.62675,
+        "estimatedEntry": 1846.62675
+      },
+      "source": "structured_values",
+      "distanceUsdt": 0.5532500000001619,
+      "distanceAtr": 0.22627811860947306
+    },
+    "short": {
+      "structuredEntryZone": {
+        "lower": 1844.63325,
+        "upper": 1845.36675,
+        "estimatedEntry": 1844.63325
+      },
+      "source": "structured_values",
+      "distanceUsdt": 0,
+      "distanceAtr": 0
+    }
+  }
+}

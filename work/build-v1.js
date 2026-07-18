@@ -12,6 +12,12 @@ function build(){
   const signalUi=fs.readFileSync(path.join(__dirname,'v1-signal-archive.template.html'),'utf8');
   const autoUi=fs.readFileSync(path.join(__dirname,'v1-auto-engine.template.html'),'utf8');
   const diagnosticsUi=fs.readFileSync(path.join(__dirname,'v1-trade-gate-diagnostics.template.html'),'utf8');
+  const gmkgFragment=fs.readFileSync(path.join(__dirname,'v1-gmkg-min-loop.template.html'),'utf8');
+  const gmkgRuntimeMatches=[...gmkgFragment.matchAll(/<script data-v14-runtime>([\s\S]*?)<\/script>/g)];
+  if(gmkgRuntimeMatches.length!==1)throw Error(`构建替换失配：V1.4 GMKG运行时脚本，预期 1 处，实际 ${gmkgRuntimeMatches.length} 处`);
+  const gmkgRuntimeMatch=gmkgRuntimeMatches[0];
+  const gmkgUi=replaceExact(gmkgFragment,gmkgRuntimeMatch[0],'',1,'V1.4 GMKG运行时脚本剥离');
+  const gmkgRuntime=gmkgRuntimeMatch[1];
   const replacements=[
     ['ETH ALPHA · V1 REST DECISION CORE','ETH Alpha · V1 多周期REST决策核心',1,'页面标题'],
     ['4H','4小时',6,'4H中文化'],
@@ -42,18 +48,25 @@ function build(){
   template=replaceExact(template,'/*__SIGNAL_ARCHIVE_UI__*/',signalUi,1,'V1.3建议档案UI占位符');
   template=replaceExact(template,'/*__AUTO_ENGINE_UI__*/',autoUi,1,'V1.3自动引擎UI占位符');
   template=replaceExact(template,'/*__TRADE_GATE_DIAGNOSTICS_UI__*/',diagnosticsUi,1,'V1.3.1自动交易诊断UI占位符');
+  template=replaceExact(template,'/*__GMKG_MIN_LOOP_UI__*/',gmkgUi,1,'V1.4 GMKG最小闭环UI占位符');
   const core=fs.readFileSync(path.join(root,'v1-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const forecast=fs.readFileSync(path.join(root,'v1_2-forecast-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const paper=fs.readFileSync(path.join(root,'v1_3-paper-trading-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const signal=fs.readFileSync(path.join(root,'v1_3-signal-archive-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const auto=fs.readFileSync(path.join(root,'v1_3-auto-engine-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const diagnostics=fs.readFileSync(path.join(root,'v1_3-trade-gate-diagnostics.js'),'utf8').replace(/<\/script/gi,'<\\/script');
+  const gmkg=[
+    'v1_4-gmkg-forecast-core.js',
+    'v1_4-gmkg-outcome-core.js',
+    'v1_4-gmkg-validation-core.js'
+  ].map(file=>fs.readFileSync(path.join(root,file),'utf8').replace(/<\/script/gi,'<\\/script')).concat(gmkgRuntime.replace(/<\/script/gi,'<\\/script')).join('\n;\n');
   template=replaceExact(template,'/*__CORE__*/',core,1,'V1.1核心占位符');
   template=replaceExact(template,'/*__FORECAST__*/',forecast,1,'V1.2预测核心占位符');
   template=replaceExact(template,'/*__PAPER_TRADING__*/',paper,1,'V1.3模拟账户核心占位符');
   template=replaceExact(template,'/*__SIGNAL_ARCHIVE__*/',signal,1,'V1.3建议档案核心占位符');
   template=replaceExact(template,'/*__AUTO_ENGINE__*/',auto,1,'V1.3自动引擎核心占位符');
   template=replaceExact(template,'/*__TRADE_GATE_DIAGNOSTICS__*/',diagnostics,1,'V1.3.1自动交易诊断核心占位符');
+  template=replaceExact(template,'/*__GMKG_MIN_LOOP__*/',gmkg,1,'V1.4 GMKG最小闭环核心占位符');
   fs.writeFileSync(path.join(root,'eth-dynamic-trading-dashboard.html'),template);
   console.log('built eth-dynamic-trading-dashboard.html');
 }
