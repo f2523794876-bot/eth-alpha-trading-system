@@ -33,6 +33,26 @@ eth-dynamic-trading-dashboard.html / index.html / eth-trading-dashboard.html —
 work/build-v1.js                  — 只允许**新增**占位符替换调用（见§7），不得修改既有替换逻辑
 ```
 
+### 1.2a 实施阶段CEO授权例外记录（追加治理留痕，不改写§1.2原红线）
+
+§1.2的原始禁止修改规则完整保留。以下两项是在实施阶段由真实公开行情或人工验收发现P0后，经CEO逐项批准的特定例外；它们不构成未来可随意修改冻结文件的先例，六份V1.4规范中的其他红线继续有效。
+
+**例外一：因果滚动ATR异常检测**
+
+- 原因：真实BTCUSDT 15m样本证明`detectAnomalyBars()`使用窗口末端ATR回溯全部历史K线，造成时间错配并把27根正常历史K线误判为异常。
+- 授权范围：仅限`v1-core.js`中的因果滚动ATR异常检测，以及必要的专项测试、冻结哈希和单文件构建同步。
+- 落地提交：`207f9e9ddf4eef2c658cc342876520a299bce979`。
+- 安全约束：保留`5×ATR`阈值和`anomalyBarsExcluded>5`健康门；未授权其他`v1-core.js`重构。
+
+**例外二：结构化入场区数值贯通**
+
+- 原因：真实页面证明格式化展示字符串`1,845.xx`被反向解析为`1.00–845.xx`，污染入场距离、建议档案和影子触发。
+- 授权范围：仅限为`entryZoneValues`结构化数值贯通和严格旧档案兼容所必需的`v1-core.js`最小字段补充、V1.3模块安全读取、测试/报告及构建同步；未授权削弱V1.3.1交易门控或改变任何真实交易入口。
+- 落地提交：`d2b1f296cd1d4bba7f98d1e950c779bbb169873a`。
+- 修改文件逐项记录：`v1-core.js`、`v1_3-paper-trading-core.js`、`v1_3-signal-archive-core.js`、`v1_3-auto-engine-core.js`、`v1_3-trade-gate-diagnostics.js`、`tests/v12-ui-tests.js`、`tests/v13-ui-tests.js`、`tests/v131-trade-gate-diagnostics-tests.js`、`tests/v1_4-structured-entry-zone.test.js`、`tests/fixtures/entry-zone-live-reproduction-2026-07-18.json`、`eth-dynamic-trading-dashboard.html`、`V1_4_IMPLEMENTATION_REPORT.md`、`V1_4_TEST_RESULTS.md`。
+
+两项例外均有专项自动化测试、真实Binance REST验证与人工验收证据；均未接入真实交易账户、API密钥或真实订单。
+
 ### 1.3 本轮（文档阶段）动作
 
 **本轮不新增、不修改上述任何代码文件**，只交付六份V1.4文档本身。

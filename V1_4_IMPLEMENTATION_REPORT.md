@@ -55,6 +55,40 @@
 - `v1_3-auto-engine-core.js`：`1114ea3ed86760adb0c95ba53129ba796cfdcaa6d11a769b7928b13c69948b5b`
 - `v1_3-trade-gate-diagnostics.js`：`b1f8c51edc1781932cf7ab93c5f0036739b38c11aa6c4c03b09efeb7d6fbd70a`
 
+## 实施阶段CEO授权例外记录
+
+原`V1_4_CODEX_IMPLEMENTATION_TASK.md`§1.2“禁止修改核心文件”红线保持原文，不作全面放开。以下仅为真实人工验收或真实行情发现P0后的特定例外，不构成未来修改冻结文件的先例；六份V1.4规范中的其他红线继续有效。
+
+**例外一：因果滚动ATR异常检测**
+
+- 原因：真实BTCUSDT 15m样本证明`detectAnomalyBars()`使用窗口末端ATR回溯历史，造成时间错配与27根正常历史K线误判。
+- 授权范围：仅`v1-core.js`中的因果滚动ATR异常检测及必要测试、冻结哈希、构建同步。
+- 提交：`207f9e9ddf4eef2c658cc342876520a299bce979`。
+- `5×ATR`阈值与`anomalyBarsExcluded>5`健康门均保留；未授权其他`v1-core.js`重构。
+
+**例外二：结构化入场区数值贯通**
+
+- 原因：真实页面证明格式化展示字符串`1,845.xx`被反向解析为`1.00–845.xx`，污染距离、建议档案与影子触发。
+- 授权范围：仅为`entryZoneValues`结构化数值贯通与严格旧档案兼容所必需的最小改动。
+- 提交：`d2b1f296cd1d4bba7f98d1e950c779bbb169873a`。
+- 修改文件：`v1-core.js`、`v1_3-paper-trading-core.js`、`v1_3-signal-archive-core.js`、`v1_3-auto-engine-core.js`、`v1_3-trade-gate-diagnostics.js`、`tests/v12-ui-tests.js`、`tests/v13-ui-tests.js`、`tests/v131-trade-gate-diagnostics-tests.js`、`tests/v1_4-structured-entry-zone.test.js`、`tests/fixtures/entry-zone-live-reproduction-2026-07-18.json`、`eth-dynamic-trading-dashboard.html`、`V1_4_IMPLEMENTATION_REPORT.md`、`V1_4_TEST_RESULTS.md`。
+- 未授权削弱V1.3.1交易门控或改变真实交易入口。
+
+两项例外均有专项自动化测试、真实Binance REST与人工验收证据，且均未接入真实交易。
+
+## 已知非阻断P2（本轮未修复）
+
+- 未为复用`appendImmutable`重构现有存储代码。
+- `candidateTrajectories.records`继续保持当前V1.4最小契约，不扩张数据结构。
+- 真实REST测试继续按当前生产链冒烟与健康验证定位，不将其改写为历史校准或完整统计验证。
+- 未依据不完整摘要调整`ActionPermission`字段；任何后续调整仍须以完整权威规范为输入。
+
+## 独立复审P1修复
+
+- `computeScenarioWeights()`已逐状态对齐`V1_4_FORECAST_DATA_SPEC.md`§7.4冻结表。修正的五项为：`PO_RANGE_LOW_STRUCTURE`由`50/35/15`改为`50/25/25`，`PO_BREAKOUT_UP_STRUCTURE`由`45/45/10`改为`30/50/20`，`PO_TREND_UP_STRUCTURE`由`55/35/10`改为`30/50/20`，`PO_BREAKDOWN_STRUCTURE`由`40/15/45`改为`30/20/50`，`PO_TREND_DOWN_STRUCTURE`由`50/10/40`改为`30/20/50`。其余四项已经与冻结表一致。低置信插值、归一化、舍入和最大项吸收尾差算法未改变；`calibratedProbability`仍为`null`，页面继续标注规则型权重不是概率。
+- RANGE结果事件的`rangeBreachExcursion`已按`GMKG_DRAGONFLY_ARCHITECTURE.md`§10.4a改为`max(0, maxAbsoluteExcursion - directionThreshold)`，其中阈值直接来自生成时Snapshot。旧实现错误地以基准情景区边界代替方向阈值。非RANGE方向、路径不完整或阈值无效时继续返回`null`，RANGE的MFE/MAE继续为`null`。
+- 三份治理文档均采用“原红线保留、特定例外追加”的方式记录两次CEO授权；本轮没有把例外扩大为对冻结文件的普遍修改许可。
+
 ## 已知限制
 
 - 本地 `localStorage` 是短期验证原型；长期证据存储仍需未来 IndexedDB 或服务器架构，本版不通过删除历史规避容量限制。

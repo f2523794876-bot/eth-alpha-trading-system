@@ -39,8 +39,12 @@ t('假突破确认失败不产出突破状态',()=>assert.notEqual(classify({tre
 t('数据陈旧归入INSUFFICIENT_DATA',()=>assert.equal(classify({dataQuality:{isStale:true}}).operatingMode,'INSUFFICIENT_DATA'));
 t('置信度上限60',()=>assert.equal(classify({trend:'up',isBreakout:true,breakoutBarsCount:4},{e1:{trend:'up'}}).stateConfidence,60));
 t('代理证据带PRICE_ONLY',()=>assert.match(classify({confirmedPrice:2195}).stateEvidence[0],/PRICE_ONLY/));
-for(const state of F.PO_STATES)t(`权重归一 ${state}`,()=>{const w=F.computeScenarioWeights(state,60);assert.equal(w.baseline+w.upside+w.downside,100);assert.ok(Object.values(w).every(x=>Number.isInteger(x)&&x>=0&&x<=100))});
+const frozenWeightTable={PO_RANGE_LOW_STRUCTURE:{baseline:50,upside:25,downside:25},PO_BREAKOUT_UP_STRUCTURE:{baseline:30,upside:50,downside:20},PO_TREND_UP_STRUCTURE:{baseline:30,upside:50,downside:20},PO_STALL_HIGH_STRUCTURE:{baseline:35,upside:25,downside:40},PO_BREAKDOWN_STRUCTURE:{baseline:30,upside:20,downside:50},PO_TREND_DOWN_STRUCTURE:{baseline:30,upside:20,downside:50},PO_SHARP_DROP_STRUCTURE:{baseline:30,upside:20,downside:50},PO_RANGE_RECOVERY_STRUCTURE:{baseline:50,upside:25,downside:25},PO_UNKNOWN:{baseline:50,upside:25,downside:25}};
+for(const[state,expected]of Object.entries(frozenWeightTable))t(`§7.4冻结权重 ${state}`,()=>{const actual=F.computeScenarioWeights(state,60),message=`state=${state} expected=${JSON.stringify(expected)} actual=${JSON.stringify(actual)}`;assert.deepEqual(actual,expected,message);assert.equal(Object.values(actual).reduce((a,b)=>a+b,0),100,message);assert.ok(Object.values(actual).every(x=>Number.isFinite(x)&&x>=0&&x<=100),message)});
 t('低置信向中性组合插值',()=>assert.deepEqual(F.computeScenarioWeights('PO_TREND_UP_STRUCTURE',0),{baseline:45,upside:27,downside:28}));
+t('低置信多头状态按冻结算法插值',()=>assert.deepEqual(F.computeScenarioWeights('PO_TREND_UP_STRUCTURE',22.5),{baseline:38,upside:38,downside:24}));
+t('低置信空头状态按冻结算法插值',()=>assert.deepEqual(F.computeScenarioWeights('PO_TREND_DOWN_STRUCTURE',22.5),{baseline:38,upside:24,downside:38}));
+t('低置信区间状态按冻结算法插值',()=>assert.deepEqual(F.computeScenarioWeights('PO_RANGE_LOW_STRUCTURE',22.5),{baseline:47,upside:26,downside:27}));
 t('24H阈值平方根6',()=>{const x=F.computeDirectionThreshold(40,2000,'24h');assert.equal(x.rawThreshold,.02*Math.sqrt(6));assert.equal(x.thresholdFormulaVersion,'v1.4-threshold-formula-2')});
 t('72H阈值平方根18',()=>assert.equal(F.computeDirectionThreshold(40,2000,'72h').rawThreshold,.02*Math.sqrt(18)));
 t('24H阈值下限',()=>assert.equal(F.computeDirectionThreshold(1,2000,'24h').directionThreshold,.008));

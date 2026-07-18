@@ -100,7 +100,16 @@
 - **验证**：建议下一轮测试补充中新增专项测试核对该字段访问路径（本轮暂未新增独立测试，风险等级低且已通过文档层面订正消除主要风险）。
 - **状态**：**已关闭**。
 
-### 1.4 P2级风险（重申，非新发现，本轮未变动）
+### 1.4 实施阶段CEO授权例外记录（追加治理留痕）
+
+本记录不删除、不弱化`V1_4_CODEX_IMPLEMENTATION_TASK.md`§1.2原始“禁止修改核心文件”红线。以下例外均由真实人工验收或真实公开行情发现P0后逐项批准，不构成后续任意修改冻结文件的先例；六份V1.4规范的其他红线继续有效。
+
+1. **因果滚动ATR例外**：真实BTCUSDT 15m样本证明`detectAnomalyBars()`使用窗口末端ATR回溯历史，发生时间错配并误判27根正常历史K线。CEO只授权`v1-core.js`中因果滚动ATR异常检测及必要测试、哈希和构建同步，落地提交为`207f9e9ddf4eef2c658cc342876520a299bce979`。`5×ATR`阈值与`anomalyBarsExcluded>5`健康门保持不变，未授权其他`v1-core.js`重构。
+2. **结构化入场区例外**：真实页面证明展示字符串`1,845.xx`被反向解析为`1.00–845.xx`，污染距离、档案和影子触发。CEO只授权`entryZoneValues`结构化数值贯通及严格旧档案兼容所必需的最小改动，落地提交为`d2b1f296cd1d4bba7f98d1e950c779bbb169873a`。逐项修改文件为：`v1-core.js`、`v1_3-paper-trading-core.js`、`v1_3-signal-archive-core.js`、`v1_3-auto-engine-core.js`、`v1_3-trade-gate-diagnostics.js`、`tests/v12-ui-tests.js`、`tests/v13-ui-tests.js`、`tests/v131-trade-gate-diagnostics-tests.js`、`tests/v1_4-structured-entry-zone.test.js`、`tests/fixtures/entry-zone-live-reproduction-2026-07-18.json`、`eth-dynamic-trading-dashboard.html`、`V1_4_IMPLEMENTATION_REPORT.md`、`V1_4_TEST_RESULTS.md`。未授权削弱V1.3.1交易门控或改变真实交易入口。
+
+两项例外均有专项测试、真实REST与人工验收证据，并明确未接入真实交易。
+
+### 1.5 P2级风险（重申，非新发现，本轮未变动）
 
 #### P2-1：单文件架构限制
 
