@@ -1,6 +1,6 @@
 # V1_4_ACCEPTANCE_TESTS.md — V1.4 验收测试
 
-版本：v1.4-tests-draft-2（CEO本轮冻结裁决关闭P0-1至P0-5/P1-1至P1-4后同步更新，29个功能类别/112条为唯一权威总数）
+版本：v1.4-tests-draft-3（补齐`V1_4_ARCHITECTURE_REVIEW.md` P1-3遗留的`KlineWindowRef`专属测试类别后同步更新，30个功能类别/131条为唯一权威总数）
 基线：`main` @ `a3d7aea`
 角色：本文档是 V1.4 验收测试的唯一权威清单，供未来 Codex 实施完成后逐条勾选。本轮**不创建任何测试代码**，只定义测试规范。每条测试包含：ID / 严重等级 / 前置条件 / 输入 / 步骤 / 预期结果 / 自动或人工 / 对应规范条款。
 
@@ -265,6 +265,30 @@
 | T29.4 | P0 | — | `classifyProxyState`/`computeScenarioWeights`/`generatePredictionId`/`computeDirectionThreshold`/`computeKlineWindowRef`/`buildOutcomeEvent`函数签名 | 静态审查全部§3.1函数 | 均不包含`storage`参数 | 人工代码审查 | 同上 |
 | T29.5 | P1 | 同一`predictionId`已存在快照 | 重复调用生成编排函数`generateForecastSnapshotOrchestrated` | — | 幂等由`findForecastSnapshotByPredictionId`（持久化层）保证返回既有记录，`buildForecastSnapshot`本身被调用与否不影响最终返回同一记录 | 自动 | V1_4_CODEX_IMPLEMENTATION_TASK.md§3.3 |
 
+## T30. `KlineWindowRef` 六窗口完整性/contentHash确定性与审计复现（对应 `V1_4_ARCHITECTURE_REVIEW.md` P1-3）
+
+| ID | 严重等级 | 前置条件 | 输入 | 步骤 | 预期结果 | 自动/人工 | 规范条款 |
+|---|---|---|---|---|---|---|---|
+| T30.1 | P0 | 完整历史K线，正常生成链路 | 正常输入 | 检查`ForecastSnapshot.klineWindowRefs` | 恰好6个元素，`{symbol,timeframe}`组合精确等于`{ETHUSDT,BTCUSDT}×{15m,1h,4h}`且无遗漏 | 自动 | V1_4_FORECAST_DATA_SPEC.md§8.4a第1点 |
+| T30.2 | P0 | 构造只产出5个窗口（缺BTCUSDT/4h） | 人工裁剪窗口集合 | 调用窗口集合校验函数 | 校验失败，不得生成正式`ForecastSnapshot` | 自动 | 同上 |
+| T30.3 | P0 | 构造出现重复组合（两个`ETHUSDT/15m`，缺一个应有组合） | 人工构造 | 同上 | 校验失败，不得生成正式`ForecastSnapshot` | 自动 | 同上 |
+| T30.4 | P0 | 构造出现未知`symbol`（如`BNBUSDT`）或未知`timeframe`（如`30m`） | 人工构造 | 同上 | 校验失败，不得生成正式`ForecastSnapshot` | 自动 | 同上 |
+| T30.5 | P0 | 固定一段已收盘K线序列（同symbol/timeframe，顺序不变） | 相同输入调用两次`computeKlineWindowRef` | 比较两次`contentHash` | 完全相同（字节级相等） | 自动 | V1_4_FORECAST_DATA_SPEC.md§8.4a第5点 |
+| T30.6 | P1 | 同上K线内容固定 | 仅改变`fetchedAt`（及其他非K线内容字段） | 重新调用`computeKlineWindowRef` | `contentHash`不变 | 自动 | 同上（`contentHash`只覆盖K线内容，见第2点） |
+| T30.7 | P0 | 固定基线窗口 | 分别构造7个变体：仅改变其中一根参与计算K线的`open`/`high`/`low`/`close`/`volume`/`openTime`/`closeTime`之一（其余字段与基线完全一致） | 对每个变体调用`computeKlineWindowRef`并与基线`contentHash`比较 | 7个变体的`contentHash`**均**与基线不同 | 自动 | 同上第2/5点 |
+| T30.8 | P0 | 固定基线窗口（≥3根K线） | 交换窗口内任意两根K线的顺序（内容不变，仅排列顺序变化） | 调用`computeKlineWindowRef` | `contentHash`与基线不同 | 自动 | 同上第2/5点 |
+| T30.9 | P0 | 固定基线窗口 | 从窗口中移除一根参与计算的K线（其余不变） | 调用`computeKlineWindowRef`或窗口校验 | `contentHash`与基线不同，或窗口校验直接失败 | 自动 | 同上 |
+| T30.10 | P0 | 固定基线窗口 | 将窗口内某一根K线重复插入一次 | 同上 | `contentHash`与基线不同，或窗口校验直接失败 | 自动 | 同上 |
+| T30.11 | P0 | 构造乱序（非时间单调）K线输入 | 打乱顺序但内容集合与基线相同 | 静态审查`computeKlineWindowRef`实现 | 不存在"哈希前先按`openTime`重新排序"的代码路径；乱序输入必须原样参与哈希计算（从而与基线`contentHash`不同）或触发`non_monotonic`校验失败，不得静默排序后输出与基线相同的`contentHash` | 人工代码审查+自动 | 同上第5点红线 |
+| T30.12 | P0 | 完整已收盘K线序列 | 正常输入 | 检查窗口构造结果 | 窗口内全部K线`closeTime<=`服务器时间坐标系下的`(Date.now()+offset)`，即全部已收盘 | 自动 | V1_4_FORECAST_DATA_SPEC.md§8.4a第3点 |
+| T30.13 | P0 | 构造窗口末尾混入一根未收盘K线（`closeTime>`服务器时间） | 人工构造 | 调用窗口构造/校验函数 | 校验失败，该未收盘K线不得进入`KlineWindowRef`，且不得生成正式`ForecastSnapshot` | 自动 | 同上 |
+| T30.14 | P0 | 固定基线窗口（已知首根K线`openTime`） | — | 检查`firstOpenTime` | 与窗口内实际第一根（最早）参与计算K线的`openTime`完全一致 | 自动 | V1_4_FORECAST_DATA_SPEC.md§8.4a接口定义 |
+| T30.15 | P0 | 固定基线窗口（已知末根K线`closeTime`） | — | 检查`lastCloseTime` | 与窗口内实际最后一根已收盘参与计算K线的`closeTime`完全一致 | 自动 | 同上 |
+| T30.16 | P0 | 固定基线窗口（已知K线根数N） | — | 检查`closedBarCount` | `=N`，与实际参与`contentHash`计算的K线数量一致（不多不少） | 自动 | 同上 |
+| T30.17 | P0 | 固定基线窗口 | — | 检查`firstBarKey`/`lastBarKey` | 分别等于窗口第一根、最后一根参与计算K线的`barKey`（按GMKG总架构§10.1格式） | 自动 | 同上 |
+| T30.18 | P0 | 已生成一条正式`ForecastSnapshot`（含`klineWindowRefs`与冻结的原始K线窗口快照） | 取该Snapshot保存的`klineWindowRefs[i].contentHash` | 用冻结的K线窗口重新调用`computeKlineWindowRef`独立计算`contentHash` | 重新计算值与`ForecastSnapshot`保存值完全一致 | 自动 | V1_4_FORECAST_DATA_SPEC.md§8.4a第5点；GMKG总架构§14.1审计可复现要求 |
+| T30.19 | P0 | 构造某条历史`ForecastSnapshot`的某个`klineWindowRef`无法复核（原始K线数据缺失或复算`contentHash`不一致） | — | 调用历史验证统计聚合函数 | 该`ForecastSnapshot`对应样本**不得**计入`pathEligibleForStatistics`/`directionEligibleForStatistics`任一正式统计分母 | 自动 | 同上；V1_4_HISTORICAL_VALIDATION_SPEC.md§3.2/§4 |
+
 ---
 
 ## 测试类别数量汇总
@@ -300,9 +324,10 @@
 | T27 误差归因规则不可变性/exogenous_shock隔离 | 6 |
 | T28 effectiveSampleCount标准区间调度算法（确定性） | 7 |
 | T29 纯计算层与存储层隔离 | 5 |
-| **合计（29个功能类别）** | **112** |
+| T30 KlineWindowRef六窗口完整性/contentHash确定性与审计复现 | 19 |
+| **合计（30个功能类别）** | **131** |
 
-（初稿26个功能类别83条；第二轮复审追加T3.4/T27共4条，累计27个功能类别90条；本轮（CEO冻结裁决P0-1至P0-5/P1-1至P1-4）追加T3.5/T3.6、T21.4-T21.8、T27.4-T27.6、T28全部7条、T29全部5条，累计**29个功能类别、112条为唯一权威总数**。）
+（初稿26个功能类别83条；第二轮复审追加T3.4/T27共4条，累计27个功能类别90条；CEO冻结裁决轮（P0-1至P0-5/P1-1至P1-4）追加T3.5/T3.6、T21.4-T21.8、T27.4-T27.6、T28全部7条、T29全部5条，累计29个功能类别112条；本轮（补齐P1-3遗留的`KlineWindowRef`专属测试类别）新增T30全部19条，累计**30个功能类别、131条为唯一权威总数**。）
 
 ---
 
@@ -311,4 +336,5 @@
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.4-tests-draft-1 | 2026-07-18 | 初稿：26个功能类别，共83条可执行/可判定测试用例，覆盖未来数据泄漏、PRICE_ONLY_MODE边界、路径完整性九不变量、nullable类型、两类统计分母、情景权重不变量、校准概率隔离、快照不可变性、ActionPermission显示专属隔离、V1.1-V1.3.1回归；同轮追加T3.4（referenceBar服务器时间校验）与T27（误差归因规则不可变性，3条），响应`V1_4_ARCHITECTURE_REVIEW.md`发现的P0-1/P1-3缺口，累计27个功能类别、90条为唯一权威总数 |
-| v1.4-tests-draft-2 | 2026-07-18 | CEO本轮冻结裁决P0-1至P0-5/P1-1至P1-4后同步更新：T3新增T3.5（服务器时间不可用fail closed）/T3.6（无本地时间减安全边际实现路径），T4.2更新排除S0-S7残留；T21新增T21.4-T21.8（QuotaExceeded不删除历史/原子写入/无孤儿记录/导出完整性/UI提示，对应P0-5）；T27新增T27.4-T27.6（exogenous_shock隔离，对应P0-4）；新增T28全部7条（effectiveSampleCount标准区间调度确定性算法，对应P0-3）；新增T29全部5条（纯计算层与存储层隔离，对应P1-1）；T15.4更新指向新directionThreshold公式（对应P1-2）；累计**29个功能类别、112条为唯一权威总数** |
+| v1.4-tests-draft-2 | 2026-07-18 | CEO本轮冻结裁决P0-1至P0-5/P1-1至P1-4后同步更新：T3新增T3.5（服务器时间不可用fail closed）/T3.6（无本地时间减安全边际实现路径），T4.2更新排除S0-S7残留；T21新增T21.4-T21.8（QuotaExceeded不删除历史/原子写入/无孤儿记录/导出完整性/UI提示，对应P0-5）；T27新增T27.4-T27.6（exogenous_shock隔离，对应P0-4）；新增T28全部7条（effectiveSampleCount标准区间调度确定性算法，对应P0-3）；新增T29全部5条（纯计算层与存储层隔离，对应P1-1）；T15.4更新指向新directionThreshold公式（对应P1-2）；累计29个功能类别、112条为唯一权威总数 |
+| v1.4-tests-draft-3 | 2026-07-18 | 补齐`V1_4_ARCHITECTURE_REVIEW.md` P1-3关闭记录中遗留的"`KlineWindowRef`确定性测试尚无专属测试类别"待办：新增T30全部19条（T30.1-T30.19），覆盖六窗口完整性（T30.1-T30.4）、contentHash确定性（T30.5-T30.6）、内容敏感性（T30.7）、顺序敏感性（T30.8-T30.11，含"不得排序掩盖乱序输入"红线）、收盘边界（T30.12-T30.13）、窗口元数据一致性（T30.14-T30.17）、审计复现（T30.18-T30.19，含"无法复核的窗口不得计入正式统计分母"红线）；P1-3由此**完全关闭，无遗留测试覆盖缺口**；累计**30个功能类别、131条为唯一权威总数** |

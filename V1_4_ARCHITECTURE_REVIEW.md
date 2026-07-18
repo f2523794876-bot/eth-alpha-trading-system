@@ -1,6 +1,6 @@
 # V1_4_ARCHITECTURE_REVIEW.md — V1.4 独立架构复审
 
-版本：v1.4-review-draft-2（CEO本轮冻结裁决关闭P0-1至P0-5/P1-1至P1-4后的修订版）
+版本：v1.4-review-draft-3（补齐P1-3遗留的`KlineWindowRef`专属测试类别后，P1-3完全关闭，无遗留阻断项）
 基线：`main` @ `a3d7aea`
 角色：本文档对其余五份 V1.4 文档 + 与 `GMKG_DRAGONFLY_ARCHITECTURE.md` 的交互，做**独立风险复审**。逐条给出风险、严重等级、复现路径、修复要求、是否阻断Codex、是否允许进入编码。**不得只写"通过"**。
 
@@ -83,8 +83,8 @@
 
 - **原风险**：每个symbol/timeframe只保存一条`DataVintageRef`，无法证明特征计算实际使用的历史K线窗口范围与内容。
 - **关闭方式**：`V1_4_FORECAST_DATA_SPEC.md`新增§8.4a `KlineWindowRef`接口（六个窗口：ETH/BTC×15m/1h/4h），含`contentHash`覆盖整段已收盘K线序列内容；`ForecastSnapshot`新增`klineWindowRefs`字段（§6输出字段表已同步）。`V1_4_CODEX_IMPLEMENTATION_TASK.md`新增`computeKlineWindowRef`纯函数签名。
-- **验证**：需在未来测试补充版本新增`KlineWindowRef`确定性测试（本轮`V1_4_ACCEPTANCE_TESTS.md`暂未新增专属测试类别，见§3核对表第2项备注）。
-- **状态**：**文档层面已关闭**；测试覆盖建议在下一次测试补充轮次新增，不阻断本轮编码许可（`contentHash`确定性要求已在SPEC§8.4a第5点写明，具备可测试性，只是本轮未新增独立测试类别）。
+- **验证**：`V1_4_ACCEPTANCE_TESTS.md` T30（`v1.4-tests-draft-3`新增，T30.1-T30.19，共19条），覆盖六窗口完整性（T30.1-T30.4）、`contentHash`确定性（T30.5-T30.6）、内容敏感性（T30.7）、顺序敏感性（T30.8-T30.11）、收盘边界（T30.12-T30.13）、窗口元数据一致性（T30.14-T30.17）、审计复现（T30.18-T30.19）。
+- **状态**：**已完全关闭，无遗留问题**——文档层面（SPEC§8.4a/CODEX_TASK函数签名）与测试覆盖层面（TESTS T30全部19条）均已闭合，此前"测试覆盖待后续补充"的遗留待办已消除。
 
 #### P1-4：72H采样频率不为制造样本而提高（关闭）
 
@@ -131,12 +131,12 @@ V1.4新增计算量极小，不构成性能风险。
 | P0-5 | 静默删除历史验证证据 | P0 | 已关闭 |
 | P1-1 | buildForecastSnapshot纯函数/存储层混淆 | P1 | 已关闭 |
 | P1-2 | directionThreshold时间尺度一致性不足 | P1 | 已关闭 |
-| P1-3 | 缺少完整输入窗口审计引用 | P1 | 已关闭（测试覆盖待后续补充，不阻断编码） |
+| P1-3 | 缺少完整输入窗口审计引用 | P1 | 已完全关闭（`V1_4_ACCEPTANCE_TESTS.md` T30全部19条，测试覆盖无遗留） |
 | P1-4 | 72H采样频率被提高以凑样本量的风险 | P1 | 已关闭 |
 | 附加 | firstResistance/firstSupport字段形状错误 | P1 | 已关闭 |
 | P2-1至P2-4 | 单文件限制/存储容量/CORS/性能 | P2 | 无需关闭动作，重申记录 |
 
-**本轮结论**：全部P0（5项）与P1（4项+1项附加发现）均已关闭，无遗留阻断项。
+**本轮结论**：全部P0（5项）与P1（4项+1项附加发现）均已关闭，无遗留阻断项；P1-3此前"测试覆盖待后续补充"的遗留待办已由`V1_4_ACCEPTANCE_TESTS.md` T30补齐，不再有任何已知遗留问题。
 
 ---
 
@@ -145,8 +145,8 @@ V1.4新增计算量极小，不构成性能风险。
 | # | 核对项 | 结论 |
 |---|---|---|
 | 1 | SPEC要求全部进入CODEX_TASK | 达标——PO_\*判定（含字段形状修正）、`ForecastSnapshot`生成（纯函数/存储分层）、`KlineWindowRef`、`directionThreshold`新公式、路径定位、回填、walk-forward切分（新算法）、误差归因（含`unexplainedExtremeMove`）均已在CODEX_TASK§3-§4列出对应函数签名 |
-| 2 | CODEX_TASK全部进入ACCEPTANCE_TESTS | 达标，**但有1项待后续补充**：`KlineWindowRef`的`contentHash`确定性尚无专属测试类别（见§1.2 P1-3关闭记录），判定为不阻断本轮编码许可的遗留待办，建议下一次测试补充轮次新增 |
-| 3 | ACCEPTANCE_TESTS覆盖ARCHITECTURE_REVIEW风险 | 达标——本轮全部9项风险（P0-1至P0-5、P1-1/P1-2/P1-4、附加发现）均已在TESTS新增或更新对应测试；P1-3的测试覆盖为已知例外，已如实记录 |
+| 2 | CODEX_TASK全部进入ACCEPTANCE_TESTS | 达标，**无遗留**：`KlineWindowRef`的`contentHash`确定性已由`V1_4_ACCEPTANCE_TESTS.md` T30全部19条覆盖（见§1.2 P1-3关闭记录），此前的待后续补充事项已消除 |
+| 3 | ACCEPTANCE_TESTS覆盖ARCHITECTURE_REVIEW风险 | 达标——本轮全部10项风险（P0-1至P0-5、P1-1至P1-4、附加发现）均已在TESTS新增或更新对应测试，含P1-3的T30，无已知例外 |
 | 4 | 所有字段名一致 | 达标——`fusionState`/`fusionStateAtGeneration`恒`'UNKNOWN'`、`storageHealth`、`thresholdFormulaVersion`、`klineWindowRefs`等新字段已在SPEC与CODEX_TASK间核对一致 |
 | 5 | 所有枚举一致 | 达标——`OperatingMode`/`PriceOnlyStateId`/`TargetStateId`/`FusionStateId`仍只在GMKG总架构定义一次；本轮新增的`KlineWindowRef`/`UnexplainedExtremeMoveFlag`只在`V1_4_FORECAST_DATA_SPEC.md`/`V1_4_HISTORICAL_VALIDATION_SPEC.md`各自定义一次，未见重复定义 |
 | 6 | 所有时间定义一致 | 达标——`closeTime=openTime+timeframeMs-1`不变；新增的服务器时间校验规则（`GET /api/v3/time`+单周期缓存偏移）已在SPEC/CODEX_TASK/MATRIX/TESTS四处同步 |
@@ -200,7 +200,7 @@ V1.4新增计算量极小，不构成性能风险。
 
 ## 6. 最终结论：是否允许进入编码
 
-**允许**——本轮CEO冻结裁决的5项P0与4项P1（含1项附加发现，共10项）已全部在六份文档中同步关闭，15项跨文档一致性核对全部达标（1项`KlineWindowRef`测试覆盖的已知遗留待办不构成阻断），全文机械搜索未发现残留的旧错误规则。`V1_4_CODEX_IMPLEMENTATION_TASK.md`§5定义的构建顺序（步骤1-8）**不再有任何一步因未决裁决而被建议暂缓**，可以按既定顺序整体推进。唯一的遗留待办（`KlineWindowRef`确定性测试的专属测试类别）建议在下一次测试补充轮次中新增，不影响本轮"允许进入编码"的结论。
+**允许**——本轮CEO冻结裁决的5项P0与4项P1（含1项附加发现，共10项）已全部在六份文档中同步关闭，15项跨文档一致性核对全部达标，全文机械搜索未发现残留的旧错误规则。P1-3此前"`KlineWindowRef`测试覆盖待后续补充"的遗留待办已由`V1_4_ACCEPTANCE_TESTS.md` T30全部19条（T30.1-T30.19）补齐关闭，**不再有任何已知遗留待办**。`V1_4_CODEX_IMPLEMENTATION_TASK.md`§5定义的构建顺序（步骤1-8）**不再有任何一步因未决裁决或测试覆盖缺口而被建议暂缓**，可以按既定顺序整体推进，**可以交给Codex编码**。
 
 ---
 
@@ -210,3 +210,4 @@ V1.4新增计算量极小，不构成性能风险。
 |---|---|---|
 | v1.4-review-draft-1 | 2026-07-18 | 初稿：独立发现2项P0（referenceBar本地时钟依赖、fusionState借用正式状态标签风险）、3项P1（72H样本积累缓慢、非重叠子抽样次优、归因规则不可变性缺少测试）、4项P2（单文件限制/存储容量/CORS/性能均为重申非新发现）；完成15项跨文档一致性核对，发现并回填2处ACCEPTANCE_TESTS缺口；给出"有条件允许进入编码"的最终结论及2个需CEO裁决的P0问题 |
 | v1.4-review-draft-2 | 2026-07-18 | CEO本轮冻结裁决关闭P0-1至P0-5、P1-1至P1-4（含R1轮遗留的2项P0与部分P1，以及本轮新发现的P0-4/P0-5/P1-1/P1-2/P1-3五项），另发现并关闭`firstResistance`/`firstSupport`字段形状错误1项；重写§1风险清单（含R1/本轮编号映射表）、§2汇总表、§3跨文档一致性核对、新增§4全文机械关键词搜索记录、精简§5仅剩1项无关本轮的独立未决事项、§6最终结论改为无条件"允许进入编码" |
+| v1.4-review-draft-3 | 2026-07-18 | 补齐P1-3遗留的"`KlineWindowRef`确定性测试尚无专属测试类别"待办：`V1_4_ACCEPTANCE_TESTS.md`新增T30全部19条后，P1-3由"文档层面已关闭、测试覆盖待补充"改判为**完全关闭**；同步更新§1.2 P1-3条目、§2汇总表、§3核对表第2/3项、§6最终结论，删除全部"不阻断编码"的例外表述 |
