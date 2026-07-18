@@ -13,6 +13,15 @@
 - `work/build-v1.js` / `work/v1-ui.template.html`：只新增 V1.4 精确占位符接线；既有替换链不变。
 - `eth-dynamic-trading-dashboard.html`：由构建脚本生成的单文件正式页面。
 - `tests/v1_4-gmkg-*.test.js`：V1.4 行为、结构追踪和真实 REST 测试。
+- `tests/v1_4-structured-entry-zone.test.js`：13项结构化入场区、严格旧档案兼容解析、距离、撮合门控、真实复现及导出精度的 P0 回归测试。
+- `tests/fixtures/entry-zone-live-reproduction-2026-07-18.json`：修复前后同一轮 Binance 生产链实测值，保留原始展示值、错误解析结果、结构化数值及距离证据。
+
+## 模拟交易价格解析 P0 修复
+
+- 根因位于 `v1_3-signal-archive-core.js` 的旧 `entryNumbers()`：它用通用数字正则反向解析已经格式化的 `entryZone` 展示字符串。真实字符串 `1,845.89 – 1,846.63` 被拆为 `1 / 845.89 / 1 / 846.63`，再经最小值/最大值计算变成 `1.00–846.63`。错误值随后进入交易门控诊断、距离/ATR距离、建议档案与影子触发链。
+- 修复后 `buildTriggerPlan()` 保留原中文展示字符串，同时新增不可格式化的 `entryZoneValues = { lower, upper, estimatedEntry }`。诊断、档案、影子触发、自动引擎结构门与模拟交易方案均直接读取结构化数值，不再从中文文案反向提取业务数值。
+- 旧档案兼容只接受严格、完整的两个价格范围，支持合法千位逗号及 `–/—/-/至/~/～` 分隔符。逗号分组错误、字段缺失、非正数、`lower > upper` 或预计进场价不在区间内时返回 `null` 数值并 fail closed；不会回退到确认价、0 或近似值。
+- 真实复现（2026-07-18，ETH 已收盘确认价 `1845.34`，ATR14 `2.445`）：修复前多头解析为 `1.00–846.63`，距离 `998.71 USDT / 408.47 ATR`；修复后读取原始数值 `1845.89325–1846.62675`，距离 `0.55325 USDT / 0.22628 ATR`。修复后空头读取 `1844.63325–1845.36675`，确认价处于该区间内，距离为 `0 / 0 ATR`。
 
 ## 生产闭环
 
@@ -34,22 +43,23 @@
 
 ## 兼容性
 
-除下述 CEO 授权的 P0 修订外，既有核心文件均与基线逐字节一致：
+除下述 P0 修订外，既有核心算法与交易许可阈值保持不变：
 
 - `v1-core.js` 旧 SHA-256：`0a4d9e712859d79ecae592aacffe371abfba29a2c6b7b76119a68c49e0471a97`
-- `v1-core.js` 新 SHA-256：`252aacdf2dd7ac11e181738bc24728aee0b00d94ebb6b410692449cc628da9e0`
-- 原冻结哈希因经真实 BTC 15m 数据证明的 P0 因果 ATR 错误而经 CEO 授权更新。修改仅限 `detectAnomalyBars()`：每根已收盘 K 线只使用其之前的已收盘 K 线计算 ATR14；5×ATR 阈值和异常数量大于5根的健康门均未改变。
+- 因果 ATR 修复后 SHA-256：`252aacdf2dd7ac11e181738bc24728aee0b00d94ebb6b410692449cc628da9e0`
+- 当前 SHA-256：`edc36248440cd53443b798a9aa5ad769904b986068172ecc4590aafbe486ed00`
+- 原冻结哈希因经真实 BTC 15m 数据证明的 P0 因果 ATR 错误而经 CEO 授权更新；本轮又按人工验收发现的 P0 要求，仅为 `TriggerPlan` 增加结构化 `entryZoneValues` 与集中严格解析函数。状态机、评分、交易许可阈值、5×ATR 阈值和异常数量大于5根的健康门均未改变。
 - `v1_2-forecast-core.js`：`5cd29546ceae417c816bf7056c9fe4ddfc434548be90d1f2679fdb11f1dc250e`
-- `v1_3-paper-trading-core.js`：`76fef6291d6c1583dacd312eb5c6a7161cc83d9e30ba7c0815c75ef2591ba0c3`
-- `v1_3-signal-archive-core.js`：`a022cc7eeb2583419291a759281775d6e1228e8886388b01768ba5b1979864b5`
-- `v1_3-auto-engine-core.js`：`6621aa6854264641f20214c920148766015cd330e252192ebc9e182dd5169133`
-- `v1_3-trade-gate-diagnostics.js`：`7340e22b791c08410513a5b1e1d361caee758ba823f88669ae211c285dea2f85`
+- `v1_3-paper-trading-core.js`：`67854d59424b3c83bb8b171bf608f9053e066b488eab39d91d8e7e44b890e5a9`
+- `v1_3-signal-archive-core.js`：`6279e5cecad5acb0cb5ddaee82200b260eebf17590d1d5e6c561260a52b7e032`
+- `v1_3-auto-engine-core.js`：`1114ea3ed86760adb0c95ba53129ba796cfdcaa6d11a769b7928b13c69948b5b`
+- `v1_3-trade-gate-diagnostics.js`：`b1f8c51edc1781932cf7ab93c5f0036739b38c11aa6c4c03b09efeb7d6fbd70a`
 
 ## 已知限制
 
 - 本地 `localStorage` 是短期验证原型；长期证据存储仍需未来 IndexedDB 或服务器架构，本版不通过删除历史规避容量限制。
 - 页面关闭或电脑休眠期间不会持续运行；回填在页面重新打开并成功取得服务器时间与行情后执行。
-- Chrome 普通/无痕/禁用扩展的 `file://` Console 调用栈仍需在具备 Chrome 控制能力的人工环境完成；静态构建已证明页面不含 frame、外部脚本、外部样式或 `file://` 资源引用，GMKG Blob 导出仅在按钮点击后执行。本轮未在缺少调用栈时猜测修改导出代码。
+- 2026-07-18 人工验收已确认 Chrome 直接双击 `file://` 与 localhost 均可运行：六路 REST、24H/72H、`PRICE_ONLY_MODE`、`UNKNOWN`、`DISPLAY_ONLY/WAIT`、数据质量与存储健康均正常。此前 Console 警告未造成功能阻断，因此没有修改正常的 Blob 导出代码。
 - 真实 BTCUSDT 15m 保存样本在旧算法下误判27根，改用因果 ATR 后为0根；全部六路公开行情健康门正常，原四个 V1.2/V1.3 实时失败已关闭。
 
 详细测试口径见 `V1_4_TEST_RESULTS.md`。
