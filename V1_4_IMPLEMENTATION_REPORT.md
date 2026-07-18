@@ -9,7 +9,7 @@
 - `v1_4-gmkg-forecast-core.js`：9 个 PO_* 价格代理状态、服务器时间已确认输入约束、24H/72H 快照、规则型情景权重、4H ATR 平方根时间缩放阈值、六窗口 SHA-256 审计引用。
 - `v1_4-gmkg-outcome-core.js`：96/288 根目标路径定位、九项完整性不变量、不可变结果事件、方向/路径统计分母隔离、UP/DOWN/RANGE 指标。
 - `v1_4-gmkg-validation-core.js`：按时间切分、标准区间调度有效样本数、冻结的误差归因与中性极端波动标记。
-- `v1_4-storage-core.js`：IndexedDB正式审计仓库、旧localStorage幂等迁移、稳定ID冲突保护、四级容量状态、完整导入导出和运行缓存分层。
+- `v1_4-storage-core.js`：IndexedDB正式审计仓库、旧localStorage幂等迁移、稳定ID冲突保护（同ID内容真正不同时保留为独立`migrationConflicts`审计记录而非中止迁移）、四级容量状态、六级迁移状态（含`VERIFIED_WITH_CONFLICTS`）、完整导入导出和运行缓存分层。
 - `work/v1-gmkg-min-loop.template.html`：网络 I/O、原子持久化、幂等回填、完整 JSON/CSV 导出和中文展示层。
 - `work/build-v1.js` / `work/v1-ui.template.html`：只新增 V1.4 精确占位符接线；既有替换链不变。
 - `eth-dynamic-trading-dashboard.html`：由构建脚本生成的单文件正式页面。
@@ -55,7 +55,7 @@
 - `v1_3-signal-archive-core.js`：`6279e5cecad5acb0cb5ddaee82200b260eebf17590d1d5e6c561260a52b7e032`
 - `v1_3-auto-engine-core.js`：`1114ea3ed86760adb0c95ba53129ba796cfdcaa6d11a769b7928b13c69948b5b`
 - `v1_3-trade-gate-diagnostics.js`：`abc72c4f331fe2d5547b7d7024bc23683551e79ed0b965d4d7ffa90816ebda43`
-- `v1_4-storage-core.js`：`9c3f58c774ee215fff86ec35f76ef8f7a8de2a0abcff9820f04903822b988bd6`
+- `v1_4-storage-core.js`：`9b4edf8f365c304202fbf2979e2e8c757a683ccec4321aa5716a1b172fdda426`（本轮更新：冲突保存协议、DB_VERSION升至2，见下方专题章节；`v1-core.js`哈希未变）
 
 ## 实施阶段CEO授权例外记录
 
@@ -113,12 +113,43 @@
 
 ### 迁移、原子性和恢复
 
-- 启动状态依次为`PENDING → MIGRATING → VERIFIED`；无旧数据为`NOT_REQUIRED`，任一解析、权限、容量、校验或数据库错误进入`FAILED`。
-- 迁移先在内存生成完整迁移前JSON，再逐条按稳定ID写入IndexedDB，逐项核对ID和完整内容。全部数据验证及数据库健康探针成功后，才删除GMKG旧大数组或压缩诊断/建议运行缓存。
-- 中断后已写入的稳定ID会幂等去重；相同ID不同内容返回`ID_CONFLICT`且绝不覆盖。迁移后健康检查失败时恢复全部原localStorage值。
+- 启动状态依次为`PENDING → MIGRATING → VERIFIED`（或`VERIFIED_WITH_CONFLICTS`，见下）；无旧数据为`NOT_REQUIRED`，任一解析、权限、容量、校验或数据库错误进入`FAILED`。
+- 迁移先在内存生成完整迁移前JSON，再逐条按稳定ID写入IndexedDB，逐项核对ID和完整内容。全部数据验证（含下述冲突审计验证）及数据库健康探针成功后，才删除GMKG旧大数组或压缩诊断/建议运行缓存。
+- 中断后已写入的稳定ID会幂等去重；迁移后健康检查失败时恢复全部原localStorage值。
 - Snapshot与关联状态修订、OutcomeEvent与ErrorAttribution使用同一IndexedDB事务；事务失败不显示为正式存档，也不会留下孤儿结果。`QuotaExceededError`、权限错误、结构错误和一般数据库错误分别报告。
 - `HEALTHY/WARNING/CRITICAL/BLOCKED`根据浏览器容量探测和实际写入健康综合判定。WARNING/CRITICAL不影响读取；BLOCKED只禁止依赖新正式持久化的预测，已有结果仍可查看、导出和验证。解除BLOCKED必须通过写入、读取一致性健康探针。
-- 完整JSON导出包含`schemaVersion`、`exportedAt`和各数据集记录数；导入校验版本，按稳定ID去重，冲突只报告不覆盖。
+- 完整JSON导出包含`schemaVersion`、`exportedAt`和各数据集记录数与冲突数量；导入校验版本，按稳定ID去重，冲突记录同样保留、不覆盖。
+
+## 原Chrome实机迁移验收失败修复：`signalSnapshots`同ID内容冲突（`VERIFIED_WITH_CONFLICTS`协议）
+
+### 根因
+
+原Chrome实机验收报告迁移状态`FAILED`，精确错误`ID_CONFLICT:signalSnapshots:SIG-1784359800000-range...`。定位到两处独立成因：
+
+1. **旧`canonical()`辅助函数从未被实际使用于冲突比较**：迁移写入路径直接用`JSON.stringify(old)!==JSON.stringify(entry.record)`比较新旧内容，未做任何键序规范化，也未剥离任何非业务字段。字段插入顺序不同（例如同一条建议档案历史上先后被`v1_3-signal-archive-core.js`的`safeLoad()`→`normalizeStoredSignal()`重新构造过一次，键顺序与首次迁移写入IndexedDB时不同）即可触发误判为"内容不同"。
+2. **`entryZone`字段存在三种历史合法形状**：旧展示字符串、旧宽松对象、新结构化对象（`{lower,upper,estimatedEntry,valid,source}`），均由`v1-core.js`的`normalizeEntryZone()`统一解析为同一组数值。V1.3的`safeLoad()`会在每次读取建议档案时用`normalizeStoredSignal()`重新规范化`entryZone`形状（这是先前P0修复的既有行为，未做改动），而`v1_4-storage-core.js`的`readLegacy()`此前直接读取原始JSON、不经过该规范化步骤，导致"已写入IndexedDB时的形状"与"本次迁移读到的形状"不一致，被旧的逐字节比较误判为业务内容冲突。
+
+两处均**不是**业务内容（价格、方向、许可、评分、算法版本等）真正不同，而是序列化形态差异；但旧实现一律用`throw`中止整个迁移并回滚，导致`FAILED`永久卡住、用户看到"旧localStorage仍保留、IndexedDB已有部分记录"的僵局。
+
+### 修复：冲突处理协议（不改变正式快照不可变原则）
+
+- 新增正确的递归、键序无关的`canonicalStringify()`，替换从未被引用的旧`canonical()`。
+- 新增按数据集的逐字段白名单`VOLATILE_FIELDS`（当前仅`snapshots.generatedAt`/`snapshots.dataCutoffTime`及`klineWindowRefs[].fetchedAt`——生成时刻的运行时元数据），供比较前剥离；价格、方向、许可、评分、失效条件、目标、风险、算法版本、权重版本、数据截止时间等业务字段**不在白名单内**，逐字节比较后任何差异均视为真实冲突。
+- `signalArchive`的`entryZone`比较前，通过运行时注入的`entryZoneNormalizer`（即`v1-core.js`的`normalizeEntryZone`，通过依赖注入传入`v1_4-storage-core.js`，不复制解析逻辑）解析为数值三元组再比较；`archiveCategory`/`eligibleForTrigger`/`hardBlockedAtCreation`等字段不在白名单内，差异一律视为真实业务冲突。
+- 规范化后确认**真正内容不同**的同ID记录：不覆盖已存在的正式记录，改为写入独立的`migrationConflicts`存储区，ID为`${originalId}__conflict__${contentHash}`（`contentHash`为对规范化后内容的确定性哈希）——同一原始ID+同一内容始终产生同一冲突ID，重复迁移/重复导入不会重复膨胀。冲突记录携带`originalId`/`contentHash`/`datasetName`/`migrationConflictReason`/`sourceStorage`/完整原始内容；`signalArchive`类型的冲突记录会被强制降级为`archiveCategory:'OBSERVATION'`、`eligibleForTrigger:false`，永远不会获得新的交易许可，也不会出现在`repo.getAll('signalArchive')`等正式读取路径中。
+- 迁移校验阶段同步更新：每条源记录必须能在"正式存储"或"冲突审计记录"中找到内容匹配的副本，否则仍判定`MIGRATION_VERIFY_FAILED`（防止真正的数据丢失被误判为"已处理"）。
+- 迁移最终状态新增`VERIFIED_WITH_CONFLICTS`（非`FAILED`）：存在真实冲突时，旧localStorage数组仍会在全部校验通过后正常清理，不会因冲突而永久卡在`FAILED`。UI新增"迁移冲突"计数行与"导出迁移冲突报告"按钮。
+- `IndexedDB`数据库版本从`1`升至`2`：`onupgradeneeded`会为已经运行过一次旧版本迁移的真实用户数据库补建新增的`migrationConflicts`存储区，不影响已有存储区内容。
+- 同样的规范化比较用于`putBundle`（GMKG快照生成的正式写入路径）：两个标签页在同一`referenceBar`周期内几乎同时生成同一`predictionId`时，仅`generatedAt`/`dataCutoffTime`/窗口`fetchedAt`不同将被安全去重（不再误判为冲突或触发虚假`DATA_BLOCKED`）；若业务内容确实不同（异常场景），后到者同样进入冲突保存协议，不覆盖先到者。
+- 导入（`importBackup`）复用同一冲突处理协议：不再对冲突记录整体返回失败，而是按数据集分别报告`conflicts`列表，原正式记录始终不被覆盖。
+
+### 为什么不会丢数据
+
+写入阶段"内容匹配→去重跳过""内容不同→双方均保留（一份为正式记录、一份为确定性ID的冲突记录）"；校验阶段要求每条源记录必须能在正式记录或冲突记录中找到匹配；旧localStorage仅在全部校验通过后清理。任一环节失败（含真正的数据库错误、容量耗尽、校验失败）仍会完整回滚至迁移前的原始localStorage状态，不会同时丢失localStorage与IndexedDB两侧数据。
+
+### 为什么不会重复计入交易或统计
+
+`migrationConflicts`是独立存储区，不属于`DATASETS`映射，`repo.getAll('signalArchive')`等正式读取路径不会返回冲突记录；`signalArchive`类型的冲突记录额外被强制降级为`OBSERVATION`/`eligibleForTrigger:false`。V1.1–V1.3.1既有交易生命周期（`recordSignalIfEligible`/`evaluateShadowSignals`/`tickAutoEngine`/`processTradeGate`）从未读取IndexedDB，本次修复未新增任何调用，五个真实交易入口在全部V1.4文件中静态扫描仍为0。
 
 ## 已知限制
 
