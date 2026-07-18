@@ -9,6 +9,7 @@
 - `v1_4-gmkg-forecast-core.js`：9 个 PO_* 价格代理状态、服务器时间已确认输入约束、24H/72H 快照、规则型情景权重、4H ATR 平方根时间缩放阈值、六窗口 SHA-256 审计引用。
 - `v1_4-gmkg-outcome-core.js`：96/288 根目标路径定位、九项完整性不变量、不可变结果事件、方向/路径统计分母隔离、UP/DOWN/RANGE 指标。
 - `v1_4-gmkg-validation-core.js`：按时间切分、标准区间调度有效样本数、冻结的误差归因与中性极端波动标记。
+- `v1_4-storage-core.js`：IndexedDB正式审计仓库、旧localStorage幂等迁移、稳定ID冲突保护、四级容量状态、完整导入导出和运行缓存分层。
 - `work/v1-gmkg-min-loop.template.html`：网络 I/O、原子持久化、幂等回填、完整 JSON/CSV 导出和中文展示层。
 - `work/build-v1.js` / `work/v1-ui.template.html`：只新增 V1.4 精确占位符接线；既有替换链不变。
 - `eth-dynamic-trading-dashboard.html`：由构建脚本生成的单文件正式页面。
@@ -53,7 +54,8 @@
 - `v1_3-paper-trading-core.js`：`67854d59424b3c83bb8b171bf608f9053e066b488eab39d91d8e7e44b890e5a9`
 - `v1_3-signal-archive-core.js`：`6279e5cecad5acb0cb5ddaee82200b260eebf17590d1d5e6c561260a52b7e032`
 - `v1_3-auto-engine-core.js`：`1114ea3ed86760adb0c95ba53129ba796cfdcaa6d11a769b7928b13c69948b5b`
-- `v1_3-trade-gate-diagnostics.js`：`b1f8c51edc1781932cf7ab93c5f0036739b38c11aa6c4c03b09efeb7d6fbd70a`
+- `v1_3-trade-gate-diagnostics.js`：`abc72c4f331fe2d5547b7d7024bc23683551e79ed0b965d4d7ffa90816ebda43`
+- `v1_4-storage-core.js`：`9c3f58c774ee215fff86ec35f76ef8f7a8de2a0abcff9820f04903822b988bd6`
 
 ## 实施阶段CEO授权例外记录
 
@@ -88,6 +90,35 @@
 - `computeScenarioWeights()`已逐状态对齐`V1_4_FORECAST_DATA_SPEC.md`§7.4冻结表。修正的五项为：`PO_RANGE_LOW_STRUCTURE`由`50/35/15`改为`50/25/25`，`PO_BREAKOUT_UP_STRUCTURE`由`45/45/10`改为`30/50/20`，`PO_TREND_UP_STRUCTURE`由`55/35/10`改为`30/50/20`，`PO_BREAKDOWN_STRUCTURE`由`40/15/45`改为`30/20/50`，`PO_TREND_DOWN_STRUCTURE`由`50/10/40`改为`30/20/50`。其余四项已经与冻结表一致。低置信插值、归一化、舍入和最大项吸收尾差算法未改变；`calibratedProbability`仍为`null`，页面继续标注规则型权重不是概率。
 - RANGE结果事件的`rangeBreachExcursion`已按`GMKG_DRAGONFLY_ARCHITECTURE.md`§10.4a改为`max(0, maxAbsoluteExcursion - directionThreshold)`，其中阈值直接来自生成时Snapshot。旧实现错误地以基准情景区边界代替方向阈值。非RANGE方向、路径不完整或阈值无效时继续返回`null`，RANGE的MFE/MAE继续为`null`。
 - 三份治理文档均采用“原红线保留、特定例外追加”的方式记录两次CEO授权；本轮没有把例外扩大为对冻结文件的普遍修改许可。
+
+## STORAGE_BLOCKED 根因与修复
+
+### 证据化容量诊断
+
+- 一条真实GMKG `ForecastSnapshot`序列化后约`5,991`字节，其中六个`KlineWindowRef`约`1,945`字节；用户页面显示的52条快照按同结构约`311,731`字节。52条本身不足以耗尽常见约5MB的localStorage配额。
+- 一条真实生产链交易门控诊断约`2,897`字节，旧实现允许1000条，单键可达到约`2,897,000`字节。
+- 一条包含完整V1.2预测对象的真实建议档案约`18,821`字节，其中预测对象约`15,279`字节；旧上限2000条，理论容量远超localStorage配额。
+- GMKG、诊断、建议档案、预测日志、决策日志和模拟交易数据此前共享同一localStorage配额。GMKG的追加操作还会把整个数组重新JSON序列化并整键重写。因此实际阻断来自多个历史数组累计，而不是52条GMKG快照单独造成。
+- 同一GMKG `predictionId`已有去重，不存在30秒tick重复追加同一快照；诊断按已收盘K线键更新投影，但旧实现仍把最多1000条完整投影保存在localStorage。JSON本身没有循环异常，膨胀来自完整嵌套预测对象和整数组重复序列化。
+
+页面现在逐项显示所有实际键的记录数和估算字节。代码识别的键包括：`ethAlphaDecisionLogs`、`ethAlphaDecisionLogsV11`、`ethAlphaRiskSettings`、`ethAlphaForecastLogs`、`ethAlphaPaperAccount`、`ethAlphaPaperTrades`、`ethAlphaPaperLog`、`ethAlphaSignalArchive`、`ethAlphaSignalEvents`、`ethAlphaShadowResults`、`ethAlphaTradeGateDiagnostics`、五个GMKG正式数据键、`ethAlphaGmkgStorageMeta`及`ethAlphaStorageMigrationV14`。开发进程没有读取或清理用户Chrome配置文件；用户实际浏览器中的精确逐键数字由新版页面在原环境内审计显示。
+
+### 分层存储
+
+- IndexedDB `ethAlphaAuditStore`分别保存不可变快照、OutcomeEvent、代理状态修订、验证归因、walk-forward配置、完整建议档案、建议事件、影子结果投影和诊断投影。
+- localStorage继续保存风险设置、界面/迁移元数据、V1.1/V1.2有界日志、模拟账户、当前持仓及模拟交易同步安全状态。
+- 诊断完整历史在IndexedDB最多1000条；localStorage仅保留最近25条运行缓存和累计统计。同一`diagnosticKey`只更新投影。
+- 完整建议档案复制并验证到IndexedDB后，localStorage只保留最近100条运行缓存；其中大型完整预测快照由IndexedDB保留，运行缓存只留下方向摘要。模拟账户、持仓、保证金和交易许可读取路径保持同步且未迁移、未清空。
+- ForecastSnapshot、ForecastOutcomeEvent、状态修订、验证归因和完整建议快照均不设置静默淘汰。只裁剪明确标记为可重建的诊断投影和运行缓存。
+
+### 迁移、原子性和恢复
+
+- 启动状态依次为`PENDING → MIGRATING → VERIFIED`；无旧数据为`NOT_REQUIRED`，任一解析、权限、容量、校验或数据库错误进入`FAILED`。
+- 迁移先在内存生成完整迁移前JSON，再逐条按稳定ID写入IndexedDB，逐项核对ID和完整内容。全部数据验证及数据库健康探针成功后，才删除GMKG旧大数组或压缩诊断/建议运行缓存。
+- 中断后已写入的稳定ID会幂等去重；相同ID不同内容返回`ID_CONFLICT`且绝不覆盖。迁移后健康检查失败时恢复全部原localStorage值。
+- Snapshot与关联状态修订、OutcomeEvent与ErrorAttribution使用同一IndexedDB事务；事务失败不显示为正式存档，也不会留下孤儿结果。`QuotaExceededError`、权限错误、结构错误和一般数据库错误分别报告。
+- `HEALTHY/WARNING/CRITICAL/BLOCKED`根据浏览器容量探测和实际写入健康综合判定。WARNING/CRITICAL不影响读取；BLOCKED只禁止依赖新正式持久化的预测，已有结果仍可查看、导出和验证。解除BLOCKED必须通过写入、读取一致性健康探针。
+- 完整JSON导出包含`schemaVersion`、`exportedAt`和各数据集记录数；导入校验版本，按稳定ID去重，冲突只报告不覆盖。
 
 ## 已知限制
 
