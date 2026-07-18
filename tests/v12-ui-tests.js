@@ -26,7 +26,7 @@ test('手动模式不写预测日志',()=>assert.match(html,/function writeForec
 test('日志错误非阻塞提示',()=>assert.match(html,/预测日志写入失败（不影响页面预测）/));
 test('新增区域无裸露英文路径枚举',()=>{const visible=html.replace(/<script(?:\s[^>]*)?>[\s\S]*?<\/script>/g,'').replace(/<style>[\s\S]*?<\/style>/g,'');for(const x of ['PULLBACK_THEN_UP','INSUFFICIENT_DATA','BREAKOUT_THEN_PULLBACK','RANGE_ROUND_TRIP'])assert.doesNotMatch(visible,new RegExp(x))});
 test('禁用交易宣传措辞',()=>{const v12=html.slice(html.indexOf('<section class="grid" id="forecastSection">'));assert.doesNotMatch(v12,/真实概率|真实胜率|胜率\s*\d|概率\s*\d+%|必涨|必跌|稳赚|保证盈利/)});
-test('v1-core冻结哈希',()=>assert.equal(crypto.createHash('sha256').update(fs.readFileSync(path.join(__dirname,'../v1-core.js'))).digest('hex'),'0a4d9e712859d79ecae592aacffe371abfba29a2c6b7b76119a68c49e0471a97'));
+test('v1-core冻结哈希（CEO授权P0因果ATR修订）',()=>assert.equal(crypto.createHash('sha256').update(fs.readFileSync(path.join(__dirname,'../v1-core.js'))).digest('hex'),'252aacdf2dd7ac11e181738bc24728aee0b00d94ebb6b410692449cc628da9e0'));
 test('模板包含预测核心占位',()=>assert.match(template,/\/\*__FORECAST__\*\//));
 const builder=require('../work/build-v1.js');
 test('构建替换目标缺失时失败',()=>assert.throws(()=>builder.replaceExact('abc','missing','x',1,'测试占位'),/构建替换失配/));

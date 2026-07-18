@@ -43,5 +43,7 @@ await t('V1.4不含密钥字段',()=>assert.doesNotMatch(fs.readFileSync(path.jo
 await t('构建脚本精确替换两个占位符',()=>{const s=fs.readFileSync(path.join(__dirname,'../work/build-v1.js'),'utf8');assert.match(s,/GMKG最小闭环UI占位符/);assert.match(s,/GMKG最小闭环核心占位符/)});
 await t('生成HTML无GMKG占位符',()=>assert.doesNotMatch(fs.readFileSync(path.join(__dirname,'../eth-dynamic-trading-dashboard.html'),'utf8'),/__GMKG_MIN_LOOP/));
 await t('生成HTML内嵌三项核心',()=>{const s=fs.readFileSync(path.join(__dirname,'../eth-dynamic-trading-dashboard.html'),'utf8');for(const n of ['ETHAlphaGmkgForecast','ETHAlphaGmkgOutcome','ETHAlphaGmkgValidation','ETHAlphaGmkgRuntime'])assert.match(s,new RegExp(n))});
+await t('单文件构建不含frame或外部本地资源',()=>{const s=fs.readFileSync(path.join(__dirname,'../eth-dynamic-trading-dashboard.html'),'utf8');assert.doesNotMatch(s,/<\s*(?:iframe|frame)\b/i);assert.doesNotMatch(s,/<script\b[^>]*\bsrc\s*=/i);assert.doesNotMatch(s,/<link\b[^>]*\bhref\s*=/i);assert.doesNotMatch(s,/file:\/\//i)});
+await t('GMKG导出只绑定点击事件不在初始化时执行',()=>{const s=fs.readFileSync(path.join(__dirname,'../work/v1-gmkg-min-loop.template.html'),'utf8');assert.match(s,/gmkgExportJson'\)\.onclick=\(\)=>download/);assert.match(s,/gmkgExportCsv'\)\.onclick=\(\)=>download/);assert.doesNotMatch(s,/<a\b[^>]*href=/i)});
 console.log(`RESULT passed=${passed} failed=${failed}`);if(failed)process.exitCode=1;
 })();
