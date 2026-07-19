@@ -5,6 +5,7 @@ import { buildVintageRef } from './vintage.js';
 const decimalPattern = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/;
 export const isDecimalString = value => typeof value === 'string' && decimalPattern.test(value);
 const positive = value => isDecimalString(value) && Number(value) >= 0;
+const validEpochMs = value => Number.isSafeInteger(value) && value >= 1_000_000_000_000;
 
 export function validateKlineRow(row, interval) {
   const errors = [];
@@ -71,6 +72,9 @@ export function normalizeTakerFlow(row, context) {
   return pointFact('taker_flow', context.instrument, row.timestamp, { buySellRatio: row.buySellRatio, buyVolume: row.buyVol, sellVolume: row.sellVol }, context);
 }
 function pointFact(fieldId, instrument, observedAt, values, context) {
+  if (!validEpochMs(observedAt) || !validEpochMs(context.fetchedAt)) throw Object.assign(new Error('Point timestamp must be epoch milliseconds'), { code: 'TIMESTAMP_UNIT_MISMATCH' });
   const firstAvailableAt = context.firstAvailableAt ?? context.fetchedAt;
-  return Object.freeze({ ...context, fieldId, instrument, observedAt, observationPeriod: { start: observedAt, end: observedAt }, publishedAt: observedAt, availableAt: observedAt, firstAvailableAt, revisionNumber: context.revisionNumber ?? 0, vintageId: `${context.sourceId}:${fieldId}:${instrument}:${observedAt}:rev${context.revisionNumber ?? 0}`, schemaVersion: SCHEMA_VERSION, normalizerVersion: NORMALIZER_VERSION, contentHash: sha256(values), ...values });
+  const revisionNumber=context.revisionNumber??0;
+  const vintage=buildVintageRef({sourceId:context.sourceId,sourceRef:context.endpointId,fieldId,instrument,interval:context.interval,observationStart:observedAt,observationEnd:observedAt,publishedAt:observedAt,availableAt:observedAt,firstAvailableAt,fetchedAt:context.fetchedAt,revisionNumber,value:values});
+  return Object.freeze({ ...context, fieldId, instrument, observedAt, observationPeriod: vintage.observationPeriod, publishedAt: vintage.publishedAt, availableAt: vintage.availableAt, firstAvailableAt: vintage.firstAvailableAt, revisionNumber, vintageId:vintage.vintageId, dataVintageRef:vintage, schemaVersion: SCHEMA_VERSION, normalizerVersion: NORMALIZER_VERSION, contentHash: vintage.contentHash, ...values });
 }

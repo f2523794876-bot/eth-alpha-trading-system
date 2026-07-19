@@ -9,6 +9,7 @@ User=eth-alpha
 Group=eth-alpha
 WorkingDirectory=/opt/eth-alpha/eth-alpha-trading-system/server
 EnvironmentFile=/etc/eth-alpha/collector.env
+ExecStartPre=/usr/bin/node /opt/eth-alpha/eth-alpha-trading-system/server/src/db/migrate.js up
 ExecStart=/usr/bin/node /opt/eth-alpha/eth-alpha-trading-system/server/src/index.js
 Restart=on-failure
 RestartSec=10

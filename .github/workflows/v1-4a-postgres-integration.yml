@@ -1,0 +1,44 @@
+name: V1.4A PostgreSQL 14 integration
+
+on:
+  push:
+    branches: [codex/v1.4a-server-data-foundation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-production-path:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: eth_alpha_test
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: eth_alpha_v14a_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eth_alpha_test -d eth_alpha_v14a_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: server
+    env:
+      TEST_DATABASE_URL: postgresql://eth_alpha_test:test-only-password@127.0.0.1:5432/eth_alpha_v14a_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run test:postgres
+      - run: RUN_LIVE_REST=1 npm run test:postgres:live

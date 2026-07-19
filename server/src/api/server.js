@@ -13,7 +13,7 @@ export function createApiServer({collector,repository,host='127.0.0.1',port=8787
       if(req.method!=='GET')return error(res,405,'METHOD_NOT_ALLOWED','仅支持只读GET请求');
       const url=new URL(req.url,'http://localhost');const p=url.pathname;
       if(p==='/health/live')return json(res,200,{ok:true,status:'LIVE',time:new Date().toISOString()});
-      if(p==='/health/ready'){const h=collector.health();return json(res,h.state==='BLOCKED'?503:200,{ok:h.state!=='BLOCKED',status:h.state,reasons:h.reasons});}
+      if(p==='/health/ready'){const readiness=await collector.readiness();return json(res,readiness.ok?200:503,readiness.ok?{ok:true,status:readiness.status,checks:readiness.checks}:{ok:false,error:{code:'NOT_READY',message:'采集服务尚未就绪'},status:readiness.status,checks:readiness.checks});}
       if(p==='/api/v1/collector/status')return json(res,200,{ok:true,data:collector.status()});
       if(p==='/api/v1/data-health')return json(res,200,{ok:true,data:await repository.latestHealth()});
       if(p==='/api/v1/gaps')return json(res,200,{ok:true,data:await repository.listGaps(integer(url.searchParams.get('limit'),100,1,MAX_QUERY_ROWS,'limit'))});

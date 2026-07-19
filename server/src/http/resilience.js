@@ -9,6 +9,21 @@ export class RateLimiter {
     if (this.tokens < cost) return false;
     this.tokens -= cost; return true;
   }
+  waitMs(cost = 1) {
+    if (this.refillPerSecond <= 0) return Infinity;
+    const missing = Math.max(0, cost - this.tokens);
+    return Math.ceil(missing / this.refillPerSecond * 1000);
+  }
+  async acquire(cost = 1, { signal, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+    if (signal?.aborted) throw Object.assign(new Error('Rate limit wait aborted'), { name: 'AbortError', code: 'ABORTED' });
+    while (!this.take(cost)) {
+      if (signal?.aborted) throw Object.assign(new Error('Rate limit wait aborted'), { name: 'AbortError', code: 'ABORTED' });
+      const delay = Math.max(1, this.waitMs(cost));
+      await Promise.race([sleep(delay), signal ? new Promise((_, reject) => signal.addEventListener('abort', () => reject(Object.assign(new Error('Rate limit wait aborted'), { name: 'AbortError', code: 'ABORTED' })), { once: true })) : new Promise(() => {})]);
+    }
+    if (signal?.aborted) throw Object.assign(new Error('Rate limit wait aborted'), { name: 'AbortError', code: 'ABORTED' });
+    return true;
+  }
 }
 
 export class CircuitBreaker {

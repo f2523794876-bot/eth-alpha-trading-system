@@ -1,7 +1,7 @@
-export async function measureServerTime(adapter, { now = Date.now, maxClockOffsetMs = 5000 } = {}) {
+export async function measureServerTime(adapter, { now = Date.now, maxClockOffsetMs = 5000, signal } = {}) {
   const localRequestStartedAt = now();
   try {
-    const response = await adapter.serverTime();
+    const response = await adapter.serverTime({signal});
     const localResponseReceivedAt = now();
     const sourceServerTime = response.body?.serverTime;
     if (!Number.isSafeInteger(sourceServerTime)) return { ok: false, health: 'BLOCKED', reason: 'SERVER_TIME_INVALID', localRequestStartedAt, localResponseReceivedAt };

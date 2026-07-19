@@ -1,0 +1,15 @@
+DROP INDEX IF EXISTS backfill_claim_idx;
+ALTER TABLE data_health_snapshots DROP COLUMN IF EXISTS last_error_code, DROP COLUMN IF EXISTS recovery_started_at, DROP COLUMN IF EXISTS circuit_state, DROP COLUMN IF EXISTS latest_attempt_at;
+ALTER TABLE data_revision_events DROP COLUMN IF EXISTS fetched_at, DROP COLUMN IF EXISTS available_at;
+ALTER TABLE collection_attempts DROP COLUMN IF EXISTS fencing_token;
+ALTER TABLE collection_runs DROP COLUMN IF EXISTS fencing_token, DROP COLUMN IF EXISTS lease_name;
+ALTER TABLE backfill_jobs DROP CONSTRAINT IF EXISTS backfill_status_v14a;
+ALTER TABLE backfill_jobs DROP COLUMN IF EXISTS max_attempts, DROP COLUMN IF EXISTS last_heartbeat_at, DROP COLUMN IF EXISTS finished_at, DROP COLUMN IF EXISTS started_at, DROP COLUMN IF EXISTS fencing_token, DROP COLUMN IF EXISTS lease_name, DROP COLUMN IF EXISTS worker_id;
+ALTER TABLE provisional_market_bars DROP COLUMN IF EXISTS promoted_at, DROP COLUMN IF EXISTS promoted_market_bar_id, DROP COLUMN IF EXISTS request_id;
+ALTER TABLE taker_flow DROP CONSTRAINT IF EXISTS taker_flow_time_order;
+ALTER TABLE long_short_ratios DROP CONSTRAINT IF EXISTS long_short_time_order;
+ALTER TABLE open_interest DROP CONSTRAINT IF EXISTS open_interest_time_order;
+ALTER TABLE funding_rates DROP CONSTRAINT IF EXISTS funding_time_order;
+DROP TRIGGER IF EXISTS raw_payloads_no_delete ON raw_payloads;
+DROP TRIGGER IF EXISTS raw_payloads_no_update ON raw_payloads;
+DROP FUNCTION IF EXISTS eth_alpha_reject_raw_mutation();

@@ -105,9 +105,34 @@ Down脚本明确标为破坏性，只允许空的临时数据库；生产历史�
 - 未实现预测因子替换、概率校准、walk-forward训练、新闻、付费数据源或 V1.4B/C/D；
 - 未部署、未创建PR、未合并main。
 
-## 8. 已知限制与后续CEO决策
+## 8. 独立复审整改（P0/P1/P2）
 
-1. 当前执行环境没有可用的本地 PostgreSQL 服务/`psql`，因此DDL由一致测试适配层与静态约束测试验证，真实 PostgreSQL migration/up/down集成验收需在部署前的隔离数据库执行；这是一项明确环境阻塞，不伪报通过。
+### P0关闭
+
+1. **JSONB真实写入路径**：`saveRaw()`对 headers/body 先做确定性 canonical JSON 序列化，再以相同冻结字节计算 hash；支持全部JSON根类型，拒绝 `undefined`、BigInt、循环、非有限数和非普通对象。失败发生在事务前，不产生半条 raw，也不进入标准化事实；采集层仅记录脱敏错误码审计。相同 requestId 的不同内容不会互相覆盖。
+2. **消除假HEALTHY**：健康输入来自数据库探针、写入结果、端点级累计状态、数据时间、缺口/回补、熔断/限流和 Binance 时间守卫。零成功数据、数据库断开、写入失败、时间失败、陈旧数据及部分端点失败均不会显示 `HEALTHY`。`/health/ready`每次执行 `SELECT 1`、迁移版本、lease、时间守卫和核心数据新鲜度检查，失败返回503脱敏响应。
+3. **fencing token**：生产仓库所有 collector 写事务都强制携带 leaseName/holderId/token，并在事务开始与提交前使用 `clock_timestamp()`验证当前租约。heartbeat失败立即清空调度器、Abort在途HTTP并锁为 `BLOCKED`；旧token的 raw、事实、缺口、回补、健康、修订、运行和审计写入均由数据库拒绝。
+
+### P1关闭
+
+1. **修订链**：K线及四类衍生品事实均按明确自然键执行 advisory transaction lock、最新revision比较、`INSERTED/DEDUPED/REVISED/REJECTED`结果和同事务 `DataRevisionEvent`。OI等连续快照只在 observationTime相同时比较修订。
+2. **Backfill闭环**：`CollectorService`实例化并调度 worker；数据库以 `FOR UPDATE SKIP LOCKED`领取，记录worker/token/attempt/时间/heartbeat，支持崩溃任务回收、指数退避、永久失败和完整补齐后关闭gap。未收盘数据仍只进 provisional。
+3. **端点隔离熔断**：spot time、spot klines、futures klines、funding、OI、long-short、taker-flow分别维护breaker与健康计数，单端点OPEN不阻断其他端点。
+4. **时间红线**：新增 `002_v1_4a_review_fixes`，为四类点状事实补齐 `published <= available <= firstAvailable <= fetched`数据库约束；应用 `pointFact()`统一走 `buildVintageRef()`，拒绝秒/毫秒错配和乱序。
+5. **真实数据库测试门禁**：提交13项生产PostgreSQL集成测试及3项真实REST→Normalizer→Postgres端到端测试；无 `TEST_DATABASE_URL`时明确SKIP。GitHub Actions门禁固定 Ubuntu 22.04 + PostgreSQL 14，不连接生产库。
+
+### P2关闭
+
+- 002迁移用触发器拒绝 raw UPDATE/DELETE；归档只通过完整备份/对象存储流程，本版本没有在线删除入口。
+- `collection_runs`、`collection_attempts`和`provisional_market_bars`接入生产采集；正式化保留 provisional→market bar追溯字段。
+- RateLimiter等待后重新核算和扣减，支持 AbortSignal；外部取消不再误判成TIMEOUT重试。
+- 提交 `server/package-lock.json`，本机 `npm ci`成功且0漏洞。
+- systemd以安全的 `ExecStartPre`运行向上迁移，迁移失败阻止启动。
+- migration runner使用会话级 PostgreSQL advisory lock，并在成功/失败finally释放，checksum规则保留。
+
+## 9. 已知限制与后续CEO决策
+
+1. 当前Mac执行环境没有 PostgreSQL/`psql`/容器运行时，也没有 `TEST_DATABASE_URL`。因此本机13项真实PostgreSQL与3项REST+PostgreSQL测试明确SKIP、不计通过；已提交可直接运行的生产代码集成套件和 PostgreSQL 14 CI门禁，必须以CI或隔离Ubuntu测试库的实际结果作为最终数据库实机证据，不能以Memory测试替代。
 2. Binance公开多空比和主动买卖量只保留官方可查询窗口；长期历史从服务首次运行开始积累。
 3. 需CEO确定正式服务器的原始JSON冷归档介质、保留年限、磁盘预算及灾备RPO/RTO。
 4. 需CEO决定是否在 V1.4B 之前批准一个官方、无需密钥的宏观源；未批准前保持 `UNAVAILABLE`。

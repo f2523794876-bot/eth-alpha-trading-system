@@ -20,6 +20,8 @@ export function loadConfig() {
     backoffCapMs: integer('BACKOFF_CAP_MS', 10_000, 1),
     maxClockOffsetMs: integer('MAX_CLOCK_OFFSET_MS', 5_000, 0),
     leaseTtlMs: integer('LEASE_TTL_MS', 60_000, 10_000),
+    backfillPollMs: integer('BACKFILL_POLL_MS', 15_000, 1_000),
+    backfillMaxAttempts: integer('BACKFILL_MAX_ATTEMPTS', 5, 1),
     logLevel: process.env.LOG_LEVEL || 'info'
   });
 }

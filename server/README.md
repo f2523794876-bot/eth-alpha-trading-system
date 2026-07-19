@@ -6,14 +6,14 @@
 
 - Ubuntu 22.04 LTS
 - Node.js 22 LTS
-- PostgreSQL 15 或更高版本
+- PostgreSQL 14 或更高版本（CI固定使用 PostgreSQL 14）
 - UTC 系统时区与正常工作的 NTP
 
 本项目不要求 Docker。首先建立专用数据库与最低权限用户，然后复制 `.env.example` 到服务器外部的 `/etc/eth-alpha/collector.env`，填入强密码。不要提交 `.env`。
 
 ```bash
 cd /opt/eth-alpha/eth-alpha-trading-system/server
-npm install --omit=dev
+npm ci --omit=dev
 node src/db/migrate.js up
 node src/index.js
 ```
@@ -38,7 +38,11 @@ node src/index.js
 
 每个正式采集周期记录交易所服务器时间、请求开始/结束、本地网络中点、往返延迟和时钟偏差。偏差超过 `MAX_CLOCK_OFFSET_MS` 或服务器时间不可用时 fail closed：不写正式事实；失败响应仍可进入审计/原始降级路径。正式 `market_bars` 只接受 `closeTime <= sourceServerTime` 的K线，未收盘数据进入 provisional 层或仅保留在原始层。
 
-重试采用有上限和抖动的指数退避；429优先服从 `Retry-After`；连续失败触发熔断。单个端点失败不会中止其他端点任务。单实例租约带 fencing token，重启后相同自然键写入幂等。
+重试采用有上限和抖动的指数退避；429优先服从 `Retry-After`；等待后会重新核算并扣减令牌。七类端点分别维护熔断、连续失败、半开探测和恢复状态，单个端点失败不会阻断其他端点。单实例租约带 fencing token；所有采集写入都在同一数据库事务的开始与提交前，用 PostgreSQL 当前时间复核 holder、token 和有效期。续约失败会清除调度器、取消在途 HTTP 并进入 `BLOCKED`，旧实例不能自行恢复写入。
+
+事实修订自然键如下：K线为 `source + marketType + instrument + interval + openTime`；资金费率和 OI 为 `source + instrument + observationTime`；多空比和主动买卖量再加入 `interval`。同键同内容返回 `DEDUPED`；同键不同内容在事务内追加 revision 与 `DataRevisionEvent`，保留首个 `firstAvailableAt`，不覆盖旧版本。OI 是连续时点快照；只有相同 observationTime 的更正才属于修订。
+
+缺口任务由采集服务内置 worker 定时领取，使用 `FOR UPDATE SKIP LOCKED` 防止多实例重复执行，状态为 `PENDING → RUNNING → RETRY_WAIT/SUCCEEDED/FAILED_PERMANENT`。回补继续使用 Binance 服务器时间确认收盘；未完整补齐时不会关闭 gap。
 
 ## 只读 API
 
@@ -67,7 +71,7 @@ sudo -u postgres pg_dump --format=custom eth_alpha > eth_alpha-$(date -u +%Y%m%d
 sudo -u postgres pg_restore --clean --if-exists --dbname=eth_alpha_restore eth_alpha-*.dump
 ```
 
-systemd模板位于 `deploy/systemd/eth-alpha-collector.service`，本提交不会自动安装或启用它。建议 journald 限额或 logrotate 每日轮转、保留30天运行日志。原始响应按月分区/冷归档至对象存储并保留内容哈希与数据库索引；正式事实和修订事件不得静默删除。
+systemd模板位于 `deploy/systemd/eth-alpha-collector.service`，本提交不会自动安装或启用它。部署顺序固定为：创建最低权限数据库与用户 → `npm ci --omit=dev` → `node src/db/migrate.js up` → 核对 `/health/ready` → 再启用服务。unit 的 `ExecStartPre` 会再次执行仅向上的幂等迁移检查，checksum或迁移失败会阻止服务启动，绝不自动执行破坏性 down。建议 journald 限额或 logrotate 每日轮转、保留30天运行日志。原始响应数据库层拒绝 UPDATE/DELETE；受控归档应先使用 `pg_dump`/对象存储保留完整JSON与哈希，当前版本不提供在线删除入口。正式事实和修订事件不得静默删除。
 
 磁盘预算应根据真实采集一周后测量。初始规划可按原始JSON压缩后每日100–300MB、数据库事实每日50–150MB预留，并保持至少30%磁盘余量；达到70%告警、85%停止新增非关键缓存，正式历史只能先备份再归档。
 
@@ -85,6 +89,8 @@ systemd模板位于 `deploy/systemd/eth-alpha-collector.service`，本提交不�
 ```bash
 npm test
 RUN_LIVE_TESTS=1 npm run test:live
+TEST_DATABASE_URL=postgresql://... npm run test:postgres
+TEST_DATABASE_URL=postgresql://... RUN_LIVE_REST=1 npm run test:postgres:live
 ```
 
-真实接口测试与确定性离线测试分开；网络不可用必须标为环境阻塞，不得伪造通过。
+`TEST_DATABASE_URL`必须指向名称含 `test`、`ci` 或 `v14a` 的隔离数据库；PostgreSQL套件会执行破坏性的 up/down/up，绝不能指向生产。`.github/workflows/v1-4a-postgres-integration.yml`使用 PostgreSQL 14 service container运行生产仓库与生产采集链。真实REST形状测试、真实PostgreSQL测试和真实REST+PostgreSQL端到端测试分别统计；环境缺失时明确SKIP，不计入通过。
