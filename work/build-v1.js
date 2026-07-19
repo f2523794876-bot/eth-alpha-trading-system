@@ -56,6 +56,7 @@ function build(){
   const auto=fs.readFileSync(path.join(root,'v1_3-auto-engine-core.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const diagnostics=fs.readFileSync(path.join(root,'v1_3-trade-gate-diagnostics.js'),'utf8').replace(/<\/script/gi,'<\\/script');
   const gmkg=[
+    'v1_4-storage-core.js',
     'v1_4-gmkg-forecast-core.js',
     'v1_4-gmkg-outcome-core.js',
     'v1_4-gmkg-validation-core.js'

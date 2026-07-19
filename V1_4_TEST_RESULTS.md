@@ -5,16 +5,19 @@
 
 ## V1.4 专项
 
-- 行为级离线测试：189 项通过，0 失败。
+- 行为级离线测试：273 项通过，0 失败。
   - 预测与 K 线审计核心：81 项。
   - 路径与结果事件：33 项。
   - Walk-forward 与误差归因：14 项。
-  - 运行时持久化与 UI：40 项。
+  - 运行时持久化与 UI：58 项（新增指定ID三方对象诊断导出、冲突总数/显示数分离与新DOM接线）。
+  - IndexedDB容量、迁移、原子性与导入导出：33 项（本轮更新3项断言以匹配新的冲突保存协议，见下）。
+  - **IndexedDB迁移冲突保存协议（本轮新增）：28 项**，见下方专题章节。
+  - **第二次实机迁移真实规模回归：5 项**，覆盖200+跨dataset冲突、精确shadowResults ID、多次FAILED重试与刷新恢复。
   - 因果滚动 ATR 专项：8 项。
   - 结构化入场区 P0 专项：13 项。
 - `KlineWindowRef` T30.1–T30.19 已覆盖六窗口唯一组合、确定性、七字段内容敏感性、乱序/重复拒绝、收盘边界、元数据一致性、独立复算和不可审计样本双分母排除。
 - T1–T30 规范结构追踪：131 项通过，0 失败。该数字是验收行追踪，不表述为独立业务行为测试。
-- V1.4 真实 Binance REST：22 项通过，0 失败。
+- V1.4 真实 Binance REST：27 项通过，0 失败（本轮未改动该测试文件）。
   - `/api/v3/time` 有效；六路 K 线完整。
   - 实测 `closeTime = openTime + timeframeMs - 1`。
   - 24H/72H 快照均成功生成。
@@ -22,11 +25,12 @@
 
 ## 全部非联网回归
 
-- 自动化非联网合计：1,270 项通过，0 失败。
-- V1.1 既有非联网组：93 项通过，0 失败。
+- 自动化非联网合计：1,354 项通过，0 失败（在上一轮1,346基础上新增运行时UI 3项、真实规模迁移5项）。
+- V1.1 既有非联网组：110 项通过，0 失败（含此前未计入的 `v11-ui-tests.js` 12项）。
 - V1.2 既有非联网组：299 项通过，0 失败。
-- V1.3/V1.3.1 既有非联网组：558 项通过，0 失败（其中 V1.3 的 284 项为既有验收矩阵结构追踪）。
+- V1.3/V1.3.1 既有非联网组：594 项通过，0 失败（其中 V1.3 的 284 项为既有验收矩阵结构追踪；含此前未计入的 `v13-auto-engine-ui-tests.js` 22项、`v13-signal-archive-ui-tests.js` 14项）。
 - V1.4 行为级与结构追踪按上节单独列示，避免把结构追踪数量包装成行为测试。
+- 本次复核逐一重新执行全部非联网测试文件并核对通过数逐项相加得出总数，不采信未独立复现的历史汇总数字。
 
 ## 真实 REST 回归
 
@@ -39,14 +43,40 @@
 | V1.3 自然决策链 | 8 | 0 | 通过；未覆盖真实许可字段 |
 | V1.3 建议档案链 | 6 | 0 | 通过 |
 | V1.3.1 门禁诊断链 | 11 | 0 | 通过，未伪造交易许可 |
-| V1.4 GMKG 生产链 | 22 | 0 | 通过；含六路逐周期健康断言 |
+| V1.4 GMKG 生产链与正式存储仓库 | 27 | 0 | 通过；含六路逐周期健康断言、两时窗原子持久化、幂等与备份版本 |
 
-真实 REST 合计：95 项通过，0 失败。六路最新异常计数为 ETHUSDT 15m/1h/4h=`0/1/0`，BTCUSDT 15m/1h/4h=`0/0/0`；六路均无缺口、无陈旧。保存的 BTCUSDT 15m 原始样本在旧末端ATR算法下为27根异常，因果ATR算法下为0根。5×ATR阈值和`anomalyBarsExcluded>5`健康门保持不变。
+真实 REST 合计：100 项通过，0 失败。六路最新异常计数为 ETHUSDT 15m/1h/4h=`2/0/0`，BTCUSDT 15m/1h/4h=`0/0/0`；六路均无缺口、无陈旧且通过健康门。保存的 BTCUSDT 15m 原始样本在旧末端ATR算法下为27根异常，因果ATR算法下为0根。5×ATR阈值和`anomalyBarsExcluded>5`健康门保持不变。
+
+## STORAGE_BLOCKED专项
+
+- 33项行为断言覆盖：接近localStorage上限、`QuotaExceededError`分类、52条大型旧快照迁移、中断续传、重复迁移、记录数/ID/内容校验、追加事件、事务回滚、同收盘K线去重、诊断1000条上限、缓存与正式记录隔离、IndexedDB失败/不可用、安全降级、备份导入、重复导入去重、BLOCKED读取、健康恢复、模拟账户/持仓/建议档案隔离、建议完整历史外置和损坏JSON保护。其中"正式快照相同ID不同内容"与两项"导入同ID不同内容"断言本轮已更新为核对`VERIFIED_WITH_CONFLICTS`/冲突记录保存协议（不再是`ID_CONFLICT`导致整体失败）。
+- 实测单条GMKG快照约`5,991`字节，52条约`311,731`字节；单条真实诊断约`2,897`字节，1000条约`2,897,000`字节；单条含完整预测的建议档案约`18,821`字节。证据表明容量阻断来自共享localStorage的多历史数组累计，不是52条GMKG快照单独造成。
+- 正式数据迁移后由IndexedDB逐条稳定ID保存；诊断localStorage缓存25条，完整诊断投影1000条；建议档案localStorage运行缓存100条，完整不可变档案保留在IndexedDB。模拟账户和当前持仓键不迁移、不清空。
+
+## 迁移冲突保存协议专项（本轮新增，`tests/v1_4-storage-conflict.test.js`，28项）
+
+- **精确复现实机报告的冲突ID**`SIG-1784359800000-ranging-raft4final`：entryZone形状差异（旧展示字符串 vs 新结构化对象，数值相同）验证安全去重、不产生冲突记录；archiveCategory真实不同（业务内容差异）验证保留双方且不覆盖正式记录。
+- 逐字段场景覆盖（对应本轮要求的10类差异）：完全相同内容、仅字段顺序不同、仅白名单默认字段不同、仅generatedAt不同（以上四类均安全去重）；价格不同、方向不同、许可不同、算法版本不同、权重版本不同（以上五类均判定真实冲突并保留双方）。
+- 冲突迁移ID确定性（同输入两次独立仓库产生同一conflictId）、重复迁移不重复增加冲突记录、迁移中断后重试仍完整捕获冲突、存在真实冲突时最终状态为`VERIFIED_WITH_CONFLICTS`而非`FAILED`且旧localStorage仍被正常清理。
+- `repo.audit()`暴露`conflictCount`供UI展示；`repo.exportConflicts()`/`exportAll()`可导出完整冲突报告。
+- 冲突记录（`signalArchive`类型）强制降级为`OBSERVATION`/`eligibleForTrigger:false`，不出现在正式`signalArchive`读取结果中，不获得新的交易许可。
+- 存在真实冲突的迁移过程中，模拟账户、持仓、风控状态逐字节核对完全不变；仅500字节余量的近乎零剩余localStorage配额下，含冲突的迁移仍能完整完成并释放约30MB空间（本地构造的极限场景）。
+- **`BrowserIndexedDbAdapter`真实浏览器代码路径**（4项）：通过最小忠实的假`IndexedDB`（实现真实的请求/事务/`onupgradeneeded`/`onblocked`/提交回滚语义，而非`MemoryAdapter`模拟）直接练习该类此前从未被自动化测试覆盖的代码——验证已运行过旧版本(`DB_VERSION=1`)的数据库升级到`DB_VERSION=2`后会自动补建`migrationConflicts`存储区、`putMany`三种路径（去重/冲突/新增）、写入失败时事务abort后批内容不落地、`onblocked`时`open()`明确拒绝。
+- **两标签页并发生成同一逻辑GMKG快照**（2项）：使用真实`v1_4-gmkg-forecast-core.js`的`buildForecastSnapshot()`+相同业务输入、不同`serverTime`模拟两个标签页几乎同时生成同一`predictionId`，验证安全去重、不产生虚假`DATA_BLOCKED`；业务内容确实不同时验证保留为冲突记录而不覆盖先到者。
+
+## 第二次实机迁移真实规模专项（`tests/v1_4-storage-real-scale-migration.test.js`，5项）
+
+- 使用52条旧GMKG快照、100条旧signalArchive、100条旧shadowResults、25条诊断缓存；signalArchive和shadowResults共享相同`SIG-*` originalId，包含实机报错精确ID`SIG-1784362500000-ranging-raft4final`。
+- 精确ID对象级诊断验证同时导出：localStorage旧投影、IndexedDB当前投影、对应dataset冲突对象、双方canonical hash和逐字段差异路径。
+- 预置100条signalArchive和100条shadowResults内容差异，验证冲突总数大于100仍完成`VERIFIED_WITH_CONFLICTS`；底层、完整JSON导出和逐源记录验证均覆盖全部冲突，UI摘要只显示前100条但明确报告总数。
+- 明确验证同一originalId在signalArchive/shadowResults产生不同冲突ID；ID包含冲突schema版本、dataset、originalId和canonical content hash的确定性身份，不发生跨dataset碰撞。
+- 连续两次模拟`MIGRATION_INTERRUPTED`后第三次重试成功；相同冲突不增加副本，运行期间新增IndexedDB快照不被删除，模拟账户与未平仓持仓逐字节不变，旧GMKG数组只在全部校验后清理，刷新后状态继续为`VERIFIED_WITH_CONFLICTS`。
+- shadowResults按可更新正式投影处理：日常运行可覆盖当前投影，迁移旧投影不能覆盖当前值，只能进入dataset隔离审计记录；该记录不携带交易许可，也不进入正式交易或统计读取路径。
 
 ## 构建与人工验收
 
 - 单文件构建：通过；精确占位符全部替换，脚本可编译，无外部 CDN、WebSocket 或运行时依赖。
-- 重复构建：通过；两次 SHA-256 均为 `c389b5c840c95796fef84aa6be8a63edf595bf7314f2acd71680d0183003059e`。
+- 重复构建：通过；两次 SHA-256 均为 `fe969b5d76cbecb4a19b47093ee698f12d38bbf01e0fd36b50dc1add3ac2c5c8`。
 - 单文件静态检查：通过；无 frame、无外部本地资源、无外部脚本/样式，GMKG导出只绑定点击事件。
 - 五个真实交易入口静态扫描：`recordSignalIfEligible`、`evaluateShadowSignals`、`buildTradeProposal`、`tickAutoEngine`、`processTradeGate` 在 V1.4 GMKG 模块中的调用均为0。
 - Chrome 双击 `file://` 人工验收：通过；六路 REST、24H/72H、`PRICE_ONLY_MODE`、`UNKNOWN`、`DISPLAY_ONLY/WAIT`、数据质量和存储健康均正常。此前 Console 警告为无功能阻断警告，未修改 Blob 导出代码。
@@ -60,4 +90,4 @@
 
 ## 结论
 
-V1.4 新增业务链、全部离线回归和全部真实 REST 均为 0 失败。旧健康门失败已由 CEO 授权的严格因果 ATR 修复关闭，没有降低任何异常阈值或交易安全规则。
+V1.4 新增业务链、全部离线回归和全部真实 REST 均为 0 失败。旧健康门失败已由 CEO 授权的严格因果 ATR 修复关闭，没有降低任何异常阈值或交易安全规则。原Chrome实机验收报告的`signalSnapshots`同ID内容冲突已通过`VERIFIED_WITH_CONFLICTS`冲突保存协议修复：真实业务内容不同的历史记录不再导致迁移永久`FAILED`，而是双方均安全保留、互不覆盖、不产生孤儿记录、不获得新的交易许可；`v1-core.js`及全部V1.1-V1.3.1既有核心文件本轮零改动。
