@@ -1,0 +1,13 @@
+import test from 'node:test';import assert from 'node:assert/strict';
+import { createApiServer } from '../src/api/server.js';import { MemoryRepository } from '../src/db/memory.js';
+
+async function fixture(){const repository=new MemoryRepository();const collector={health:()=>({state:'HEALTHY',reasons:[]}),status:()=>({running:true})};const api=createApiServer({collector,repository,host:'127.0.0.1',port:0});const address=await api.start();return{api,base:`http://127.0.0.1:${address.port}`};}
+test('liveness独立返回LIVE',async()=>{const x=await fixture();try{const r=await fetch(`${x.base}/health/live`);assert.equal(r.status,200);assert.equal((await r.json()).status,'LIVE');}finally{await x.api.stop();}});
+test('readiness按数据健康返回',async()=>{const x=await fixture();try{assert.equal((await fetch(`${x.base}/health/ready`)).status,200);}finally{await x.api.stop();}});
+test('API拒绝非GET方法',async()=>{const x=await fixture();try{assert.equal((await fetch(`${x.base}/api/v1/sources`,{method:'POST'})).status,405);}finally{await x.api.stop();}});
+test('bars参数使用symbol白名单',async()=>{const x=await fixture();try{const r=await fetch(`${x.base}/api/v1/bars?instrument=BNBUSDT&interval=15m`);assert.equal(r.status,400);assert.equal((await r.json()).error.code,'INVALID_INSTRUMENT');}finally{await x.api.stop();}});
+test('bars周期使用固定白名单',async()=>{const x=await fixture();try{assert.equal((await fetch(`${x.base}/api/v1/bars?instrument=ETHUSDT&interval=30m`)).status,400);}finally{await x.api.stop();}});
+test('API限制最大返回数量',async()=>{const x=await fixture();try{assert.equal((await fetch(`${x.base}/api/v1/gaps?limit=1001`)).status,400);}finally{await x.api.stop();}});
+test('API限制查询时间范围',async()=>{const x=await fixture();try{assert.equal((await fetch(`${x.base}/api/v1/bars?instrument=ETHUSDT&interval=15m&from=0&to=999999999999`)).status,400);}finally{await x.api.stop();}});
+test('内部错误不暴露堆栈或环境变量',async()=>{const repository=new MemoryRepository();repository.listSources=async()=>{throw new Error(`secret=${process.env.DATABASE_URL}`)};const collector={health:()=>({state:'HEALTHY'}),status:()=>({})};const api=createApiServer({collector,repository,host:'127.0.0.1',port:0});const a=await api.start();try{const body=await(await fetch(`http://127.0.0.1:${a.port}/api/v1/sources`)).text();assert.doesNotMatch(body,/stack|DATABASE_URL|postgresql:/i);assert.match(body,/服务暂时不可用/);}finally{await api.stop();}});
+test('未知路由返回统一错误结构',async()=>{const x=await fixture();try{const body=await(await fetch(`${x.base}/nope`)).json();assert.equal(body.ok,false);assert.equal(body.error.code,'NOT_FOUND');}finally{await x.api.stop();}});

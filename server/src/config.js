@@ -1,0 +1,25 @@
+const integer = (name, fallback, min = 0) => {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isInteger(value) || value < min) throw new Error(`Invalid ${name}`);
+  return value;
+};
+
+export function loadConfig() {
+  return Object.freeze({
+    env: process.env.NODE_ENV || 'development',
+    host: process.env.HOST || '127.0.0.1',
+    port: integer('PORT', 8787, 1),
+    databaseUrl: process.env.DATABASE_URL || '',
+    dbSsl: process.env.DB_SSL === 'true',
+    collectorId: process.env.COLLECTOR_ID || `collector-${process.pid}`,
+    spotBaseUrl: process.env.BINANCE_SPOT_BASE_URL || 'https://api.binance.com',
+    futuresBaseUrl: process.env.BINANCE_FUTURES_BASE_URL || 'https://fapi.binance.com',
+    timeoutMs: integer('HTTP_TIMEOUT_MS', 10_000, 100),
+    maxRetries: integer('MAX_RETRIES', 3, 0),
+    backoffBaseMs: integer('BACKOFF_BASE_MS', 250, 1),
+    backoffCapMs: integer('BACKOFF_CAP_MS', 10_000, 1),
+    maxClockOffsetMs: integer('MAX_CLOCK_OFFSET_MS', 5_000, 0),
+    leaseTtlMs: integer('LEASE_TTL_MS', 60_000, 10_000),
+    logLevel: process.env.LOG_LEVEL || 'info'
+  });
+}
