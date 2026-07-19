@@ -5,13 +5,14 @@
 
 ## V1.4 专项
 
-- 行为级离线测试：265 项通过，0 失败。
+- 行为级离线测试：273 项通过，0 失败。
   - 预测与 K 线审计核心：81 项。
   - 路径与结果事件：33 项。
   - Walk-forward 与误差归因：14 项。
-  - 运行时持久化与 UI：55 项（本轮新增5项：冲突UI DOM、entryZoneNormalizer注入、六级迁移状态、DB_VERSION=2升级、冲突存储区专属常量核对）。
+  - 运行时持久化与 UI：58 项（新增指定ID三方对象诊断导出、冲突总数/显示数分离与新DOM接线）。
   - IndexedDB容量、迁移、原子性与导入导出：33 项（本轮更新3项断言以匹配新的冲突保存协议，见下）。
   - **IndexedDB迁移冲突保存协议（本轮新增）：28 项**，见下方专题章节。
+  - **第二次实机迁移真实规模回归：5 项**，覆盖200+跨dataset冲突、精确shadowResults ID、多次FAILED重试与刷新恢复。
   - 因果滚动 ATR 专项：8 项。
   - 结构化入场区 P0 专项：13 项。
 - `KlineWindowRef` T30.1–T30.19 已覆盖六窗口唯一组合、确定性、七字段内容敏感性、乱序/重复拒绝、收盘边界、元数据一致性、独立复算和不可审计样本双分母排除。
@@ -24,7 +25,7 @@
 
 ## 全部非联网回归
 
-- 自动化非联网合计：1,346 项通过，0 失败（本轮从1,313增至1,346：运行时UI +5，新增冲突保存协议 +28）。
+- 自动化非联网合计：1,354 项通过，0 失败（在上一轮1,346基础上新增运行时UI 3项、真实规模迁移5项）。
 - V1.1 既有非联网组：110 项通过，0 失败（含此前未计入的 `v11-ui-tests.js` 12项）。
 - V1.2 既有非联网组：299 项通过，0 失败。
 - V1.3/V1.3.1 既有非联网组：594 项通过，0 失败（其中 V1.3 的 284 项为既有验收矩阵结构追踪；含此前未计入的 `v13-auto-engine-ui-tests.js` 22项、`v13-signal-archive-ui-tests.js` 14项）。
@@ -44,7 +45,7 @@
 | V1.3.1 门禁诊断链 | 11 | 0 | 通过，未伪造交易许可 |
 | V1.4 GMKG 生产链与正式存储仓库 | 27 | 0 | 通过；含六路逐周期健康断言、两时窗原子持久化、幂等与备份版本 |
 
-真实 REST 合计：100 项通过，0 失败。六路最新异常计数为 ETHUSDT 15m/1h/4h=`0/1/0`，BTCUSDT 15m/1h/4h=`0/0/0`；六路均无缺口、无陈旧。保存的 BTCUSDT 15m 原始样本在旧末端ATR算法下为27根异常，因果ATR算法下为0根。5×ATR阈值和`anomalyBarsExcluded>5`健康门保持不变。
+真实 REST 合计：100 项通过，0 失败。六路最新异常计数为 ETHUSDT 15m/1h/4h=`2/0/0`，BTCUSDT 15m/1h/4h=`0/0/0`；六路均无缺口、无陈旧且通过健康门。保存的 BTCUSDT 15m 原始样本在旧末端ATR算法下为27根异常，因果ATR算法下为0根。5×ATR阈值和`anomalyBarsExcluded>5`健康门保持不变。
 
 ## STORAGE_BLOCKED专项
 
@@ -63,10 +64,19 @@
 - **`BrowserIndexedDbAdapter`真实浏览器代码路径**（4项）：通过最小忠实的假`IndexedDB`（实现真实的请求/事务/`onupgradeneeded`/`onblocked`/提交回滚语义，而非`MemoryAdapter`模拟）直接练习该类此前从未被自动化测试覆盖的代码——验证已运行过旧版本(`DB_VERSION=1`)的数据库升级到`DB_VERSION=2`后会自动补建`migrationConflicts`存储区、`putMany`三种路径（去重/冲突/新增）、写入失败时事务abort后批内容不落地、`onblocked`时`open()`明确拒绝。
 - **两标签页并发生成同一逻辑GMKG快照**（2项）：使用真实`v1_4-gmkg-forecast-core.js`的`buildForecastSnapshot()`+相同业务输入、不同`serverTime`模拟两个标签页几乎同时生成同一`predictionId`，验证安全去重、不产生虚假`DATA_BLOCKED`；业务内容确实不同时验证保留为冲突记录而不覆盖先到者。
 
+## 第二次实机迁移真实规模专项（`tests/v1_4-storage-real-scale-migration.test.js`，5项）
+
+- 使用52条旧GMKG快照、100条旧signalArchive、100条旧shadowResults、25条诊断缓存；signalArchive和shadowResults共享相同`SIG-*` originalId，包含实机报错精确ID`SIG-1784362500000-ranging-raft4final`。
+- 精确ID对象级诊断验证同时导出：localStorage旧投影、IndexedDB当前投影、对应dataset冲突对象、双方canonical hash和逐字段差异路径。
+- 预置100条signalArchive和100条shadowResults内容差异，验证冲突总数大于100仍完成`VERIFIED_WITH_CONFLICTS`；底层、完整JSON导出和逐源记录验证均覆盖全部冲突，UI摘要只显示前100条但明确报告总数。
+- 明确验证同一originalId在signalArchive/shadowResults产生不同冲突ID；ID包含冲突schema版本、dataset、originalId和canonical content hash的确定性身份，不发生跨dataset碰撞。
+- 连续两次模拟`MIGRATION_INTERRUPTED`后第三次重试成功；相同冲突不增加副本，运行期间新增IndexedDB快照不被删除，模拟账户与未平仓持仓逐字节不变，旧GMKG数组只在全部校验后清理，刷新后状态继续为`VERIFIED_WITH_CONFLICTS`。
+- shadowResults按可更新正式投影处理：日常运行可覆盖当前投影，迁移旧投影不能覆盖当前值，只能进入dataset隔离审计记录；该记录不携带交易许可，也不进入正式交易或统计读取路径。
+
 ## 构建与人工验收
 
 - 单文件构建：通过；精确占位符全部替换，脚本可编译，无外部 CDN、WebSocket 或运行时依赖。
-- 重复构建：通过；两次 SHA-256 均为 `d8051363f82ee4556fb00804e3717a74c4c10125c8afc76c70de58e994e5b827`。
+- 重复构建：通过；两次 SHA-256 均为 `fe969b5d76cbecb4a19b47093ee698f12d38bbf01e0fd36b50dc1add3ac2c5c8`。
 - 单文件静态检查：通过；无 frame、无外部本地资源、无外部脚本/样式，GMKG导出只绑定点击事件。
 - 五个真实交易入口静态扫描：`recordSignalIfEligible`、`evaluateShadowSignals`、`buildTradeProposal`、`tickAutoEngine`、`processTradeGate` 在 V1.4 GMKG 模块中的调用均为0。
 - Chrome 双击 `file://` 人工验收：通过；六路 REST、24H/72H、`PRICE_ONLY_MODE`、`UNKNOWN`、`DISPLAY_ONLY/WAIT`、数据质量和存储健康均正常。此前 Console 警告为无功能阻断警告，未修改 Blob 导出代码。

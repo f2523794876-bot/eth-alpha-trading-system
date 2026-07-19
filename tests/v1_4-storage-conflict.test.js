@@ -76,7 +76,7 @@ await test('T1b 精确ID：archiveCategory真实不同（业务内容差异）�
   await r.putImmutable('signalArchive',inIndexedDb);
   const inLocalStorage=signal(REAL_CONFLICT_ID,{archiveCategory:'OBSERVATION',eligibleForTrigger:false,hardBlockedAtCreation:true});
   const x=await r.putImmutable('signalArchive',inLocalStorage);
-  assert.equal(x.ok,true);assert.equal(x.conflict,true);assert.ok(x.conflictId.startsWith(REAL_CONFLICT_ID+'__conflict__'));
+  assert.equal(x.ok,true);assert.equal(x.conflict,true);assert.match(x.conflictId,/v1\.4-migrationconflict-2__signalArchive__/);
   const formal=await r.get('signalArchive',REAL_CONFLICT_ID);
   assert.equal(formal.archiveCategory,'WATCHLIST','正式存储记录不得被覆盖');
   const conflicts=await r.getConflicts('signalArchive');

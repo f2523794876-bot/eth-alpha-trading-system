@@ -55,7 +55,7 @@
 - `v1_3-signal-archive-core.js`：`6279e5cecad5acb0cb5ddaee82200b260eebf17590d1d5e6c561260a52b7e032`
 - `v1_3-auto-engine-core.js`：`1114ea3ed86760adb0c95ba53129ba796cfdcaa6d11a769b7928b13c69948b5b`
 - `v1_3-trade-gate-diagnostics.js`：`abc72c4f331fe2d5547b7d7024bc23683551e79ed0b965d4d7ffa90816ebda43`
-- `v1_4-storage-core.js`：`9b4edf8f365c304202fbf2979e2e8c757a683ccec4321aa5716a1b172fdda426`（本轮更新：冲突保存协议、DB_VERSION升至2，见下方专题章节；`v1-core.js`哈希未变）
+- `v1_4-storage-core.js`：`cde2f2d3d041b2199501007529582fe862bb5420767bf02a081b162e93edc665`（迁移冲突协议v2：冲突ID按dataset隔离、投影历史冲突保留、全量计数与幂等重试；`v1-core.js`哈希未变）
 
 ## 实施阶段CEO授权例外记录
 
@@ -136,7 +136,7 @@
 - 新增正确的递归、键序无关的`canonicalStringify()`，替换从未被引用的旧`canonical()`。
 - 新增按数据集的逐字段白名单`VOLATILE_FIELDS`（当前仅`snapshots.generatedAt`/`snapshots.dataCutoffTime`及`klineWindowRefs[].fetchedAt`——生成时刻的运行时元数据），供比较前剥离；价格、方向、许可、评分、失效条件、目标、风险、算法版本、权重版本、数据截止时间等业务字段**不在白名单内**，逐字节比较后任何差异均视为真实冲突。
 - `signalArchive`的`entryZone`比较前，通过运行时注入的`entryZoneNormalizer`（即`v1-core.js`的`normalizeEntryZone`，通过依赖注入传入`v1_4-storage-core.js`，不复制解析逻辑）解析为数值三元组再比较；`archiveCategory`/`eligibleForTrigger`/`hardBlockedAtCreation`等字段不在白名单内，差异一律视为真实业务冲突。
-- 规范化后确认**真正内容不同**的同ID记录：不覆盖已存在的正式记录，改为写入独立的`migrationConflicts`存储区，ID为`${originalId}__conflict__${contentHash}`（`contentHash`为对规范化后内容的确定性哈希）——同一原始ID+同一内容始终产生同一冲突ID，重复迁移/重复导入不会重复膨胀。冲突记录携带`originalId`/`contentHash`/`datasetName`/`migrationConflictReason`/`sourceStorage`/完整原始内容；`signalArchive`类型的冲突记录会被强制降级为`archiveCategory:'OBSERVATION'`、`eligibleForTrigger:false`，永远不会获得新的交易许可，也不会出现在`repo.getAll('signalArchive')`等正式读取路径中。
+- 规范化后确认**真正内容不同**的同ID记录：不覆盖已存在的正式记录，改为写入独立的`migrationConflicts`存储区。第二次原Chrome实机迁移暴露旧ID`${originalId}__conflict__${contentHash}`缺少dataset，会让`signalArchive`和`shadowResults`共用`SIG-*`时发生跨数据集主键碰撞；当前已升级为`CONFLICT_SCHEMA_VERSION + dataset + stableHash(schemaVersion,dataset,originalId,contentHash) + contentHash`。同一dataset、原始ID和规范化内容始终产生同一冲突ID，跨dataset绝不碰撞，重复迁移/重复导入不会重复膨胀。冲突记录携带`originalId`/`contentHash`/`datasetName`/`migrationConflictReason`/`sourceStorage`/完整原始内容；`signalArchive`类型的冲突记录会被强制降级为`archiveCategory:'OBSERVATION'`、`eligibleForTrigger:false`，永远不会获得新的交易许可，也不会出现在`repo.getAll('signalArchive')`等正式读取路径中。
 - 迁移校验阶段同步更新：每条源记录必须能在"正式存储"或"冲突审计记录"中找到内容匹配的副本，否则仍判定`MIGRATION_VERIFY_FAILED`（防止真正的数据丢失被误判为"已处理"）。
 - 迁移最终状态新增`VERIFIED_WITH_CONFLICTS`（非`FAILED`）：存在真实冲突时，旧localStorage数组仍会在全部校验通过后正常清理，不会因冲突而永久卡在`FAILED`。UI新增"迁移冲突"计数行与"导出迁移冲突报告"按钮。
 - `IndexedDB`数据库版本从`1`升至`2`：`onupgradeneeded`会为已经运行过一次旧版本迁移的真实用户数据库补建新增的`migrationConflicts`存储区，不影响已有存储区内容。
@@ -150,6 +150,27 @@
 ### 为什么不会重复计入交易或统计
 
 `migrationConflicts`是独立存储区，不属于`DATASETS`映射，`repo.getAll('signalArchive')`等正式读取路径不会返回冲突记录；`signalArchive`类型的冲突记录额外被强制降级为`OBSERVATION`/`eligibleForTrigger:false`。V1.1–V1.3.1既有交易生命周期（`recordSignalIfEligible`/`evaluateShadowSignals`/`tickAutoEngine`/`processTradeGate`）从未读取IndexedDB，本次修复未新增任何调用，五个真实交易入口在全部V1.4文件中静态扫描仍为0。
+
+## 第二次原Chrome迁移验收：`shadowResults`校验失败修复
+
+### 对象级证据与准确根因
+
+用户Chrome Profile不由开发测试进程直接读取或修改。为避免以推测替代证据，页面新增“导出指定迁移记录诊断”：输入dataset和originalId后，一次性导出旧localStorage对象、IndexedDB当前对象、该dataset全部匹配冲突对象、双方canonical hash及逐字段差异路径，不要求用户编辑任何存储。专项测试使用实机错误中的精确ID `SIG-1784362500000-ranging-raft4final`构造可复现等价历史：
+
+- localStorage `shadowResults`：`lifecycleStatus='OBSERVING'`、`verified=false`、`entryFillPrice/exitPrice/grossR=null`、`origin='local'`；
+- IndexedDB `shadowResults`当前投影：`lifecycleStatus='STOPPED'`、`verified=true`、`entryFillPrice=1843.815`、`exitPrice=1835`、`grossR=-1`、`origin='indexeddb'`；
+- `migrationConflicts`：dataset严格为`shadowResults`、originalId为上述精确ID、contentHash等于localStorage对象的同一canonical结果，record完整保留旧投影。
+
+旧协议的冲突ID只有`originalId+contentHash`。`signalArchive`与`shadowResults`合法共用同一个`SIG-*` originalId；当两数据集的canonical内容恰好得到各自冲突时，第二条可能命中第一条已经占用的IndexedDB主键而被当成“已保存”。底层因此只有`signalArchive`冲突，verify却按`datasetName==='shadowResults'`查找，最终抛出`MIGRATION_VERIFY_FAILED:shadowResults:<id>`。这解释了为什么页面能显示冲突已保存而shadowResults仍验证失败。
+
+### 冲突存储、投影与重试修复
+
+- 冲突ID升级为`v1.4-migrationconflict-2__<dataset>__<identityHash>__<contentHash>`；identityHash明确绑定`schemaVersion/dataset/originalId/contentHash`。写入和verify共用同一`conflictIdentity()`，不再各自拼接或重新解释ID。
+- 没有发现`migrationConflicts`底层100条保存上限。此前UI只有单一数字，无法区分总量与展示量；现在IndexedDB保存全部冲突，UI分别显示`totalConflictCount`与`displayedConflictCount`（展示上限100），完整导出永不截断。迁移元数据只保存前100条摘要，避免localStorage元数据膨胀，但总数单独持久化。
+- `shadowResults`被明确为可更新的正式当前投影：正常运行继续用`putProjection()`更新；迁移旧数据则一律走冲突保留写入，绝不覆盖当前投影。旧投影与当前投影不同是合法历史差异，旧对象进入dataset隔离的冲突审计区；它不属于建议档案、不携带或推导交易许可，也不会进入正式胜负统计分母。
+- 每批迁移的`migrationSessionId`由全部源dataset的canonical内容确定。FAILED重试相同源数据得到相同sessionId和相同冲突ID，复用已经安全写入的正式记录与冲突记录，不产生副本。IndexedDB `repositoryMeta.migrationLock`标记`MIGRATING/FAILED/VERIFIED_WITH_CONFLICTS`；迁移校验期间同页面的运行投影归档延后，localStorage原数据继续保留。
+- 只有全部dataset逐条通过“正式对象内容匹配，或同dataset冲突对象内容匹配”校验和健康探针后才清理旧GMKG大数组/压缩运行缓存。页面运行期间新写入IndexedDB的记录从不在迁移中删除。成功状态和有限冲突摘要写入localStorage，刷新后直接恢复`VERIFIED_WITH_CONFLICTS`，不会把已压缩运行缓存再次当作完整旧历史重迁。
+- `SCHEMA_VERSION`升级为`v1.4-storage-repository-3`，`CONFLICT_SCHEMA_VERSION`升级为`v1.4-migrationconflict-2`。旧FAILED批次留下的v1冲突记录继续作为历史审计保留，但不会冒充v2 dataset隔离冲突满足新校验；重试会生成正确的v2记录。
 
 ## 已知限制
 

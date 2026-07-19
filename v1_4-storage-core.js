@@ -1,6 +1,6 @@
 (function(root,factory){const api=factory();if(typeof module==='object'&&module.exports)module.exports=api;root.ETHAlphaStorageV14=api;})(typeof globalThis!=='undefined'?globalThis:this,function(){
 'use strict';
-const DB_NAME='ethAlphaAuditStore',DB_VERSION=2,MIGRATION_KEY='ethAlphaStorageMigrationV14',SCHEMA_VERSION='v1.4-storage-repository-2',CONFLICT_SCHEMA_VERSION='v1.4-migrationconflict-1',DIAGNOSTIC_LOCAL_CACHE_LIMIT=25,SIGNAL_LOCAL_CACHE_LIMIT=100;
+const DB_NAME='ethAlphaAuditStore',DB_VERSION=2,MIGRATION_KEY='ethAlphaStorageMigrationV14',SCHEMA_VERSION='v1.4-storage-repository-3',CONFLICT_SCHEMA_VERSION='v1.4-migrationconflict-2',CONFLICT_DISPLAY_LIMIT=100,DIAGNOSTIC_LOCAL_CACHE_LIMIT=25,SIGNAL_LOCAL_CACHE_LIMIT=100;
 const MIGRATION_STATES=['NOT_REQUIRED','PENDING','MIGRATING','VERIFIED','VERIFIED_WITH_CONFLICTS','FAILED'],HEALTH_STATES=['HEALTHY','WARNING','CRITICAL','BLOCKED'];
 const DATASETS={
   snapshots:{store:'forecastSnapshots',id:'predictionId',formal:true,legacyKey:'ethAlphaGmkgForecastSnapshots'},
@@ -36,6 +36,12 @@ function stableHash(text){
   }
   return(h1>>>0).toString(16).padStart(8,'0')+(h2>>>0).toString(16).padStart(8,'0');
 }
+// 冲突身份必须同时绑定数据集、原始ID、规范化内容和冲突schema。signalArchive与shadowResults
+// 合法共用SIG-*业务ID，但绝不能在migrationConflicts对象仓库里共用主键。
+function conflictIdentity(datasetName,originalId,canonicalContent){
+  const contentHash=stableHash(canonicalContent),identity=canonicalStringify({schemaVersion:CONFLICT_SCHEMA_VERSION,datasetName:String(datasetName),originalId:String(originalId),contentHash});
+  return{contentHash,conflictId:`${CONFLICT_SCHEMA_VERSION}__${datasetName}__${stableHash(identity)}__${contentHash}`};
+}
 function stripVolatile(name,record){
   const out=clone(record),fields=VOLATILE_FIELDS[name]||[];
   for(const f of fields)delete out[f];
@@ -60,11 +66,18 @@ function demoteForConflictStorage(name,record){
   return safe;
 }
 function buildConflictRecord(entry,id,conflictId,contentHash){
-  return{_storageId:conflictId,schemaVersion:CONFLICT_SCHEMA_VERSION,conflictId,datasetName:entry.name,store:entry.store,originalId:id,contentHash,detectedAt:Date.now(),migrationConflictReason:entry.conflictReason||'ID_CONFLICT_CONTENT_MISMATCH',sourceStorage:entry.sourceStorage||'localStorage',record:entry.demote?demoteForConflictStorage(entry.name,entry.record):clone(entry.record)};
+  return{_storageId:conflictId,schemaVersion:CONFLICT_SCHEMA_VERSION,conflictId,datasetName:entry.name,store:entry.store,originalId:id,contentHash,detectedAt:Date.now(),migrationSessionId:entry.migrationSessionId||null,migrationConflictReason:entry.conflictReason||'ID_CONFLICT_CONTENT_MISMATCH',sourceStorage:entry.sourceStorage||'localStorage',record:entry.demote?demoteForConflictStorage(entry.name,entry.record):clone(entry.record)};
 }
 function classifyError(e){const name=e?.name||'Error',message=e?.message||String(e||'未知错误');if(name==='QuotaExceededError')return{code:'QUOTA_EXCEEDED',message};if(['SecurityError','NotAllowedError'].includes(name))return{code:'PERMISSION_DENIED',message};if(name==='DataError')return{code:'DATA_ERROR',message};if(String(message).includes('ID_CONFLICT'))return{code:'ID_CONFLICT',message};return{code:'DATABASE_ERROR',message}}
 function recordId(name,record){const cfg=DATASETS[name],candidate=record?.[cfg.id]??(name==='walkForward'?'default':null);return candidate===null||candidate===undefined||candidate===''?null:String(candidate)}
 function stripInternal(record){if(!record||typeof record!=='object')return record;const out=clone(record);delete out._storageId;return out}
+function differencePaths(a,b,path='',out=[]){
+  if(Object.is(a,b))return out;
+  if(a===null||b===null||typeof a!=='object'||typeof b!=='object'||Array.isArray(a)!==Array.isArray(b)){out.push(path||'$');return out}
+  const keys=new Set([...Object.keys(a),...Object.keys(b)]);
+  for(const key of keys)differencePaths(a[key],b[key],path?`${path}.${key}`:key,out);
+  return out;
+}
 function requestPromise(req){return new Promise((resolve,reject)=>{req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error||Error('IndexedDB请求失败'))})}
 function transactionDone(tx){return new Promise((resolve,reject)=>{tx.oncomplete=()=>resolve();tx.onabort=()=>reject(tx.error||Error('IndexedDB事务中止'));tx.onerror=()=>reject(tx.error||Error('IndexedDB事务失败'))})}
 class BrowserIndexedDbAdapter{
@@ -90,7 +103,7 @@ class BrowserIndexedDbAdapter{
         if(prior&&!projection){
           const old=stripInternal(prior);
           if(canonicalStringify(canon(old))===canonicalStringify(canon(entry.record))){results.push({id,deduped:true,conflict:false});continue}
-          const contentHash=stableHash(canonicalStringify(canon(entry.record))),conflictId=`${id}__conflict__${contentHash}`,conflictStore=tx.objectStore(CONFLICT_STORE),existingConflict=await requestPromise(conflictStore.get(conflictId));
+          const{contentHash,conflictId}=conflictIdentity(entry.name,id,canonicalStringify(canon(entry.record))),conflictStore=tx.objectStore(CONFLICT_STORE),existingConflict=await requestPromise(conflictStore.get(conflictId));
           if(!existingConflict)conflictStore.put(buildConflictRecord(entry,id,conflictId,contentHash));
           results.push({id,deduped:false,conflict:true,conflictId});
           continue;
@@ -124,7 +137,7 @@ class MemoryAdapter{
         const table=this.tables.get(x.store),id=String(x.id),old=table.get(id),canon=x.canonicalize||(v=>v);
         if(old&&!projection){
           if(canonicalStringify(canon(old))===canonicalStringify(canon(x.record))){out.push({id,deduped:true,conflict:false});continue}
-          const contentHash=stableHash(canonicalStringify(canon(x.record))),conflictId=`${id}__conflict__${contentHash}`,conflictTable=this.tables.get(CONFLICT_STORE);
+          const{contentHash,conflictId}=conflictIdentity(x.name,id,canonicalStringify(canon(x.record))),conflictTable=this.tables.get(CONFLICT_STORE);
           if(!conflictTable.has(conflictId))stage(CONFLICT_STORE,conflictId,clone(buildConflictRecord(x,id,conflictId,contentHash)));
           out.push({id,deduped:false,conflict:true,conflictId});
           continue;
@@ -152,16 +165,21 @@ function compactOperationalSignalCache(storage){try{const archive=JSON.parse(sto
 function createRepository(options={}){
   const storage=options.localStorage||null,navigatorStorage=options.navigatorStorage||null,adapter=options.adapter||new BrowserIndexedDbAdapter(options.indexedDB),
     repo={adapter,storage,navigatorStorage,ready:false,lastError:null,lastLegacyBackup:null,migration:migrationMeta(null,'NOT_REQUIRED')};
-  const buildEntry=(name,record)=>({
+  const buildEntry=(name,record,extra={})=>({
     store:DATASETS[name].store,id:recordId(name,record),name,record:stripInternal(record),
     canonicalize:r=>canonicalizeForCompare(name,r,options),
     demote:name==='signalArchive',
-    conflictReason:'ID_CONFLICT_CONTENT_MISMATCH',sourceStorage:'localStorage'
+    conflictReason:'ID_CONFLICT_CONTENT_MISMATCH',sourceStorage:'localStorage',...extra
   });
   repo.open=async()=>{try{await adapter.open();repo.ready=true;return{ok:true}}catch(e){repo.lastError=classifyError(e);return{ok:false,error:repo.lastError}}};
   repo.getAll=async name=>{if(!repo.ready)throw Error('REPOSITORY_NOT_READY');return adapter.getAll(DATASETS[name].store)};
   repo.get=async(name,id)=>{if(!repo.ready)throw Error('REPOSITORY_NOT_READY');return adapter.get(DATASETS[name].store,id)};
   repo.getConflicts=async name=>{if(!repo.ready)return[];const all=await adapter.getAll(CONFLICT_STORE);return name?all.filter(c=>c.datasetName===name):all};
+  repo.inspectMigrationRecord=async(name,id)=>{
+    if(!DATASETS[name])throw Error(`未知数据集：${name}`);
+    const source=readLegacy(name,storage),localRecord=source.records.find(x=>recordId(name,x)===String(id))||null,formalRecord=await repo.get(name,id),conflicts=(await repo.getConflicts(name)).filter(x=>x.originalId===String(id)),canon=x=>x===null?null:canonicalizeForCompare(name,x,options),localCanonical=canon(localRecord),formalCanonical=canon(formalRecord);
+    return{schemaVersion:SCHEMA_VERSION,exportedAt:Date.now(),dataset:name,originalId:String(id),localStorageRecord:localRecord,indexedDbRecord:formalRecord,migrationConflicts:conflicts,canonical:{local:localCanonical,formal:formalCanonical,localHash:localCanonical===null?null:stableHash(canonicalStringify(localCanonical)),formalHash:formalCanonical===null?null:stableHash(canonicalStringify(formalCanonical)),differencePaths:localCanonical===null||formalCanonical===null?[]:differencePaths(localCanonical,formalCanonical)}};
+  };
   repo.putImmutable=async(name,record)=>{
     const id=recordId(name,record);
     if(!id)return{ok:false,error:{code:'DATA_ERROR',message:`${name}缺少稳定ID`}};
@@ -177,11 +195,12 @@ function createRepository(options={}){
       return{ok:true,deduped:result.every(x=>x.deduped),conflicts:result.filter(x=>x.conflict).map(x=>({id:x.id,conflictId:x.conflictId}))};
     }catch(e){repo.lastError=classifyError(e);return{ok:false,error:repo.lastError}}
   };
-  repo.audit=async()=>{const local=auditLocalStorage(storage),datasets=[];let conflictCount=0;if(repo.ready){for(const name of Object.keys(DATASETS)){const records=await repo.getAll(name);datasets.push({name,store:DATASETS[name].store,count:records.length,estimatedBytes:records.reduce((s,x)=>s+bytes(x),0),formal:DATASETS[name].formal})}conflictCount=(await repo.getConflicts()).length}let estimate=null;try{estimate=await navigatorStorage?.estimate?.()||null}catch(_){}const used=estimate?.usage??local.totalBytes,quota=estimate?.quota??null,ratio=quota?used/quota:null;let status='HEALTHY';if(repo.lastError||!repo.ready)status='BLOCKED';else if(ratio!==null&&ratio>=.92)status='BLOCKED';else if(ratio!==null&&ratio>=.8)status='CRITICAL';else if(ratio!==null&&ratio>=.6)status='WARNING';const all=[...datasets,...local.rows.map(x=>({name:x.key,store:'localStorage',count:x.count,estimatedBytes:x.estimatedBytes,formal:false}))].sort((a,b)=>b.estimatedBytes-a.estimatedBytes);return{schemaVersion:SCHEMA_VERSION,status,estimatedUsage:used,quota,usageRatio:ratio,localStorage:local,datasets,conflictCount,largest:all[0]||null,lastError:repo.lastError}};
+  repo.audit=async()=>{const local=auditLocalStorage(storage),datasets=[];let totalConflictCount=0;if(repo.ready){for(const name of Object.keys(DATASETS)){const records=await repo.getAll(name);datasets.push({name,store:DATASETS[name].store,count:records.length,estimatedBytes:records.reduce((s,x)=>s+bytes(x),0),formal:DATASETS[name].formal})}totalConflictCount=(await repo.getConflicts()).length}let estimate=null;try{estimate=await navigatorStorage?.estimate?.()||null}catch(_){}const used=estimate?.usage??local.totalBytes,quota=estimate?.quota??null,ratio=quota?used/quota:null;let status='HEALTHY';if(repo.lastError||!repo.ready)status='BLOCKED';else if(ratio!==null&&ratio>=.92)status='BLOCKED';else if(ratio!==null&&ratio>=.8)status='CRITICAL';else if(ratio!==null&&ratio>=.6)status='WARNING';const all=[...datasets,...local.rows.map(x=>({name:x.key,store:'localStorage',count:x.count,estimatedBytes:x.estimatedBytes,formal:false}))].sort((a,b)=>b.estimatedBytes-a.estimatedBytes);return{schemaVersion:SCHEMA_VERSION,status,estimatedUsage:used,quota,usageRatio:ratio,localStorage:local,datasets,conflictCount:totalConflictCount,totalConflictCount,displayedConflictCount:Math.min(totalConflictCount,CONFLICT_DISPLAY_LIMIT),largest:all[0]||null,lastError:repo.lastError}};
   repo.healthCheck=async()=>{if(!repo.ready)return{ok:false,status:'BLOCKED',error:repo.lastError};const probe={schemaVersion:SCHEMA_VERSION,probeId:'health',checkedAt:Date.now()};try{await adapter.putMany([{store:'repositoryMeta',id:'health',record:probe}],{projection:true});const got=await adapter.get('repositoryMeta','health');if(!got||got.checkedAt!==probe.checkedAt)throw Error('HEALTH_PROBE_MISMATCH');repo.lastError=null;return{ok:true,status:(await repo.audit()).status}}catch(e){repo.lastError=classifyError(e);return{ok:false,status:'BLOCKED',error:repo.lastError}}};
   repo.exportLegacyBackup=()=>{const audit=auditLocalStorage(storage),datasets={};for(const name of Object.keys(DATASETS)){const loaded=readLegacy(name,storage);datasets[name]={ok:loaded.ok,records:loaded.records,stats:loaded.stats,error:loaded.error||null}}return JSON.stringify({schemaVersion:SCHEMA_VERSION,exportedAt:Date.now(),summary:{localStorageBytes:audit.totalBytes,keys:audit.rows.length,records:Object.fromEntries(Object.entries(datasets).map(([k,v])=>[k,v.records.length]))},datasets},null,2)};
   repo.exportAll=async()=>{const datasets={};for(const name of Object.keys(DATASETS))datasets[name]=await repo.getAll(name);const conflicts=await repo.getConflicts(),diagnosticStats=readLegacy('diagnostics',storage).stats||{};return JSON.stringify({schemaVersion:SCHEMA_VERSION,exportedAt:Date.now(),summary:{records:Object.fromEntries(Object.entries(datasets).map(([k,v])=>[k,v.length])),conflictCount:conflicts.length},metadata:{diagnosticStats},datasets,migrationConflicts:conflicts},null,2)};
-  repo.exportConflicts=async()=>{const conflicts=await repo.getConflicts();return JSON.stringify({schemaVersion:SCHEMA_VERSION,exportedAt:Date.now(),conflictCount:conflicts.length,conflicts},null,2)};
+  repo.exportConflicts=async()=>{const conflicts=await repo.getConflicts();return JSON.stringify({schemaVersion:SCHEMA_VERSION,exportedAt:Date.now(),totalConflictCount:conflicts.length,displayedConflictCount:conflicts.length,conflictCount:conflicts.length,conflicts},null,2)};
+  repo.exportMigrationConflictDiagnostic=async(name,id)=>JSON.stringify(await repo.inspectMigrationRecord(name,id),null,2);
   repo.importBackup=async text=>{
     let parsed;try{parsed=typeof text==='string'?JSON.parse(text):clone(text)}catch(e){return{ok:false,error:{code:'DATA_ERROR',message:'导入JSON无法解析'}}}
     if(parsed?.schemaVersion!==SCHEMA_VERSION||!parsed.datasets)return{ok:false,error:{code:'DATA_ERROR',message:'导入格式版本不受支持'}};
@@ -201,8 +220,13 @@ function createRepository(options={}){
     if(importedStats&&storage){const current=readLegacy('diagnostics',storage),stats={...(current.stats||{})};for(const[k,v]of Object.entries(importedStats))if(Number.isFinite(+v))stats[k]=Math.max(+stats[k]||0,+v);storage.setItem(DATASETS.diagnostics.legacyKey,JSON.stringify({schemaVersion:'v1.3.1-trade-gate-1',stats,records:(current.records||[]).slice(-DIAGNOSTIC_LOCAL_CACHE_LIMIT)}))}
     return{ok:true,imported,conflicts,error:null};
   };
-  repo.archiveOperationalDatasets=async()=>{if(!repo.ready)return{ok:false,error:repo.lastError};const names=['signalArchive','signalEvents','shadowResults','diagnostics'];try{for(const name of names){const source=readLegacy(name,storage);if(!source.ok)throw Error(`${name}:${source.error}`);for(const record of source.records){const id=recordId(name,record);if(!DATASETS[name].projection&&await repo.get(name,id))continue;const saved=DATASETS[name].projection?await repo.putProjection(name,record):await repo.putImmutable(name,record);if(!saved.ok)throw Object.assign(Error(saved.error.message),{storageError:saved.error})}}const compacted=compactOperationalSignalCache(storage);if(!compacted.ok)throw Error(compacted.reason);const diagnostic=readLegacy('diagnostics',storage);if(diagnostic.ok&&diagnostic.records.length>DIAGNOSTIC_LOCAL_CACHE_LIMIT)storage.setItem(DATASETS.diagnostics.legacyKey,JSON.stringify({schemaVersion:'v1.3.1-trade-gate-1',stats:diagnostic.stats||{},records:diagnostic.records.slice(-DIAGNOSTIC_LOCAL_CACHE_LIMIT)}));if(repo.lastError){const health=await repo.healthCheck();if(!health.ok)return{ok:false,error:health.error}}return{ok:true,signalCacheCount:compacted.retained}}catch(e){repo.lastError=e.storageError||classifyError(e);return{ok:false,error:repo.lastError}}};
+  repo.archiveOperationalDatasets=async()=>{if(!repo.ready)return{ok:false,error:repo.lastError};const lock=await adapter.get('repositoryMeta','migrationLock');if(lock?.state==='MIGRATING')return{ok:true,deferred:true,reason:'迁移校验期间暂停投影归档，正式运行数据仍保留在localStorage'};const names=['signalArchive','signalEvents','shadowResults','diagnostics'];try{for(const name of names){const source=readLegacy(name,storage);if(!source.ok)throw Error(`${name}:${source.error}`);for(const record of source.records){const id=recordId(name,record);if(!DATASETS[name].projection&&await repo.get(name,id))continue;const saved=DATASETS[name].projection?await repo.putProjection(name,record):await repo.putImmutable(name,record);if(!saved.ok)throw Object.assign(Error(saved.error.message),{storageError:saved.error})}}const compacted=compactOperationalSignalCache(storage);if(!compacted.ok)throw Error(compacted.reason);const diagnostic=readLegacy('diagnostics',storage);if(diagnostic.ok&&diagnostic.records.length>DIAGNOSTIC_LOCAL_CACHE_LIMIT)storage.setItem(DATASETS.diagnostics.legacyKey,JSON.stringify({schemaVersion:'v1.3.1-trade-gate-1',stats:diagnostic.stats||{},records:diagnostic.records.slice(-DIAGNOSTIC_LOCAL_CACHE_LIMIT)}));if(repo.lastError){const health=await repo.healthCheck();if(!health.ok)return{ok:false,error:health.error}}return{ok:true,signalCacheCount:compacted.retained}}catch(e){repo.lastError=e.storageError||classifyError(e);return{ok:false,error:repo.lastError}}};
   repo.migrateLegacy=async()=>{
+    let priorMeta=null;try{priorMeta=JSON.parse(storage?.getItem(MIGRATION_KEY)||'null')}catch(_){}
+    if(priorMeta?.schemaVersion===SCHEMA_VERSION&&['VERIFIED','VERIFIED_WITH_CONFLICTS'].includes(priorMeta.state)){
+      const health=await repo.healthCheck();
+      if(health.ok){repo.migration=priorMeta;return{ok:true,state:priorMeta.state,counts:priorMeta.counts||{},retainedOperational:priorMeta.retainedOperational||[],totalConflictCount:priorMeta.totalConflictCount??priorMeta.conflictCount??0,displayedConflictCount:priorMeta.displayedConflictCount??Math.min(priorMeta.conflictCount||0,CONFLICT_DISPLAY_LIMIT),conflictCount:priorMeta.conflictCount||0,conflicts:priorMeta.conflicts||[],resumedVerified:true}}
+    }
     const sources={},has=[],conflicts=[],legacyOriginals=new Map(Object.values(DATASETS).map(cfg=>[cfg.legacyKey,storage?.getItem(cfg.legacyKey)??null]));
     let localMutated=false;
     repo.lastLegacyBackup=repo.exportLegacyBackup();
@@ -212,14 +236,21 @@ function createRepository(options={}){
       if(sources[name].records.length)has.push(name);
     }
     if(!has.length){repo.migration=migrationMeta(storage,'NOT_REQUIRED');return{ok:true,state:'NOT_REQUIRED',counts:{}}}
+    // sessionId取决于迁移源的规范化业务内容；同一批旧数据多次FAILED重试会得到同一ID，
+    // 页面运行中新产生的IndexedDB记录不会改变它，也不会被本迁移删除。
+    const migrationSessionId=`MIG-${stableHash(canonicalStringify(has.map(name=>({name,records:sources[name].records.map(record=>canonicalizeForCompare(name,record,options))}))))}`;
     repo.migration=migrationMeta(storage,'PENDING',{datasets:has});
-    repo.migration=migrationMeta(storage,'MIGRATING',{datasets:has});
+    repo.migration=migrationMeta(storage,'MIGRATING',{datasets:has,migrationSessionId});
     try{
+      await adapter.putMany([{store:'repositoryMeta',id:'migrationLock',name:'repositoryMeta',record:{schemaVersion:SCHEMA_VERSION,migrationSessionId,state:'MIGRATING',startedAt:Date.now()}}],{projection:true});
       // 写入阶段：内容一致的记录幂等去重；内容真正不同的同ID记录不覆盖已存在记录，转而作为确定性ID的冲突审计记录一并写入（见putImmutable/putMany）。
+      // shadowResults/diagnostics在日常运行中是可更新投影，但迁移是历史取证：旧投影不得覆盖当前投影，
+      // 内容不同必须进入dataset隔离的冲突审计记录。因此迁移阶段统一走冲突保留写入，不使用putProjection。
       for(const name of has)for(const record of sources[name].records){
-        const result=DATASETS[name].projection?await repo.putProjection(name,record):await repo.putImmutable(name,record);
-        if(!result.ok)throw Object.assign(Error(result.error.message),{storageError:result.error});
-        if(result.conflict)conflicts.push({name,id:result.id,conflictId:result.conflictId});
+        const id=recordId(name,record);
+        if(!id)throw Object.assign(Error(`${name}缺少稳定ID`),{storageError:{code:'DATA_ERROR',message:`${name}缺少稳定ID`}});
+        const written=await adapter.putMany([buildEntry(name,record,{migrationSessionId})]),result=written[0];
+        if(result.conflict)conflicts.push({name,id,conflictId:result.conflictId});
       }
       // 校验阶段：每条源记录必须能在"正式存储"或"冲突审计记录"中找到内容匹配的副本，否则判定迁移失败（防止静默丢数据）。
       for(const name of has){
@@ -230,8 +261,8 @@ function createRepository(options={}){
         for(const record of sources[name].records){
           const id=recordId(name,record),canon=r=>canonicalizeForCompare(name,r,options),wanted=canonicalStringify(canon(record)),stored=migrated.get(id);
           if(stored&&canonicalStringify(canon(stored))===wanted)continue;
-          const wantedHash=stableHash(wanted),losers=conflictsByOriginal.get(id)||[];
-          if(losers.some(c=>c.contentHash===wantedHash))continue;
+          const{contentHash:wantedHash,conflictId:wantedConflictId}=conflictIdentity(name,id,wanted),losers=conflictsByOriginal.get(id)||[];
+          if(losers.some(c=>c.schemaVersion===CONFLICT_SCHEMA_VERSION&&c.datasetName===name&&c.originalId===id&&c.contentHash===wantedHash&&c.conflictId===wantedConflictId))continue;
           throw Error(`MIGRATION_VERIFY_FAILED:${name}:${id}`);
         }
       }
@@ -247,21 +278,26 @@ function createRepository(options={}){
       if(!health.ok)throw Object.assign(Error(health.error?.message||'迁移后健康检查失败'),{storageError:health.error});
       const relevantConflicts=(await adapter.getAll(CONFLICT_STORE)).filter(c=>has.includes(c.datasetName)),
         state=relevantConflicts.length?'VERIFIED_WITH_CONFLICTS':'VERIFIED';
+      await adapter.putMany([{store:'repositoryMeta',id:'migrationLock',name:'repositoryMeta',record:{schemaVersion:SCHEMA_VERSION,migrationSessionId,state,verifiedAt:Date.now(),totalConflictCount:relevantConflicts.length}}],{projection:true});
       repo.migration=migrationMeta(storage,state,{
+        migrationSessionId,
         counts:Object.fromEntries(has.map(n=>[n,sources[n].records.length])),
         retainedOperational:has.filter(n=>DATASETS[n].retainLegacy),
+        totalConflictCount:relevantConflicts.length,
+        displayedConflictCount:Math.min(relevantConflicts.length,CONFLICT_DISPLAY_LIMIT),
         conflictCount:relevantConflicts.length,
-        conflicts:relevantConflicts.map(c=>({name:c.datasetName,originalId:c.originalId,conflictId:c.conflictId}))
+        conflicts:relevantConflicts.slice(0,CONFLICT_DISPLAY_LIMIT).map(c=>({name:c.datasetName,originalId:c.originalId,conflictId:c.conflictId}))
       });
-      return{ok:true,state,counts:repo.migration.counts,retainedOperational:repo.migration.retainedOperational,conflictCount:repo.migration.conflictCount,conflicts:repo.migration.conflicts};
+      return{ok:true,state,counts:repo.migration.counts,retainedOperational:repo.migration.retainedOperational,totalConflictCount:repo.migration.totalConflictCount,displayedConflictCount:repo.migration.displayedConflictCount,conflictCount:repo.migration.conflictCount,conflicts:repo.migration.conflicts};
     }catch(e){
       if(localMutated)for(const[key,raw]of legacyOriginals){try{if(raw===null)storage.removeItem(key);else storage.setItem(key,raw)}catch(_){}}
       repo.lastError=e.storageError||classifyError(e);
-      repo.migration=migrationMeta(storage,'FAILED',{reason:repo.lastError.message});
+      try{await adapter.putMany([{store:'repositoryMeta',id:'migrationLock',name:'repositoryMeta',record:{schemaVersion:SCHEMA_VERSION,migrationSessionId,state:'FAILED',failedAt:Date.now(),reason:repo.lastError.message}}],{projection:true})}catch(_){}
+      repo.migration=migrationMeta(storage,'FAILED',{migrationSessionId,reason:repo.lastError.message});
       return{ok:false,state:'FAILED',reason:repo.lastError.message,error:repo.lastError};
     }
   };
   return repo;
 }
-return{DB_NAME,DB_VERSION,MIGRATION_KEY,SCHEMA_VERSION,CONFLICT_SCHEMA_VERSION,CONFLICT_STORE,DIAGNOSTIC_LOCAL_CACHE_LIMIT,SIGNAL_LOCAL_CACHE_LIMIT,MIGRATION_STATES,HEALTH_STATES,DATASETS,VOLATILE_FIELDS,BrowserIndexedDbAdapter,MemoryAdapter,auditLocalStorage,readLegacy,recordId,classifyError,canonicalStringify,stableHash,canonicalizeForCompare,demoteForConflictStorage,writeLocalAtomically,compactOperationalSignalCache,createRepository};
+return{DB_NAME,DB_VERSION,MIGRATION_KEY,SCHEMA_VERSION,CONFLICT_SCHEMA_VERSION,CONFLICT_STORE,CONFLICT_DISPLAY_LIMIT,DIAGNOSTIC_LOCAL_CACHE_LIMIT,SIGNAL_LOCAL_CACHE_LIMIT,MIGRATION_STATES,HEALTH_STATES,DATASETS,VOLATILE_FIELDS,BrowserIndexedDbAdapter,MemoryAdapter,auditLocalStorage,readLegacy,recordId,classifyError,canonicalStringify,stableHash,conflictIdentity,canonicalizeForCompare,demoteForConflictStorage,differencePaths,writeLocalAtomically,compactOperationalSignalCache,createRepository};
 });
