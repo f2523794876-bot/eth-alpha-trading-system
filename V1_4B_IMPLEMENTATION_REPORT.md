@@ -2,7 +2,7 @@
 
 分支：`codex/v1.4b-feature-engine-foundation`  
 基线：`main@3b997ee2baddc95ecf3712d533700ecc9b539855`（Release v1.4.1）  
-交付提交：本报告所在最终提交；完整哈希记录在最终交付消息。  
+实现提交：`8a7e0112f98308ea95e7e76018bf6a1b9ebf8580`。本报告元数据的后续纯文档提交哈希记录在最终交付消息。  
 范围：统一特征工程、as-of时间契约、质量控制、来源追溯和PostgreSQL存储基础。没有训练模型、概率校准、规则权重修改、账户连接或真实交易。
 
 ## 1. 实现范围
@@ -67,3 +67,5 @@ BTC联动6项：`btcReturn`、`btcTrendState`、`btcVolatility`、`ethBtcReturnS
 `server/src`中五个真实交易入口直接调用均为0。没有API密钥、签名请求、订单、账户、持仓或浏览器模拟账户修改。宏观数据继续 `UNAVAILABLE/null`，没有伪造值。浏览器V1.1–V1.4文件和正式HTML均未改动。
 
 本机没有隔离 PostgreSQL/`TEST_DATABASE_URL`，因此新增4项真实PG测试与既有13项在本机明确SKIP。V1.4A 13项已有真实PostgreSQL 14 CI通过证据；V1.4B 4项已加入同一强制门禁，最终状态需以推送后CI为准。真实REST+PostgreSQL仍按既有独立Job执行；精确451只记 `EXTERNAL_REGION_BLOCKED`，不记PASS。
+
+Push尝试结果：失败，原因是本机Git HTTPS凭据不可用（`could not read Username`）；没有修改remote或凭据，需由用户通过GitHub Desktop推送。实现提交完成时工作区干净，`main`与`origin/main`仍为 `3b997ee2baddc95ecf3712d533700ecc9b539855`。
