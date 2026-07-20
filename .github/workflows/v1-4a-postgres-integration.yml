@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   postgres-production-path:
+    name: PostgreSQL 14生产集成（强制门禁）
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     services:
@@ -41,4 +42,62 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run test:postgres
-      - run: RUN_LIVE_REST=1 npm run test:postgres:live
+
+  rest-postgres-live-path:
+    name: Binance REST + PostgreSQL真实链（451为环境阻塞，非通过）
+    needs: postgres-production-path
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: eth_alpha_test
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: eth_alpha_v14a_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eth_alpha_test -d eth_alpha_v14a_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: server
+    env:
+      TEST_DATABASE_URL: postgresql://eth_alpha_test:test-only-password@127.0.0.1:5432/eth_alpha_v14a_test
+      RUN_LIVE_REST: "1"
+      LIVE_REST_STATUS_FILE: /tmp/v1-4a-live-rest-status.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - name: 运行真实Binance REST到PostgreSQL生产链
+        run: npm run test:postgres:live
+      - name: 发布真实链独立结果摘要
+        if: always()
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          let report;
+          try { report=JSON.parse(readFileSync(process.env.LIVE_REST_STATUS_FILE,'utf8')); }
+          catch { report={status:'FAIL',passed:0,externalRegionBlocked:0,failed:3,missing:3,total:3}; }
+          const lines=['## V1.4A REST + PostgreSQL真实链','',`- 最终状态：**${report.status}**`,`- 通过：${report.passed}/${report.total}`,`- 外部地区阻塞：${report.externalRegionBlocked}/${report.total}`,`- 失败：${report.failed}/${report.total}`,''];
+          if(report.status==='EXTERNAL_REGION_BLOCKED'){
+            lines.push('PostgreSQL 14生产集成门禁已在独立Job通过；GitHub托管Runner访问Binance收到精确HTTP 451，因此真实REST链未完成并被明确SKIP。此结果不是端到端通过。');
+            console.log('::warning title=EXTERNAL_REGION_BLOCKED::PostgreSQL集成已通过；Binance真实REST因Runner地区限制未完成，不能记为端到端通过');
+          }else if(report.status==='PASS'){
+            lines.push('三项真实Binance REST → PostgreSQL生产链均已执行并通过。');
+            console.log('::notice title=REST + PostgreSQL PASS::三项真实生产链均已执行并通过');
+          }else{
+            lines.push('真实链发生非451错误、数据库错误或结果不完整，必须保持失败。');
+            console.log('::error title=REST + PostgreSQL FAIL::非451错误或结果不完整，禁止降级为环境阻塞');
+            process.exitCode=1;
+          }
+          appendFileSync(process.env.GITHUB_STEP_SUMMARY,`${lines.join('\n')}\n`);
+          NODE

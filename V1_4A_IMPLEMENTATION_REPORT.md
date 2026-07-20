@@ -130,6 +130,14 @@ Down脚本明确标为破坏性，只允许空的临时数据库；生产历史�
 
 新增两项不依赖MemoryRepository结果的生产仓库调用级回归：分别执行 `PostgresRepository.saveMarketBar()`与四类 `savePointFact()`，核对目标列、绑定值、连续参数、关键时间与内容哈希。本机非联网V1.4A测试由101增至103且0失败；真实 PostgreSQL 14最终状态必须以推送后的CI复验为准。
 
+### PostgreSQL 14第二轮CI与地区限制分层
+
+`8505f81321de21032236da963b180c542e9938fa`第二轮CI证明：`npm test`通过，13项真实 PostgreSQL 14生产集成全部通过；失败只发生在后置的3项真实Binance REST→PostgreSQL测试，错误均为GitHub托管Runner访问Binance返回HTTP 451。该错误属于外部运行地区限制，不是数据库写入失败，也不是端到端通过。
+
+CI现拆为两个独立Job：`PostgreSQL 14生产集成（强制门禁）`继续真实执行非联网测试与13项数据库集成；`Binance REST + PostgreSQL真实链`仅在前者通过后运行。HTTP客户端把精确451分类为 `EXTERNAL_REGION_BLOCKED`，真实链测试据此逐项明确SKIP并生成独立摘要；429、500、超时、无效JSON、数据库错误、结果缺失及任何非精确451仍抛错并使Job失败。SKIP数量与PASS数量分开，不使用代理、伪响应或反复重跑规避地区限制。
+
+当Runner可访问Binance且 `RUN_LIVE_REST=1`时，原三项生产链保持不变：真实六路现货/永续K线与衍生品响应经过 `CollectorService`、Normalizer、fencing事务和真实PostgreSQL表，再验证幂等与readiness；没有用MemoryRepository替代。
+
 ### P2关闭
 
 - 002迁移用触发器拒绝 raw UPDATE/DELETE；归档只通过完整备份/对象存储流程，本版本没有在线删除入口。
@@ -141,7 +149,7 @@ Down脚本明确标为破坏性，只允许空的临时数据库；生产历史�
 
 ## 9. 已知限制与后续CEO决策
 
-1. 当前Mac执行环境没有 PostgreSQL/`psql`/容器运行时，也没有 `TEST_DATABASE_URL`。因此本机13项真实PostgreSQL与3项REST+PostgreSQL测试明确SKIP、不计通过；已提交可直接运行的生产代码集成套件和 PostgreSQL 14 CI门禁，必须以CI或隔离Ubuntu测试库的实际结果作为最终数据库实机证据，不能以Memory测试替代。
+1. 当前Mac执行环境没有 PostgreSQL/`psql`/容器运行时，也没有 `TEST_DATABASE_URL`。因此本机13项真实PostgreSQL与3项REST+PostgreSQL测试明确SKIP、不计通过；13项数据库集成已有第二轮CI实机通过证据，真实链仍须在允许访问Binance的Runner完成。GitHub托管Runner的精确HTTP 451只记为 `EXTERNAL_REGION_BLOCKED`，不得记为PASS。
 2. Binance公开多空比和主动买卖量只保留官方可查询窗口；长期历史从服务首次运行开始积累。
 3. 需CEO确定正式服务器的原始JSON冷归档介质、保留年限、磁盘预算及灾备RPO/RTO。
 4. 需CEO决定是否在 V1.4B 之前批准一个官方、无需密钥的宏观源；未批准前保持 `UNAVAILABLE`。

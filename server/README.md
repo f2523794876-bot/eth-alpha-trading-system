@@ -94,3 +94,5 @@ TEST_DATABASE_URL=postgresql://... RUN_LIVE_REST=1 npm run test:postgres:live
 ```
 
 `TEST_DATABASE_URL`必须指向名称含 `test`、`ci` 或 `v14a` 的隔离数据库；PostgreSQL套件会执行破坏性的 up/down/up，绝不能指向生产。`.github/workflows/v1-4a-postgres-integration.yml`使用 PostgreSQL 14 service container运行生产仓库与生产采集链。真实REST形状测试、真实PostgreSQL测试和真实REST+PostgreSQL端到端测试分别统计；环境缺失时明确SKIP，不计入通过。
+
+CI把13项 PostgreSQL 14生产集成作为独立强制门禁，并在后续独立Job运行3项真实REST+PostgreSQL链。GitHub托管Runner访问Binance可能因运行地区收到HTTP 451；只有精确的 `status=451`且错误码为 `EXTERNAL_REGION_BLOCKED`时，真实链才标记为环境阻塞SKIP，并在Job摘要明确“数据库门禁已通过、真实链未完成、不得视为端到端通过”。429、500、网络超时、无效JSON、数据库错误和任何非451错误仍会失败。可以在允许访问Binance的隔离Runner设置 `RUN_LIVE_REST=1`真实执行；禁止使用代理、伪响应或MemoryRepository冒充端到端验收。

@@ -12,6 +12,6 @@ export async function measureServerTime(adapter, { now = Date.now, maxClockOffse
     return { ok, health: ok ? 'HEALTHY' : 'BLOCKED', reason: ok ? null : 'CLOCK_OFFSET_EXCEEDED', sourceServerTime, localRequestStartedAt, localResponseReceivedAt, estimatedNetworkMidpoint, clockOffsetMs, roundTripMs, requestId: response.requestId };
   } catch (error) {
     const localResponseReceivedAt = now();
-    return { ok: false, health: 'BLOCKED', reason: 'SERVER_TIME_UNAVAILABLE', errorCode: error.code || 'UNKNOWN', localRequestStartedAt, localResponseReceivedAt, roundTripMs: localResponseReceivedAt - localRequestStartedAt };
+    return { ok: false, health: 'BLOCKED', reason: 'SERVER_TIME_UNAVAILABLE', errorCode: error.code || 'UNKNOWN', upstreamStatus: Number.isInteger(error.status) ? error.status : null, localRequestStartedAt, localResponseReceivedAt, roundTripMs: localResponseReceivedAt - localRequestStartedAt };
   }
 }

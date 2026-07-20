@@ -9,6 +9,8 @@ export class HttpError extends Error {
   }
 }
 
+export const isExternalRegionBlocked = error => error instanceof HttpError && error.status === 451 && error.code === 'EXTERNAL_REGION_BLOCKED';
+
 export class PublicHttpClient {
   constructor(config = {}, dependencies = {}) {
     this.fetch = dependencies.fetch || globalThis.fetch;
@@ -33,7 +35,8 @@ export class PublicHttpClient {
         const receivedAt = this.now(); const text = await response.text();
         if (!response.ok) {
           const retryable = response.status === 429 || response.status >= 500;
-          const error = new HttpError(`Upstream HTTP ${response.status}`, { status: response.status, retryable, code: response.status === 429 ? 'RATE_LIMITED' : 'UPSTREAM_HTTP', detail: text.slice(0, 500) });
+          const code = response.status === 451 ? 'EXTERNAL_REGION_BLOCKED' : response.status === 429 ? 'RATE_LIMITED' : 'UPSTREAM_HTTP';
+          const error = new HttpError(`Upstream HTTP ${response.status}`, { status: response.status, retryable, code, detail: text.slice(0, 500) });
           if (!retryable || attempt === this.maxRetries) throw error;
           await this.sleep(response.status === 429 ? retryAfterMs(response.headers, retryDelay(attempt, { baseMs: this.backoffBaseMs, capMs: this.backoffCapMs })) : retryDelay(attempt, { baseMs: this.backoffBaseMs, capMs: this.backoffCapMs }));
           continue;

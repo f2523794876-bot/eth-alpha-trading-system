@@ -8,16 +8,16 @@
 
 | 测试组 | 通过 | 失败 | 环境阻塞 |
 |---|---:|---:|---:|
-| V1.4A离线/Memory/静态约束/HTTP/API行为 | 103 | 0 | 0 |
-| V1.4A真实PostgreSQL生产仓库集成（`61a9da4`首次CI） | 7 | 6 | 0 |
-| V1.4A真实PostgreSQL生产仓库集成（本修复本机） | 0 | 0 | 13（本机无TEST_DATABASE_URL；等待CI复验） |
-| **V1.4A新增非联网已执行合计** | **103** | **0** | **13** |
+| V1.4A离线/Memory/静态约束/HTTP/API行为 | 110 | 0 | 0 |
+| V1.4A真实PostgreSQL 14生产仓库集成（`8505f81`第二轮CI） | 13 | 0 | 0 |
+| V1.4A真实PostgreSQL生产仓库集成（本机） | 0 | 0 | 13（本机无TEST_DATABASE_URL；CI证据单列） |
+| **V1.4A新增非联网已执行合计** | **110** | **0** | **13** |
 | V1.1–V1.4既有非联网回归 | 1,354 | 0 | 0 |
-| **全部已执行非联网自动化** | **1,457** | **0** | **13** |
+| **全部已执行非联网自动化** | **1,464** | **0** | **13** |
 
-V1.4A 103项已执行覆盖：canonical JSON根类型/拒绝路径、脱敏失败审计、修订状态与显式REJECTED、DataVintageRef、四表时间乱序、秒/毫秒、UTC日界、数据库/写入/零数据假健康、端点恢复、真实OPEN熔断隔离、令牌桶重算/取消、fencing旧token、heartbeat停调度、graceful shutdown、回补领取/重试/永久失败、collection run/attempt关联、raw触发器和迁移静态约束、API readiness脱敏，以及本轮新增的 `market_bars` 30列/30参数一一对应、四类点状事实生产列映射函数调用测试。
+V1.4A 110项已执行覆盖此前103项，并新增7项CI分层回归：451精确分类、仅451可转环境阻塞、429/500/超时/JSON错误保持失败、服务器时间守卫fail-closed且保留脱敏451状态、SKIP与PASS分离、PostgreSQL强制门禁独立，以及非451真实链仍调用生产 `CollectorService`与 `PostgresRepository`路径。
 
-数据库迁移测试说明：`61a9da4`首次 PostgreSQL 14 CI 为7通过、6失败。对象级复核确认两项生产缺陷：`market_bars` 30个目标列生成了31个值表达式并引用越界参数；点状事实列映射把 `Map` 中已经取出的函数再次按 `[1]`索引，首写即抛出 `TypeError`，其余失败为依赖这两条写入链的级联。本轮已用固定列清单/结构化30值数组和直接函数调用修复，并新增两项生产仓库SQL生成回归。当前Mac没有 PostgreSQL/`psql`/容器运行时且未配置 `TEST_DATABASE_URL`，所以13项真实PostgreSQL套件本地仍明确SKIP，不能把本地结果冒充CI复验；推送后由同一 PostgreSQL 14门禁重新执行。
+数据库迁移测试说明：`8505f81321de21032236da963b180c542e9938fa`第二轮CI已经在真实 PostgreSQL 14中执行13项生产集成测试并全部通过，关闭首轮K线与点状事实写入缺陷。其后的3项REST+PostgreSQL测试因GitHub托管Runner访问Binance收到精确HTTP 451而失败；这是外部地区可达性限制，不是否定前置数据库门禁，也不能表述为真实链通过。本轮将两个阶段拆为独立Job，并只允许精确451显示 `EXTERNAL_REGION_BLOCKED`/SKIP。
 
 ## 真实公开 REST
 
@@ -26,11 +26,13 @@ V1.4A 103项已执行覆盖：canonical JSON根类型/拒绝路径、脱敏失�
 | V1.4A Binance服务器时间与六路现货生产标准化 | 7 | 0 | 时间偏差守卫通过；ETH/BTC × 15m/1h/4h均产生已收盘正式事实 |
 | V1.4A ETH/BTC永续公开数据组合 | 2 | 0 | 永续K线、资金费率、OI、多空比、主动买卖量均HTTP 200且字段有效 |
 | **V1.4A真实REST** | **9** | **0** | **通过** |
-| V1.4A真实REST + PostgreSQL生产落库 | 0 | 0 | 3项SKIP：本机无隔离PostgreSQL |
+| V1.4A真实REST + PostgreSQL生产落库（本机） | 0 | 0 | 3项SKIP：本机无隔离PostgreSQL |
+| V1.4A真实REST + PostgreSQL生产落库（`8505f81` CI） | 0 | 3 | HTTP 451；真实链未完成，不能记为通过 |
+| V1.4A真实REST + PostgreSQL生产落库（本修复CI语义） | 0 | 0 | 精确451时为 `EXTERNAL_REGION_BLOCKED`，等待推送复验 |
 | V1.1–V1.4既有真实REST回归 | 100 | 0 | 八个既有联网测试文件全部通过 |
 | **全部真实REST** | **109** | **0** | **通过** |
 
-真实REST形状/Normalizer与真实REST+PostgreSQL端到端严格分开记录。前者109项通过；后者3项因本机数据库环境缺失SKIP，不能称为实机落库通过。接口响应中确认：资金费率可为负数，价格和数量是十进制字符串，所有时间戳为毫秒整数。
+真实REST形状/Normalizer、PostgreSQL 14生产集成与真实REST+PostgreSQL端到端严格分开记录。前者109项本机通过；数据库13项已有CI实机通过证据；真实链3项在 `8505f81`因HTTP 451未完成。本修复后451只会成为醒目的环境阻塞SKIP，429、500、超时、JSON、数据库或结果不完整仍失败。在可访问Binance的Runner上，三项仍必须使用真实响应写入真实测试PostgreSQL并完成原断言。
 
 ## 构建与静态安全
 
@@ -44,4 +46,4 @@ V1.4A 103项已执行覆盖：canonical JSON根类型/拒绝路径、脱敏失�
 
 ## 结论
 
-V1.4A非联网103项、真实REST形状9项、既有非联网1,354项和既有真实REST 100项均为0失败；合计1,566项本机已执行自动化通过。另有真实PostgreSQL 13项与真实REST+PostgreSQL 3项因本机环境缺失SKIP且未计入通过；`61a9da4`首次CI的7通过/6失败作为历史结果单列，不能视为本修复已获数据库实机通过。服务尚未部署，没有把Memory或HTTP形状测试冒充数据库实机验收。
+V1.4A非联网110项、真实REST形状9项、既有非联网1,354项和既有真实REST 100项均为0失败；合计1,573项本机已执行自动化通过。PostgreSQL 14生产集成13项已由第二轮CI真实通过。REST+PostgreSQL三项在该CI中为HTTP 451导致的未完成状态；本修复目标状态为 `EXTERNAL_REGION_BLOCKED`而非PASS，最终以推送后的分层CI为准。服务尚未部署，没有把Memory、HTTP形状或SKIP冒充端到端验收。
