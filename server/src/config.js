@@ -3,6 +3,7 @@ const integer = (name, fallback, min = 0) => {
   if (!Number.isInteger(value) || value < min) throw new Error(`Invalid ${name}`);
   return value;
 };
+const positiveNumber=(name,fallback)=>{const value=Number(process.env[name]??fallback);if(!Number.isFinite(value)||value<=0)throw new Error(`Invalid ${name}`);return value;};
 
 export function loadConfig() {
   return Object.freeze({
@@ -22,6 +23,8 @@ export function loadConfig() {
     leaseTtlMs: integer('LEASE_TTL_MS', 60_000, 10_000),
     backfillPollMs: integer('BACKFILL_POLL_MS', 15_000, 1_000),
     backfillMaxAttempts: integer('BACKFILL_MAX_ATTEMPTS', 5, 1),
+    healthRetentionDays: integer('HEALTH_RETENTION_DAYS', 90, 1),
+    freshnessGraceMultiplier: positiveNumber('FRESHNESS_GRACE_MULTIPLIER',3),
     logLevel: process.env.LOG_LEVEL || 'info'
   });
 }
