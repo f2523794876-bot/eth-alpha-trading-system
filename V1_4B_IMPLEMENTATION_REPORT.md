@@ -69,3 +69,9 @@ BTC联动6项：`btcReturn`、`btcTrendState`、`btcVolatility`、`ethBtcReturnS
 本机没有隔离 PostgreSQL/`TEST_DATABASE_URL`，因此新增4项真实PG测试与既有13项在本机明确SKIP。V1.4A 13项已有真实PostgreSQL 14 CI通过证据；V1.4B 4项已加入同一强制门禁，最终状态需以推送后CI为准。真实REST+PostgreSQL仍按既有独立Job执行；精确451只记 `EXTERNAL_REGION_BLOCKED`，不记PASS。
 
 Push尝试结果：失败，原因是本机Git HTTPS凭据不可用（`could not read Username`）；没有修改remote或凭据，需由用户通过GitHub Desktop推送。实现提交完成时工作区干净，`main`与`origin/main`仍为 `3b997ee2baddc95ecf3712d533700ecc9b539855`。
+
+## 8. PostgreSQL 14 CI fixture修复
+
+GitHub Actions在`7de62a4a14f61866957da314eca0c27a8bf2954e`运行V1.4B PostgreSQL测试时，4项均在共享种子hook内失败。对象级核对表明`normalizeLongShort()`的正式输入为Binance全市场多空比结构：`symbol`、毫秒级`timestamp`，以及带前导零的十进制字符串`longShortRatio`、`longAccount`、`shortAccount`。测试fixture误写为`longAccount: '.52'`、`shortAccount: '.48'`，不符合冻结十进制字符串规则，故严格校验正确返回`LONG_SHORT_INVALID`。
+
+修复仅把种子改为真实合法形状`'0.52'`/`'0.48'`，并在原4项PostgreSQL测试第一项中查询`long_short_ratios`核对三项数值确已通过生产标准化和仓库路径写入。另增加合法结构与三类非法结构的非联网回归。`normalizeLongShort()`生产实现、时间顺序红线、防未来泄漏、fencing和数据库约束均未改变。修复后共享hook可以完成，原4项测试将由PostgreSQL 14 CI真实执行，而不是以hookFailed结束。
