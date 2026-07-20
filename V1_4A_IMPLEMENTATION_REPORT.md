@@ -121,6 +121,15 @@ Down脚本明确标为破坏性，只允许空的临时数据库；生产历史�
 4. **时间红线**：新增 `002_v1_4a_review_fixes`，为四类点状事实补齐 `published <= available <= firstAvailable <= fetched`数据库约束；应用 `pointFact()`统一走 `buildVintageRef()`，拒绝秒/毫秒错配和乱序。
 5. **真实数据库测试门禁**：提交13项生产PostgreSQL集成测试及3项真实REST→Normalizer→Postgres端到端测试；无 `TEST_DATABASE_URL`时明确SKIP。GitHub Actions门禁固定 Ubuntu 22.04 + PostgreSQL 14，不连接生产库。
 
+### PostgreSQL 14首次CI修复记录
+
+`61a9da42aae9e19357a49a66b7ca7610f69c61a2`首次在真实 PostgreSQL 14运行13项生产仓库测试，结果为7通过、6失败，后续REST+PostgreSQL步骤因门禁失败未执行。失败根因不是JSONB修复回退，而是两条此前本机无数据库时未实际执行到的生产SQL路径：
+
+1. `saveMarketBar()`列出了30个 `market_bars` 目标列，却生成31个值表达式，并引用参数数组不存在的 `$28`。现改为冻结30列清单与结构化30值数组，再按数组长度生成连续占位符；时间字段直接绑定为 `Date`，避免手工编号再次漂移。
+2. `savePointFact()`的动态列映射以 `Map<string, function>`保存取值函数，却错误调用 `valueByName.get(name)[1]`。现直接调用 `valueByName.get(name)(normalized)`，资金费率、OI、多空比和主动买卖量共用的生产路径均被覆盖。
+
+新增两项不依赖MemoryRepository结果的生产仓库调用级回归：分别执行 `PostgresRepository.saveMarketBar()`与四类 `savePointFact()`，核对目标列、绑定值、连续参数、关键时间与内容哈希。本机非联网V1.4A测试由101增至103且0失败；真实 PostgreSQL 14最终状态必须以推送后的CI复验为准。
+
 ### P2关闭
 
 - 002迁移用触发器拒绝 raw UPDATE/DELETE；归档只通过完整备份/对象存储流程，本版本没有在线删除入口。

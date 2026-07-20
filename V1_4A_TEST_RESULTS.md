@@ -8,15 +8,16 @@
 
 | 测试组 | 通过 | 失败 | 环境阻塞 |
 |---|---:|---:|---:|
-| V1.4A离线/Memory/静态约束/HTTP/API行为 | 101 | 0 | 0 |
-| V1.4A真实PostgreSQL生产仓库集成 | 0 | 0 | 13（本机无TEST_DATABASE_URL） |
-| **V1.4A新增非联网已执行合计** | **101** | **0** | **13** |
+| V1.4A离线/Memory/静态约束/HTTP/API行为 | 103 | 0 | 0 |
+| V1.4A真实PostgreSQL生产仓库集成（`61a9da4`首次CI） | 7 | 6 | 0 |
+| V1.4A真实PostgreSQL生产仓库集成（本修复本机） | 0 | 0 | 13（本机无TEST_DATABASE_URL；等待CI复验） |
+| **V1.4A新增非联网已执行合计** | **103** | **0** | **13** |
 | V1.1–V1.4既有非联网回归 | 1,354 | 0 | 0 |
-| **全部已执行非联网自动化** | **1,455** | **0** | **13** |
+| **全部已执行非联网自动化** | **1,457** | **0** | **13** |
 
-V1.4A 101项已执行覆盖：canonical JSON根类型/拒绝路径、脱敏失败审计、修订状态与显式REJECTED、DataVintageRef、四表时间乱序、秒/毫秒、UTC日界、数据库/写入/零数据假健康、端点恢复、真实OPEN熔断隔离、令牌桶重算/取消、fencing旧token、heartbeat停调度、graceful shutdown、回补领取/重试/永久失败、collection run/attempt关联、raw触发器和迁移静态约束、API readiness脱敏等。
+V1.4A 103项已执行覆盖：canonical JSON根类型/拒绝路径、脱敏失败审计、修订状态与显式REJECTED、DataVintageRef、四表时间乱序、秒/毫秒、UTC日界、数据库/写入/零数据假健康、端点恢复、真实OPEN熔断隔离、令牌桶重算/取消、fencing旧token、heartbeat停调度、graceful shutdown、回补领取/重试/永久失败、collection run/attempt关联、raw触发器和迁移静态约束、API readiness脱敏，以及本轮新增的 `market_bars` 30列/30参数一一对应、四类点状事实生产列映射函数调用测试。
 
-数据库迁移测试说明：当前Mac没有 PostgreSQL/`psql`/容器运行时且未配置 `TEST_DATABASE_URL`。13项真实PostgreSQL 14生产仓库套件已提交但本机全部明确SKIP，未计入通过；覆盖up/down/up与并发migration锁、19表、JSONB对象/数组/原语、生产CollectorService落库、五类事实幂等/修订/rollback、孤儿修订回滚、时间CHECK、gap/backfill、旧token拒写/并发lease、raw UPDATE/DELETE和数据库断开readiness。对应CI门禁为 `.github/workflows/v1-4a-postgres-integration.yml`。
+数据库迁移测试说明：`61a9da4`首次 PostgreSQL 14 CI 为7通过、6失败。对象级复核确认两项生产缺陷：`market_bars` 30个目标列生成了31个值表达式并引用越界参数；点状事实列映射把 `Map` 中已经取出的函数再次按 `[1]`索引，首写即抛出 `TypeError`，其余失败为依赖这两条写入链的级联。本轮已用固定列清单/结构化30值数组和直接函数调用修复，并新增两项生产仓库SQL生成回归。当前Mac没有 PostgreSQL/`psql`/容器运行时且未配置 `TEST_DATABASE_URL`，所以13项真实PostgreSQL套件本地仍明确SKIP，不能把本地结果冒充CI复验；推送后由同一 PostgreSQL 14门禁重新执行。
 
 ## 真实公开 REST
 
@@ -43,4 +44,4 @@ V1.4A 101项已执行覆盖：canonical JSON根类型/拒绝路径、脱敏失�
 
 ## 结论
 
-V1.4A非联网101项、真实REST形状9项、既有非联网1,354项和既有真实REST 100项均为0失败；合计1,564项已执行自动化通过。另有真实PostgreSQL 13项与真实REST+PostgreSQL 3项因本机环境缺失SKIP且未计入通过。服务尚未部署，没有把Memory或HTTP形状测试冒充数据库实机验收。
+V1.4A非联网103项、真实REST形状9项、既有非联网1,354项和既有真实REST 100项均为0失败；合计1,566项本机已执行自动化通过。另有真实PostgreSQL 13项与真实REST+PostgreSQL 3项因本机环境缺失SKIP且未计入通过；`61a9da4`首次CI的7通过/6失败作为历史结果单列，不能视为本修复已获数据库实机通过。服务尚未部署，没有把Memory或HTTP形状测试冒充数据库实机验收。
