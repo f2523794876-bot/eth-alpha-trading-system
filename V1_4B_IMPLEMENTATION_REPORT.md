@@ -75,3 +75,31 @@ Push尝试结果：失败，原因是本机Git HTTPS凭据不可用（`could not
 GitHub Actions在`7de62a4a14f61866957da314eca0c27a8bf2954e`运行V1.4B PostgreSQL测试时，4项均在共享种子hook内失败。对象级核对表明`normalizeLongShort()`的正式输入为Binance全市场多空比结构：`symbol`、毫秒级`timestamp`，以及带前导零的十进制字符串`longShortRatio`、`longAccount`、`shortAccount`。测试fixture误写为`longAccount: '.52'`、`shortAccount: '.48'`，不符合冻结十进制字符串规则，故严格校验正确返回`LONG_SHORT_INVALID`。
 
 修复仅把种子改为真实合法形状`'0.52'`/`'0.48'`，并在原4项PostgreSQL测试第一项中查询`long_short_ratios`核对三项数值确已通过生产标准化和仓库路径写入。另增加合法结构与三类非法结构的非联网回归。`normalizeLongShort()`生产实现、时间顺序红线、防未来泄漏、fencing和数据库约束均未改变。修复后共享hook可以完成，原4项测试将由PostgreSQL 14 CI真实执行，而不是以hookFailed结束。
+
+## 9. Revision持久化缺陷根因定位与修复
+
+独立对抗性复审在隔离PostgreSQL 14中用真实推进的时间戳（而非既有测试复用的同一常量时间戳）复现：写入`market_bars`及全部4张衍生品事实表的revision=0初始事实后，推进真实抓取时间（+3小时），使用相同自然键但不同业务内容尝试写入revision=1，5张表全部触发CHECK约束失败：
+
+| 表 | 约束名 | 错误码 |
+|---|---|---|
+| market_bars | market_bars_check4 | 23514 |
+| funding_rates | funding_rates_check | 23514 |
+| open_interest | open_interest_time_order | 23514 |
+| long_short_ratios | long_short_time_order | 23514 |
+| taker_flow | taker_flow_time_order | 23514 |
+
+失败行的实际时间字段：原记录`available_at=first_available_at=fetched_at`三者相等（初始写入，源自同一次抓取）；尝试写入的新revision行中，`first_available_at`被正确保留为原记录的旧值，但`available_at`被错误赋值为本次抓取的新`fetched_at`（远晚于保留的`first_available_at`），导致违反`CHECK(available_at<=first_available_at<=fetched_at)`。
+
+**精确根因**：`server/src/db/postgres.js`的`saveMarketBar()`与`savePointFact()`在构造revision行时，把`available_at`列错误地重新赋值为“本次请求的抓取时间”（`bar.fetchedAt`/`fact.fetchedAt`），而不是保持为`normalizeKlines()`/`pointFact()`本就正确计算好的、随自然键固定不变的来源侧可用时间（K线为收盘时间`closeTime`，点状事实为观测时间`observedAt`）。`first_available_at`按设计（README“保留首个firstAvailableAt”）在revision间被正确保留为原记录旧值。这两处赋值逻辑本身各自正确，但被组合使用时产生矛盾：`available_at`本应是随自然键恒定的常量（与revision 0完全一致），却被换成了会随每次抓取真实推进的`fetched_at`；而`first_available_at`则被钉死在最早一次抓取的旧值上。当revision发生在真实、有意义的时间间隔之后（这正是revision的定义本身），`available_at`（新、大）必然超过`first_available_at`（旧、小），触发约束拒绝。既有17项真实PostgreSQL测试的revision用例均复用同一个固定`NOW`常量同时作为原始行与修订行的`fetchedAt`，使二者恰好相等，从而掩盖了这一必然在真实时间推进下发生的缺陷。
+
+**修复**：`server/src/db/postgres.js`的`saveMarketBar()`第69行、`savePointFact()`内部`normalized`对象构造处，将`available_at`固定改为直接使用传入行自身的`bar.availableAt`/`fact.availableAt`（不再区分是否存在`previous`），与revision 0的原有行为完全一致；`first_available_at`的保留逻辑不变。同时修复`server/src/db/memory.js`中`upsertMarketBars`/`savePointFacts`的同构问题，保持MemoryRepository与真实PostgreSQL行为一致。未改动、未放宽任何CHECK约束、未改动未来数据防泄漏逻辑、未收盘K线拒绝逻辑、fencing校验或原始数据不可变触发器。
+
+**为什么不会造成未来数据泄漏**：本次修复只改变了写入路径中`available_at`列的取值来源（从错误的“本次抓取时间”改回正确的“来源自身固定的可用时间”），不涉及、不放宽任何`publishedAt/availableAt/firstAvailableAt/fetchedAt/asOfTime`大小关系校验，也不影响`generateFeatureRecord`中的`future`布尔检查与`validateLineage`的双重未来来源校验；`loadFeatureInputs`的as-of查询逻辑（`available_at<=asOfTime AND fetched_at<=asOfTime`）未被修改，其中`fetched_at`因本次修复后仍随revision真实推进，继续正确充当revision可见性的判别边界。
+
+**为什么不会覆盖或丢失旧revision**：修复后`saveMarketBar`/`savePointFact`仍然是纯INSERT（从不UPDATE已有行），旧revision在DEDUPED/REVISED任一分支下都不会被修改；`available_at`赋值方式的调整只影响新插入行自身的列值，不触及、不删除任何已存在的行。真实PostgreSQL测试确认修复前被CHECK约束拒绝的revision，在修复后能成功追加为新的一行，而revision 0原样保留、内容未变。
+
+**五类事实表revision测试结果**：新增`server/tests/postgres/v1-4b-revision-time-progression.integration.test.js`，对`market_bars`及4张衍生品事实表逐一验证CREATED→DEDUPED→（真实时间推进+3小时后）REVISED→revision 0/1共存→revision事件存在→旧记录未覆盖，5项测试全部通过。
+
+**as-of新旧revision边界结果**：新增独立测试验证，在修订自身的`fetched_at`可见时间点之前查询，`loadFeatureInputs`只能读到旧revision内容；在该时间点及之后查询，才能读到新revision内容；未出现修订提前可见的情况。
+
+**PostgreSQL真实执行状态**：本次修复的全部验证（复现、根因确认、修复后回归、9项新增revision测试、既有13+4项测试、真实REST+PostgreSQL链）均在本机隔离PostgreSQL 14中真实执行，非本机SKIP、非引用CI证据。提交后仍需GitHub Actions PostgreSQL 14强制门禁独立复核。
