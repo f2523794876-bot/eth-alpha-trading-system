@@ -1,4 +1,4 @@
-# ETH Alpha V1.4A 服务器数据基础
+# ETH Alpha V1.4A/V1.4B 服务器数据与统一特征基础
 
 这是独立于浏览器页面运行的公开市场数据采集器。它只读取 Binance 公开 REST 行情，绝不读取交易密钥、连接账户或发送订单。现有单文件 HTML 不依赖本服务，页面关闭不会停止服务器进程。
 
@@ -58,6 +58,23 @@ GET /api/v1/sources
 GET /api/v1/bars?instrument=ETHUSDT&marketType=spot&interval=15m&from=...&to=...&limit=500
 GET /api/v1/derivatives/funding?instrument=ETHUSDT&from=...&to=...&limit=100
 GET /api/v1/derivatives/open-interest?instrument=ETHUSDT&from=...&to=...&limit=100
+GET /api/v1/features/by-id?featureId=...
+GET /api/v1/features?symbol=ETHUSDT&interval=15m&from=...&to=...&limit=100
+GET /api/v1/features/lineage?featureId=...
+GET /api/v1/features/quality?featureId=...
+GET /api/v1/features/runs?limit=100
+GET /api/v1/features/issues?symbol=ETHUSDT&limit=100
+```
+
+V1.4B 特征接口全部只读。正式记录以目标K线收盘时点为 `asOfTime`，数据库查询只选择当时已经 `published/available/fetched` 的版本；ETH 1h/4h与BTC上下文也只能使用该时点前已收盘记录。任何未来来源、未收盘目标或关键15m窗口不足都会 fail closed。缺失的非关键衍生品特征保持 `null` 并写入 `missingFeatures/degradedReasons`，绝不填伪造的0。
+
+统一特征定义版本为 `v1.4b-unified-1`。`feature_records` 不覆盖旧revision；来源引用、质量事件和修订事件与正式record在同一受 fencing token 保护的事务内写入。V1.4B没有训练模型、概率校准或修改GMKG规则权重。
+
+生成命令支持单点、区间、dry-run与中断后游标续跑所需的稳定自然键：
+
+```bash
+npm run features:generate -- --target=1784400000000 --as-of=1784400001000
+npm run features:generate -- --from=1784300000000 --to=1784400000000 --dry-run
 ```
 
 参数使用白名单，单次最多1000行、最大366天。错误响应不暴露堆栈、环境变量或数据库信息。若对外提供，应在反向代理增加 TLS、来源控制和只读访问策略。
@@ -72,6 +89,10 @@ sudo -u postgres pg_restore --clean --if-exists --dbname=eth_alpha_restore eth_a
 ```
 
 systemd模板位于 `deploy/systemd/eth-alpha-collector.service`，本提交不会自动安装或启用它。部署顺序固定为：创建最低权限数据库与用户 → `npm ci --omit=dev` → `node src/db/migrate.js up` → 核对 `/health/ready` → 再启用服务。unit 的 `ExecStartPre` 会再次执行仅向上的幂等迁移检查，checksum或迁移失败会阻止服务启动，绝不自动执行破坏性 down。建议 journald 限额或 logrotate 每日轮转、保留30天运行日志。原始响应数据库层拒绝 UPDATE/DELETE；受控归档应先使用 `pg_dump`/对象存储保留完整JSON与哈希，当前版本不提供在线删除入口。正式事实和修订事件不得静默删除。
+
+`data_health_snapshots`属于可重建健康遥测，默认保留90天，可用 `HEALTH_RETENTION_DAYS`调整。先执行 `npm run maintenance:health -- --dry-run`核对数量，再执行 `npm run maintenance:health`清理。该命令的SQL只触及 `data_health_snapshots`；绝不删除 `raw_payloads`、正式事实、修订事件、特征记录或特征血缘。正式历史仍须先备份再归档。
+
+readiness 新鲜度按每个周期独立计算：15m、1h、4h分别使用自身周期毫秒数作为 `expectedFrequencyMs`，再乘集中配置的 `FRESHNESS_GRACE_MULTIPLIER`（默认3）。不再使用统一的990000ms阈值。
 
 磁盘预算应根据真实采集一周后测量。初始规划可按原始JSON压缩后每日100–300MB、数据库事实每日50–150MB预留，并保持至少30%磁盘余量；达到70%告警、85%停止新增非关键缓存，正式历史只能先备份再归档。
 
@@ -88,6 +109,7 @@ systemd模板位于 `deploy/systemd/eth-alpha-collector.service`，本提交不�
 
 ```bash
 npm test
+npm run test:features
 RUN_LIVE_TESTS=1 npm run test:live
 TEST_DATABASE_URL=postgresql://... npm run test:postgres
 TEST_DATABASE_URL=postgresql://... RUN_LIVE_REST=1 npm run test:postgres:live
