@@ -29,6 +29,26 @@ test('四类点状事实生产INSERT直接调用列映射函数且参数完整',
 
 test('CI将PostgreSQL强制门禁与真实REST地区可达性分成独立Job',async()=>{const workflow=await readFile(new URL('../../.github/workflows/v1-4a-postgres-integration.yml',import.meta.url),'utf8');const databaseJob=workflow.slice(workflow.indexOf('  postgres-production-path:'),workflow.indexOf('  rest-postgres-live-path:'));const liveJob=workflow.slice(workflow.indexOf('  rest-postgres-live-path:'));assert.match(databaseJob,/npm run test:postgres/);assert.doesNotMatch(databaseJob,/test:postgres:live/);assert.match(liveJob,/needs: postgres-production-path/);assert.match(liveJob,/RUN_LIVE_REST: "1"/);assert.match(liveJob,/EXTERNAL_REGION_BLOCKED/);assert.doesNotMatch(workflow,/continue-on-error/);});
 
-test('PostgreSQL强制组合命令固定接入13+4+9项revision时间推进门禁',async()=>{const packageJson=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8'));assert.equal(packageJson.scripts['test:postgres:revision'],'node --test tests/postgres/v1-4b-revision-time-progression.integration.test.js');assert.equal(packageJson.scripts['test:postgres'],'npm run test:postgres:v1.4a && npm run test:postgres:features && npm run test:postgres:revision');const workflow=await readFile(new URL('../../.github/workflows/v1-4a-postgres-integration.yml',import.meta.url),'utf8');const databaseJob=workflow.slice(workflow.indexOf('  postgres-production-path:'),workflow.indexOf('  rest-postgres-live-path:'));assert.match(databaseJob,/run: npm run test:postgres/);assert.doesNotMatch(databaseJob,/continue-on-error/);});
+test('PostgreSQL强制组合命令固定接入13+4+9项revision时间推进门禁',async()=>{const packageJson=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8'));assert.equal(packageJson.scripts['test:postgres:revision'],'node --test tests/postgres/v1-4b-revision-time-progression.integration.test.js');const workflow=await readFile(new URL('../../.github/workflows/v1-4a-postgres-integration.yml',import.meta.url),'utf8');const databaseJob=workflow.slice(workflow.indexOf('  postgres-production-path:'),workflow.indexOf('  rest-postgres-live-path:'));assert.match(databaseJob,/run: npm run test:postgres/);assert.doesNotMatch(databaseJob,/continue-on-error/);});
+
+test('V1_4C_SCOPE_SPEC.md §16第8步：V1.4C三组真实PostgreSQL测试与package.json在同一提交内接入test:postgres强制门禁',async()=>{
+  const packageJson=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8'));
+  const scripts=packageJson.scripts;
+  assert.equal(scripts['test:postgres:v1.4c-forecast'],'node --test tests/postgres/v1-4c-forecast.integration.test.js');
+  assert.equal(scripts['test:postgres:v1.4c-outcome'],'node --test tests/postgres/v1-4c-outcome.integration.test.js');
+  assert.equal(scripts['test:postgres:v1.4c-lease'],'node --test tests/postgres/v1-4c-lease-concurrency.integration.test.js');
+  for(const step of ['test:postgres:v1.4a','test:postgres:features','test:postgres:revision','test:postgres:v1.4c-forecast','test:postgres:v1.4c-outcome','test:postgres:v1.4c-lease'])
+    assert.match(scripts['test:postgres'],new RegExp(`npm run ${step.replace(/\./g,'\\.')}`),`test:postgres组合命令缺少${step}`);
+  for(const file of ['v1-4c-forecast.integration.test.js','v1-4c-outcome.integration.test.js','v1-4c-lease-concurrency.integration.test.js']){
+    const source=await readFile(new URL(`./postgres/${file}`,import.meta.url),'utf8');
+    assert.match(source,/TEST_DATABASE_URL/,`${file}必须使用TEST_DATABASE_URL隔离测试库`);
+    assert.match(source,/test\|ci\|v14/,`${file}必须校验isolated test/ci数据库命名`);
+    assert.doesNotMatch(source,/\.only\(/,`${file}不得使用.only`);
+    assert.doesNotMatch(source,/test\.skip\(/,`${file}不得使用test.skip（除pgtest的enabled=false降级路径外）`);
+  }
+  const workflow=await readFile(new URL('../../.github/workflows/v1-4a-postgres-integration.yml',import.meta.url),'utf8');
+  const databaseJob=workflow.slice(workflow.indexOf('  postgres-production-path:'),workflow.indexOf('  rest-postgres-live-path:'));
+  assert.match(databaseJob,/run: npm run test:postgres/,'CI必须继续通过组合命令test:postgres间接执行V1.4C三组测试，不得另起未接线的Job');
+});
 
 test('真实链保留生产数据库写入断言且仅精确451调用SKIP',async()=>{const source=await readFile(new URL('./live/postgres-live-e2e.test.js',import.meta.url),'utf8');assert.match(source,/runLiveRestOperation/);assert.match(source,/t\.skip\('EXTERNAL_REGION_BLOCKED/);for(const productionCall of ['collector.collectBars','collector.collectPoint','collector.collectBarsFromResponse','collector.readiness'])assert.ok(source.includes(productionCall),productionCall);assert.doesNotMatch(source,/MemoryRepository/);});

@@ -22,7 +22,7 @@ if(enabled){
   after(async()=>{await pool?.end();});
 }
 
-pgtest('迁移支持up/down/up、并发锁、25张表和版本完整',async()=>{assert.deepEqual((await repo.migrationStatus()).versions,['001','002','003']);await runMigrations(pool,'down');await Promise.all([runMigrations(pool,'up'),runMigrations(pool,'up')]);assert.equal((await repo.migrationStatus()).ok,true);const tables=await pool.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public'");assert.equal(tables.rows.length,25);repo=new PostgresRepository(pool);lease=await repo.acquireLease('primary-collector','pg-integration',60_000);collector.repository=repo;collector.lease=lease;});
+pgtest('迁移支持up/down/up、并发锁、31张表和版本完整',async()=>{assert.deepEqual((await repo.migrationStatus()).versions,['001','002','003']);await runMigrations(pool,'down');await Promise.all([runMigrations(pool,'up'),runMigrations(pool,'up')]);assert.equal((await repo.migrationStatus()).ok,true);const tables=await pool.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public'");assert.equal(tables.rows.length,31);repo=new PostgresRepository(pool);lease=await repo.acquireLease('primary-collector','pg-integration',60_000);collector.repository=repo;collector.lease=lease;});
 
 pgtest('saveRaw真实JSONB支持对象、数组、null、布尔、数字和字符串',async()=>{for(const body of [{b:2,a:1},[1,{a:true}],null,false,12.5,'文本']){const r=response(body);const id=await repo.saveRaw(r,{...meta(),contentHash:canonicalJsonHash(body)},lease);const stored=(await pool.query('SELECT payload,response_headers FROM raw_payloads WHERE raw_payload_id=$1',[id])).rows[0];assert.deepEqual(stored.payload,body);assert.equal(stored.response_headers['x-endpoint'],'binance-spot-klines');}});
 
