@@ -103,3 +103,9 @@ GitHub Actions在`7de62a4a14f61866957da314eca0c27a8bf2954e`运行V1.4B PostgreSQ
 **as-of新旧revision边界结果**：新增独立测试验证，在修订自身的`fetched_at`可见时间点之前查询，`loadFeatureInputs`只能读到旧revision内容；在该时间点及之后查询，才能读到新revision内容；未出现修订提前可见的情况。
 
 **PostgreSQL真实执行状态**：本次修复的全部验证（复现、根因确认、修复后回归、9项新增revision测试、既有13+4项测试、真实REST+PostgreSQL链）均在本机隔离PostgreSQL 14中真实执行，非本机SKIP、非引用CI证据。提交后仍需GitHub Actions PostgreSQL 14强制门禁独立复核。
+
+## 10. Revision时间推进测试接入强制门禁
+
+独立复审确认第9节新增的9项真实PostgreSQL测试虽然已经存在并曾在隔离数据库中单独通过，但`server/package.json`的`test:postgres`仍只串联V1.4A 13项与V1.4B原有4项，导致GitHub Actions调用组合命令时没有执行revision时间推进文件。本轮不修改任何revision生产逻辑，只新增`test:postgres:revision`脚本，并将强制组合固定为`test:postgres:v1.4a → test:postgres:features → test:postgres:revision`，预期合计26项。
+
+`.github/workflows/v1-4a-postgres-integration.yml`的`postgres-production-path`继续直接执行`npm run test:postgres`，没有`continue-on-error`，因此任何一组失败都会使强制门禁失败。`server/tests/review-regression.test.js`新增结构性断言，同时锁定独立脚本路径、三段组合命令和workflow调用点，防止revision测试文件再次脱离CI。数据库CHECK、as-of时间红线、未来数据防泄漏、fencing及事务原子性均未修改或放宽。

@@ -10,11 +10,12 @@
     "migrate:down": "node src/db/migrate.js down",
     "test": "node --test tests/*.test.js",
     "test:live": "node --test tests/live/*.test.js",
-    "test:postgres": "npm run test:postgres:v1.4a && npm run test:postgres:features",
+    "test:postgres": "npm run test:postgres:v1.4a && npm run test:postgres:features && npm run test:postgres:revision",
     "test:postgres:v1.4a": "node --test tests/postgres/postgres-production.integration.test.js",
     "test:postgres:live": "node --test tests/live/postgres-live-e2e.test.js",
     "test:features": "node --test tests/features/*.test.js",
     "test:postgres:features": "node --test tests/postgres/v1-4b-feature.integration.test.js",
+    "test:postgres:revision": "node --test tests/postgres/v1-4b-revision-time-progression.integration.test.js",
     "maintenance:health": "node src/maintenance/cleanup-health.js",
     "features:generate": "node src/features/generate-features.js",
     "check": "node --check src/index.js && node --test tests/*.test.js"
