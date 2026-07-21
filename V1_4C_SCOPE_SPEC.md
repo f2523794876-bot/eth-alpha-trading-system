@@ -1,6 +1,6 @@
 # V1_4C_SCOPE_SPEC.md — V1.4C 服务器端预测基础设施 冻结规范
 
-版本：v1.4c-spec-draft-2（Codex 对 `e421f8c870b692ce2fb800d8080c1aeb899bd64f` 的定向复审关闭 P1-1/P1-2/P1-3 后的修订版，见 §4.1/§8.3/§8.4/§7.1/§7.2/§17.4/§17.9/§17.11/§17.12）
+版本：v1.4c-spec-draft-3（Codex 对 `ccb8f1844034b0332cbe4e20dbeac7305bfe131a` 的增量复审关闭剩余3项P1后的修订版：P1-1修正4H ATR14取数深度[14→15根]、P1-2A修正连续bar计数回放深度算法[固定20+M=23根,M=3]、P1-2B修正BTC相关性符号语义[带符号effectiveBtcDirection]，原P1-3结论未变；见 §4.1/§8.3/§8.4/§14/§16/§17.4/§17.9/§17.12）
 基线：`main` @ `96d3651`（含 V1.4A `codex/v1.4a-server-data-foundation`、V1.4B `codex/v1.4b-feature-engine-foundation`，PR #10/#11 已合并，main PostgreSQL CI 触发修复已合并并绿色通过）
 角色：本文档是 **V1.4C 阶段——把浏览器端已验证过的 PO_ 状态/`ForecastSnapshot`/`ForecastOutcomeEvent`/可复现验证闭环，迁移为服务器端、PostgreSQL 持久化、可 24 小时运行的正式预测基础设施——的唯一权威冻结规范**。本文档**本身不是编码**，本轮不修改任何生产代码、测试代码、数据库迁移、`package.json`、GitHub Actions 或部署配置，只交付规范文档。
 
@@ -163,9 +163,32 @@ V1.4A CollectorService                V1.4B FeatureEngine              V1.4C（�
 | `contentHash` | string | 见 §13.2 | 已冻结口径，新增计算范围 |
 | `auxiliaryEvidence` | `Record<string, unknown>` | 见 §9，funding/OI/taker-flow 等 V1.4B 已有但不参与 PO_ 判定的证据 | 【V1.4C新增，见§17.6】 |
 
-### 4.1 `directionThreshold` 计算公式（P1-1，已关闭，唯一权威口径，不留待实施层裁决）
+### 4.1 `directionThreshold` 计算公式（P1-1，已关闭，本轮修正 4H ATR14 所需K线数量，唯一权威口径，不留待实施层裁决）
 
-**来源数据（`atr14FourHourAtGeneration`）**：V1.4B `feature_records.feature_values.atr14` 是 15m 目标周期的 ATR（`computeFeatureValues()` 恒以 `eth15` 为基础计算全部"结构"类字段，与 `targetInterval` 参数无关），**不是**4H 周期的 ATR，因此本公式**不得**读取 `feature_records.atr14`。4H ATR14 由 V1.4C 独立计算：按 §10 相同的 as-of 正确查询模式，对 V1.4A `market_bars`（`market_type='spot'`, `interval_name='4h'`, `close_time<=asOfTime` 且已收盘）取最近 14 根已收盘 4H K 线，套用与 V1.4B `feature-engine.js` `trueRanges()`/`atr()`**完全相同的真实波幅公式**（逐根 `max(high-low, |high-prevClose|, |low-prevClose|)` 后取 14 周期均值），**不重新发明**波幅计算方式，只是把同一公式应用到 4H 而非 15m 窗口。计算结果在快照生成事务内**一次性复制**为 `atr14FourHourAtGeneration` 不可变值（同 §7.3 `featureValuesUsed` 的"复制而非引用"红线），不随 `market_bars` 后续 revision 变化。
+**来源数据（`atr14FourHourAtGeneration`）**：V1.4B `feature_records.feature_values.atr14` 是 15m 目标周期的 ATR（`computeFeatureValues()` 恒以 `eth15` 为基础计算全部"结构"类字段，与 `targetInterval` 参数无关），**不是**4H 周期的 ATR，因此本公式**不得**读取 `feature_records.atr14`。4H ATR14 由 V1.4C 独立计算，按 §10 相同的 as-of 正确查询模式，对 V1.4A `market_bars`（`market_type='spot'`, `interval_name='4h'`, `close_time<=asOfTime` 且已收盘）取数。
+
+**K线数量红线（本轮修正，取代原"最近14根已收盘4H K线足够计算ATR14"的错误表述）**：ATR14 的标准真实波幅（True Range）计算中，每根 bar 的 TR 都需要**前一根 bar 的收盘价**（`prevClose`）才能算出 `|high-prevClose|`/`|low-prevClose|` 两项，因此 14 周期 ATR **实际需要 `period+1=15` 根K线**，而不是 14 根——14 根K线只能产生 13 个完整 TR 样本（因为第 1 根没有更早的 `prevClose` 可用），不足以构成"14周期均值"。冻结取数与计算规则：
+
+```
+requiredBars = 15   # period(14) + 1，第1根仅提供prevClose，不计入TR均值样本
+
+bars = 按§10相同as-of正确查询，取最近15根连续、已收盘的4H K线
+       （open_time严格递增，无缺口、无重复、无乱序，全部close_time<=asOfTime且已收盘，
+        不得使用estimated/synthetic bar，复用§10.5.1九项不变量同款连续性校验）
+
+若 bars.length < 15 或 连续性校验未通过（缺失/重复/乱序/未收盘）:
+  return ATR14_4H_INSUFFICIENT，fail closed（见下）
+
+# bars[0]（最早一根）只提供prevClose，不产生自己的TR样本
+# bars[1..14]（后14根）各自产生一个TR样本，逐根：
+trueRange[i] = max(bars[i].high - bars[i].low,
+                    |bars[i].high - bars[i-1].close|,
+                    |bars[i].low  - bars[i-1].close|)   for i in 1..14
+
+atr14FourHourAtGeneration = average(trueRange[1..14])   # 14个完整TR样本的均值
+```
+
+套用与 V1.4B `feature-engine.js` `trueRanges()`/`atr()`**完全相同的真实波幅公式**，**不重新发明**波幅计算方式，只是把同一公式应用到 4H 而非 15m 窗口，且本轮明确纠正了所需K线数量（15 根，而非 14 根）。计算结果在快照生成事务内**一次性复制**为 `atr14FourHourAtGeneration` 不可变值（同 §7.3 `featureValuesUsed` 的"复制而非引用"红线），不随 `market_bars` 后续 revision 变化。
 
 **公式**：
 
@@ -178,7 +201,7 @@ rawThreshold      = atr14FourHourAtGeneration / referencePrice × sqrt(periods)
 directionThreshold = clamp(rawThreshold, floor, ceiling)
 thresholdFloor      = floor
 thresholdCeiling    = ceiling
-thresholdFormulaVersion = 'v1.4c-threshold-formula-1'
+thresholdFormulaVersion = 'v1.4c-threshold-formula-2'
 
 方向判定（GMKG §10.3 既有抽象规则的具体化，不改变 §10.3 本身）：
   actualReturn >= +directionThreshold → UP
@@ -186,9 +209,9 @@ thresholdFormulaVersion = 'v1.4c-threshold-formula-1'
   否则                                 → RANGE
 ```
 
-**若 4H ATR14 数据不足（不足 14 根已收盘 4H K 线，或 `referencePrice<=0`）**：`rawThreshold` 无法计算，本次生成 `fail closed`——不产出 `directionThreshold`、不产出正式 `ForecastSnapshot`，`forecast_generation_runs` 记录 `error_code='ATR14_4H_INSUFFICIENT'`，与 §7.5 服务器时间不可用时的 fail-closed 处理属于同一类前置门禁，不得用近似值或历史缓存值顶替。
+**若 4H ATR14 数据不足（不足 15 根连续已收盘 4H K 线，或 15 根窗口内存在缺失/重复/乱序/未收盘，或 `referencePrice<=0`）**：`atr14FourHourAtGeneration`/`rawThreshold` 均无法计算，本次生成 `fail closed`——不产出 `directionThreshold`、不产出正式 `ForecastSnapshot`，`forecast_generation_runs` 记录 `error_code='ATR14_4H_INSUFFICIENT'`，与 §7.5 服务器时间不可用时的 fail-closed 处理属于同一类前置门禁，不得用近似值、历史缓存值或"用现有13个TR样本近似"顶替。
 
-**红线**：`periods`/`floor`/`ceiling` 三组数值随 `thresholdFormulaVersion` 一并冻结，**不得**在同一 `thresholdFormulaVersion` 内调整（同 §13.3 版本号纪律）；未来若认为数值需要调整，必须递增 `thresholdFormulaVersion`，不得复用旧版本号静默改值。
+**红线**：`periods`/`floor`/`ceiling` 三组数值随 `thresholdFormulaVersion` 一并冻结，**不得**在同一 `thresholdFormulaVersion` 内调整（同 §13.3 版本号纪律）；本轮因修正 ATR14 取数逻辑（15 根而非 14 根，属于计算逻辑变化而非单纯数值调整），`thresholdFormulaVersion` 由 `'v1.4c-threshold-formula-1'` 递增为 `'v1.4c-threshold-formula-2'`；未来若再调整，必须继续递增，不得复用旧版本号静默改值。
 
 ---
 
@@ -343,32 +366,67 @@ thresholdFormulaVersion = 'v1.4c-threshold-formula-1'
 
 ### 8.3 四项特征映射的确定性冻结（P1-2，已关闭，唯一权威口径）
 
-**映射一：`breakoutBarsCount`/`breakdownBarsCount`（正式、可回放的连续已收盘 bar 计数特征）**
+**映射一：`breakoutBarsCount`/`breakdownBarsCount`（正式、可回放的连续已收盘 bar 计数特征，本轮修正回放深度算法）**
 
-`feature_records` 从不持久化跨快照的计数状态（`breakoutState` 只是单次快照的瞬时判定），且该字段无论 `targetInterval` 取何值都恒以 `eth15`（15m）窗口计算（同 §4.1 已说明的 `atr14` 同源限制），不存在 4H 专属的 `breakoutState` 历史。V1.4C **独立实现**一个正式的、可回放的计数特征，不依赖 `feature_records`：
+`feature_records` 从不持久化跨快照的计数状态（`breakoutState` 只是单次快照的瞬时判定），且该字段无论 `targetInterval` 取何值都恒以 `eth15`（15m）窗口计算（同 §4.1 已说明的 `atr14` 同源限制），不存在 4H 专属的 `breakoutState` 历史。V1.4C **独立实现**一个正式的、可回放的计数特征，不依赖 `feature_records`。
+
+**算法缺陷更正（本轮）**：上一版本"最少21根"的规则只对**最新1根**bar分配了20根前置历史窗口，若要判断连续2根或更多根候选bar是否都处于突破状态，**每一根候选bar都必须拥有它自己独立的、严格早于它的20根已收盘历史**作为突破基准——不能让多个候选bar共享同一个冻结的窗口，也不能用任何候选bar自身或其后的bar去参与更早候选bar的判定基准。本轮冻结正确算法：
+
+**最大回放上限 `M` 的冻结**：PO_ 状态机（§4.2）对 `breakoutBarsCount`/`breakdownBarsCount` 的全部消费点只区分三档——`0`（不满足 `PO_BREAKOUT_*`/`PO_BREAKDOWN_*` 必要条件）、`[1,2]`（`PO_BREAKOUT_UP_STRUCTURE`/`PO_BREAKDOWN_STRUCTURE` 的必要条件区间）、`>2`（`PO_TREND_UP_STRUCTURE`/`PO_TREND_DOWN_STRUCTURE` 的必要条件），不存在任何规则需要区分"连续3根"与"连续8根"的具体差异。能够可靠区分"恰好2根"与">2根"的**最小**候选回放深度是 `M=3`（若只回放2根候选bar，即使2根都满足突破条件，也无法排除"第3根若纳入回放，是否仍满足"这一未知——必须真实观测第3根候选bar才能确认计数确已超过2）。冻结：
+
+```
+consecutiveBarCountMaxLookback = 3          # M，最小且足够区分0/[1,2]/>2三档的回放深度
+consecutiveBarCountFormulaVersion = 'v1.4c-bar-count-lookback-1'
+requiredBars = 20 + consecutiveBarCountMaxLookback   # = 23，固定值，不随可用数据量动态伸缩
+```
+
+**算法**：
 
 ```
 computeConsecutiveBreakoutBars(instrument, asOfTime, direction):
   # direction ∈ {'up','down'}，对应breakoutBarsCount/breakdownBarsCount
-  bars = 按§10相同as-of正确查询，取market_type='spot', interval_name='4h'，
-         close_time<=asOfTime的最近N根已收盘4H K线（N见下方数据不足判定）
-  若 bars.length < 21（20根用于滚动高低点基准 + 至少1根用于判定，与V1.4B swingHigh/swingLow的20根窗口口径一致）：
+  M = consecutiveBarCountMaxLookback   # = 3
+  requiredBars = 20 + M                # = 23
+
+  allBars = 按§10相同as-of正确查询，取market_type='spot', interval_name='4h'，
+            close_time<=asOfTime的最近requiredBars(=23)根连续、已收盘4H K线
+            （open_time严格递增、无缺口、无重复、无乱序，全部已收盘，不得使用estimated/synthetic bar，
+             复用§10.5.1九项不变量同款连续性校验；allBars按时间升序排列）
+
+  若 allBars.length < requiredBars 或 连续性校验未通过（缺失/重复/乱序/未收盘）：
     return { count: null, state: 'INSUFFICIENT_DATA' }  # 不得猜测
 
-  对每根bar（从早到晚）逐根判定：
-    priorHigh20 = 该bar之前20根bar的最高价
-    priorLow20  = 该bar之前20根bar的最低价
-    barState = direction==='up'
-      ? (bar.close > priorHigh20 ? 'BREAKOUT' : 'NOT_BREAKOUT')
-      : (bar.close < priorLow20  ? 'BREAKOUT' : 'NOT_BREAKOUT')
-      # 与V1.4B breakoutState的判定概念一致（价格相对前置窗口高低点的突破关系），
-      # 只是逐根bar历史重算，而非读取任一次feature_records快照
+  # allBars[0..19]：最早候选bar的前置20根历史窗口起点
+  # allBars[20..22]（共M=3根）：待判断的候选bar本身
 
-  count = 从最新一根bar开始向前数，连续为'BREAKOUT'的根数（遇到第一根'NOT_BREAKOUT'即停止）
-  return { count, state: count > 0 ? 'BREAKOUT_ACTIVE' : 'NOT_BREAKOUT' }
+  candidateStates = []
+  for i in 20 .. requiredBars-1:                    # 按时间从早到晚，逐个候选bar独立计算
+    priorWindow = allBars[i-20 .. i-1]               # 严格取该候选bar自己之前的20根，不使用该bar之后任何数据
+    priorHigh20 = max(priorWindow.high)
+    priorLow20  = min(priorWindow.low)
+    candidate = allBars[i]
+    barState = direction==='up'
+      ? (candidate.close > priorHigh20 ? 'BREAKOUT' : 'NOT_BREAKOUT')
+      : (candidate.close < priorLow20  ? 'BREAKOUT' : 'NOT_BREAKOUT')
+      # 与V1.4B breakoutState的判定概念一致（价格相对前置窗口高低点的突破关系），
+      # 只是逐根bar历史重算、每根候选bar各自独立的前置窗口，而非读取任一次feature_records快照
+    candidateStates.push(barState)                   # 按时间升序push，保持与allBars同序
+
+  # 从最新bar开始反向计数，遇到第一根不符合方向的bar立即停止
+  count = 0
+  for state in reverse(candidateStates):             # 从最新到最早
+    if state === 'BREAKOUT': count += 1
+    else: break
+
+  return { count, state: count > 0 ? 'BREAKOUT_ACTIVE' : 'NOT_BREAKOUT', maxLookback: M }
 ```
 
-**红线**：数据不足（历史深度不够 21 根 4H K 线）时返回 `state:'INSUFFICIENT_DATA'`，对应 PO_ 状态判定层直接进入 `operatingMode='INSUFFICIENT_DATA'`（同 §4.2 原有的"数据不足处理"规则），**不得**用 `count:0` 或其他猜测值顶替。
+**红线（本轮逐条对应 CEO 裁决原文）**：
+- **不得用未来bar计算历史bar的突破基准**——`priorWindow = allBars[i-20..i-1]` 严格早于候选bar `i` 本身，算法结构上保证任一候选bar的判定结果只依赖严格早于它的数据；
+- **不得用当前单点 `breakoutState` 冒充连续计数**——本算法完全独立于 `feature_records.breakoutState`，是对真实 4H K线历史的逐根回放；
+- **修改候选bar之后的未来数据，不得改变该候选bar的历史判定**——由于每根候选bar的 `barState` 只由它自己的 `priorWindow`（严格更早的20根）与自身 `close` 决定，追加/修改该候选bar**之后**的任何bar（无论是更晚的候选bar还是超出 `requiredBars` 范围的未来数据）都不会影响该候选bar已经计算出的 `barState`，这一性质由算法结构直接保证，不需要额外校验代码；
+- 数据不足（`allBars.length<23`）或回放窗口内存在缺失/重复/乱序/未收盘 bar 时，返回 `state:'INSUFFICIENT_DATA'`，对应 PO_ 状态判定层直接进入 `operatingMode='INSUFFICIENT_DATA'`（同 §4.2 原有的"数据不足处理"规则），**不得**用 `count:0` 或其他猜测值顶替；
+- `count` 达到 `M=3` 即代表"连续突破根数 `>=3`"，已经足以满足 `PO_TREND_UP_STRUCTURE`/`PO_TREND_DOWN_STRUCTURE` 必要条件 `count>2` 的判定，**不需要**、也**不会**继续向更早的bar扩大回放去求精确计数（`requiredBars` 固定为23，不随实际连续根数动态增大），确保查询范围、资源消耗和结果均唯一可复现。
 
 **映射二：`srZones.lower`/`upper`（区域边界的服务器计算来源和公式）**
 
@@ -395,35 +453,48 @@ V1.4C改为：falseBreakoutRisk !== 'NONE'（即UPPER_REJECTION或LOWER_REJECTIO
 
 这是**真实但更弱**的否决信号（只反映当根拒绝证据，不反映跨 bar 确认），`evidenceText`/`stateEvidence` 必须明确标注"基于当根拒绝信号，未实现跨 bar 确认"，**不得**使用暗示多根确认的措辞。
 
-**映射四：`btcAlignment(direction, b4)` 显式三态计算**
+**映射四：`btcAlignment(direction, b4)` 显式三态计算（本轮修正相关性正负号语义）**
+
+**算法缺陷更正（本轮）**：上一版本只检查 `|ethBtcRollingCorrelation| < correlationFloor` 的绝对值，**忽略了相关性的正负号**，导致 ETH/BTC 处于**强负相关**时判断相反——例如 BTC 处于上升趋势（`btcTrendState==='up'`）但 ETH/BTC 呈强负相关，此时 BTC 上升实际上应被理解为对"ETH 下跌候选方向"构成支持证据，旧公式却会因为只看 `btcTrendState==='up'` 直接判定"上涨候选方向"得到 `SUPPORT`、"下跌候选方向"得到 `OPPOSE`，与真实相关关系相反。本轮冻结**带符号**的语义：
 
 ```
+effectiveBtcDirection(correlation, btcTrendState, correlationFloor = 0.3):
+  若 correlation 缺失 或 非有限数（NaN/Infinity）：
+    return 'UNKNOWN'
+  若 btcTrendState 缺失 或 btcTrendState === 'flat'（BTC自身无明确趋势）：
+    return 'UNKNOWN'
+  若 correlation >= +correlationFloor（正相关，含边界）：
+    return btcTrendState                       # 沿用BTC表面方向，'up'|'down'
+  若 correlation <= -correlationFloor（负相关，含边界）：
+    return inverse(btcTrendState)              # 方向取反：'up'→'down'，'down'→'up'
+  否则（-correlationFloor < correlation < +correlationFloor，相关性不足以支撑联动判断）：
+    return 'UNKNOWN'
+
 btcAlignmentServer(candidateDirection, btcTrendState, ethBtcRollingCorrelation, correlationFloor = 0.3):
   # candidateDirection ∈ {'up','down'}
-  若 btcTrendState 缺失 或 ethBtcRollingCorrelation 缺失或非有限数：
+  effective = effectiveBtcDirection(ethBtcRollingCorrelation, btcTrendState, correlationFloor)
+  若 effective === 'UNKNOWN'：
     return 'UNKNOWN'
-  若 |ethBtcRollingCorrelation| < correlationFloor（相关性不足以支撑联动判断）：
-    return 'UNKNOWN'
-  若 btcTrendState === 'flat'（BTC自身无明确趋势）：
-    return 'UNKNOWN'
-  若 candidateDirection === 'up':
-    return btcTrendState === 'up' ? 'SUPPORT' : 'OPPOSE'
-  若 candidateDirection === 'down':
-    return btcTrendState === 'down' ? 'SUPPORT' : 'OPPOSE'
+  若 effective === candidateDirection：
+    return 'SUPPORT'
+  否则（方向相反）：
+    return 'OPPOSE'
 ```
 
-`correlationFloor = 0.3` 是本裁决**新冻结**的常量（既有六份 V1.4 文档与 GMKG 总架构均未定义 ETH-BTC 相关性阈值，此数值不是从既有文档继承而来，是本轮为关闭 P1-2 新增的判定阈值，版本号 `btcAlignmentFormulaVersion = 'v1.4c-btc-alignment-1'`，未来调整须递增此版本号）。**红线**：`btcTrendState` 缺失、`ethBtcRollingCorrelation` 缺失/非有限数、相关性不足、或 `btcTrendState='flat'` 时**必须**返回 `'UNKNOWN'`，**不得**默认返回 `'SUPPORT'`（对应 CEO 裁决原文"不得默认ALIGNED"，`SUPPORT` 是本裁决体系里对应原 `ALIGNED`/`support` 语义的值）。原 §4.2 中 `btcAlignment(...)==='support'` 的加分条件判断，V1.4C 改为 `btcAlignmentServer(...)==='SUPPORT'`；`'UNKNOWN'` 与 `'OPPOSE'` 在加分条件语境下效果相同（均不触发加分，因为加分条件本身是"有支持证据才加分"，不确定和相反证据同样不构成支持）。
+`correlationFloor = 0.3` 延续冻结（数值不变，语义修正——上一版本文档已将此数值标注为本轮新增的判定阈值，本轮只修正其正负号使用方式，不改变数值本身，不递增数值来源）。**边界（本轮明确）**：`correlation` 恰好等于 `+0.3` 时进入正相关分支（`>=`，含边界）；`correlation` 恰好等于 `-0.3` 时进入负相关分支（`<=`，含边界）；`-0.3 < correlation < +0.3`（不含两端）时返回 `'UNKNOWN'`。**红线**：`correlation` 缺失、非有限数（`NaN`/`Infinity`）、数据不完整、`btcTrendState` 缺失、或 `btcTrendState==='flat'` 时，`effectiveBtcDirection` 与 `btcAlignmentServer` **均必须**返回 `'UNKNOWN'`，**不得**默认返回 `'SUPPORT'`（对应 CEO 裁决原文"不得默认SUPPORT或ALIGNED"，`SUPPORT` 是本裁决体系里对应原 `ALIGNED`/`support` 语义的值）。原 §4.2 中 `btcAlignment(...)==='support'` 的加分条件判断，V1.4C 改为 `btcAlignmentServer(...)==='SUPPORT'`；`'UNKNOWN'` 与 `'OPPOSE'` 在加分条件语境下效果相同（均不触发加分，因为加分条件本身是"有支持证据才加分"，不确定和相反证据同样不构成支持）。
+
+**版本号**：本轮修正属于计算逻辑变化（而非单纯数值调整），`btcAlignmentFormulaVersion` 由 `'v1.4c-btc-alignment-1'` 递增为 `'v1.4c-btc-alignment-2'`，未来再调整须继续递增，不得复用旧版本号静默改值。
 
 ### 8.4 四项裁决对 9 种 PO_ 状态进入/保持/退出/否决条件的逐项影响
 
 | PO_ 状态 | 受影响裁决 | 具体影响 |
 |---|---|---|
 | `PO_RANGE_LOW_STRUCTURE` | 映射二（srZones） | 必要条件"price 落入支撑区间"改为 `isNearSupport(distanceToSupportAtr)`；状态退出"突破 `resistanceZones[0].upper+0.3ATR`"改为 `close > swingHigh` 且不再叠加区间宽度；"跌破 `supportZones[0].lower-0.5ATR`"改为 `close < swingLow`（失效线点值比较，不再有区间宽度可加减容差，容差已内化进 `isNearSupport` 的 `toleranceAtrMultiple`） |
-| `PO_BREAKOUT_UP_STRUCTURE` | 映射一（bar计数）、映射三（falseBreakoutRisk）、映射四（btcAlignment） | 必要条件 `breakoutBarsCount∈[1,2]` 改为消费 `computeConsecutiveBreakoutBars(...,'up')` 的 `count`；数据不足时整个状态判定让位于 `operatingMode='INSUFFICIENT_DATA'`；否决条件改为 `falseBreakoutRisk!=='NONE'`（弱化为当根信号）；加分条件改为 `btcAlignmentServer('up',...)==='SUPPORT'` |
-| `PO_TREND_UP_STRUCTURE` | 映射一、映射三 | 必要条件 `breakoutBarsCount>2` 改为消费映射一的 `count>2`；否决条件 `falseBreakoutRisk!=='NONE'`（原文仅 `'confirmation_failed'` 触发否决，现扩大为任何当根拒绝信号触发，判定更保守，符合"数据不足/信号更弱时应更保守"的一般原则） |
+| `PO_BREAKOUT_UP_STRUCTURE` | 映射一（bar计数，本轮修正深度）、映射三（falseBreakoutRisk）、映射四（btcAlignment，本轮修正符号） | 必要条件 `breakoutBarsCount∈[1,2]` 改为消费 `computeConsecutiveBreakoutBars(...,'up')`（M=3，20+3根回放）返回的 `count`（`count∈{1,2}`时满足，`count`达到`M=3`时不满足本状态、转入`PO_TREND_UP_STRUCTURE`判定范围）；数据不足（不足23根）时整个状态判定让位于 `operatingMode='INSUFFICIENT_DATA'`；否决条件改为 `falseBreakoutRisk!=='NONE'`（弱化为当根信号）；加分条件改为 `btcAlignmentServer('up',...)==='SUPPORT'`（本轮起为带符号相关性判定，负相关时需BTC呈`'down'`趋势才返回`SUPPORT`） |
+| `PO_TREND_UP_STRUCTURE` | 映射一（本轮修正深度）、映射三 | 必要条件 `breakoutBarsCount>2` 改为消费映射一的 `count`，`count===M(=3)` 即判定满足"`>2`"（因`M=3`是能可靠区分`[1,2]`与`>2`的最小回放深度，`count`达到`3`已充分证明连续根数确实超过2，不需要更大回放去求精确值）；`count<3`（含`INSUFFICIENT_DATA`）时不满足本状态必要条件；否决条件 `falseBreakoutRisk!=='NONE'`（原文仅 `'confirmation_failed'` 触发否决，现扩大为任何当根拒绝信号触发，判定更保守，符合"数据不足/信号更弱时应更保守"的一般原则） |
 | `PO_STALL_HIGH_STRUCTURE` | 映射二 | 状态退出"跌破 `supportZones[0].lower`"改为 `close < swingLow` |
-| `PO_BREAKDOWN_STRUCTURE` | 映射一、映射三、映射四 | 与 `PO_BREAKOUT_UP_STRUCTURE` 对称：`count`（down方向）、`falseBreakoutRisk!=='NONE'`、`btcAlignmentServer('down',...)==='SUPPORT'` |
-| `PO_TREND_DOWN_STRUCTURE` | 映射一、映射三 | 与 `PO_TREND_UP_STRUCTURE` 对称 |
+| `PO_BREAKDOWN_STRUCTURE` | 映射一（本轮修正深度）、映射三、映射四（本轮修正符号） | 与 `PO_BREAKOUT_UP_STRUCTURE` 对称：`count∈{1,2}`（down方向）、`falseBreakoutRisk!=='NONE'`、`btcAlignmentServer('down',...)==='SUPPORT'`（带符号相关性，正相关时需BTC呈`'down'`趋势，负相关时需BTC呈`'up'`趋势才返回`SUPPORT`） |
+| `PO_TREND_DOWN_STRUCTURE` | 映射一（本轮修正深度）、映射三 | 与 `PO_TREND_UP_STRUCTURE` 对称：`count===M(=3)` 判定满足"`>2`" |
 | `PO_SHARP_DROP_STRUCTURE` | 无直接影响 | 必要/加分/否决条件原文只依赖 `atr14`（15m，§4.1已说明的既有字段）与 `volumeRatio20`，不引用本节 4 项映射中的任何一项 |
 | `PO_RANGE_RECOVERY_STRUCTURE` | 无直接影响 | 必要/加分/否决条件原文只依赖 `atr14` 相对急跌当根的降幅与价格自身相对区间百分比，不直接引用本节 4 项映射；冲突处理"同 `PO_RANGE_LOW_STRUCTURE` 条目"因此间接继承映射二的影响 |
 | `PO_UNKNOWN` | 间接受全部 4 项影响 | 触发条件是"以上 8 项必要条件均不满足"，8 项中任一项的判定手段变化（映射一/二/三/四）都会改变"均不满足"这一汇总结论是否成立，但 `PO_UNKNOWN` 自身不直接引用任何一项映射 |
@@ -558,7 +629,7 @@ contentHash = canonicalJsonHash({
 
 | 级别 | 测试项 |
 |---|---|
-| **P0** | `dataCutoffTime` 前的未来数据不得进入 `ForecastSnapshot`；`referenceBar`/`targetBar` 必须是已收盘 K 线；`ForecastOutcomeEvent` 不得覆盖 `ForecastSnapshot` 任何字段（数据库触发器+外键 `ON DELETE RESTRICT` 双重验证）；`scenarioWeights` 三项之和恒为 100 且无 NaN/Infinity/负值；`pathDataComplete` 九项不变量全部验证（含 §11 真值表 4 种组合场景）；`targetStateAtGeneration`/`fusionStateAtGeneration` 恒为 `'UNKNOWN'`（数据库 CHECK + 应用层双重验证）；`proxyStateAtGeneration` 判定不受 `auxiliaryEvidence` 影响（§9.3 冲突不改变状态的专项测试）；`algorithmVersion` 同一版本内 `directionThreshold`/`evaluationVersion` 不得动态调整；服务器时间不可用时 fail closed；幂等生成/回填（`UNIQUE(prediction_id)`/`UNIQUE(prediction_id,evaluation_version)` 数据库约束+并发双实例竞争测试）；同一事务原子写入（snapshot+sources+quality_event），失败整体回滚，不产生孤儿记录；`forecast_snapshots` 数据库层拒绝 UPDATE/DELETE（触发器验证）；旧 fencing token 被数据库拒绝，拒绝后无残留写入。**（P1-1/P1-2/P1-3 关闭新增）**：24H/72H 两组固定输入（已知 4H ATR14+referencePrice）产出的 `rawThreshold`/`directionThreshold` 与 §4.1 公式手算结果逐位一致；`directionThreshold` 上下限 clamp（构造 `rawThreshold` 分别小于 floor、大于 ceiling、落在区间内三种场景，验证 clamp 结果）；`actualReturn` 恰好等于 `+directionThreshold`/`-directionThreshold` 边界值时分别判定为 `UP`/`DOWN`（不落入 `RANGE`，`>=`/`<=` 边界包含性专项测试）；`forecast_snapshots` 落库后 `rawThreshold`/`thresholdFloor`/`thresholdCeiling`/`thresholdFormulaVersion`/`atr14FourHourAtGeneration` 五项审计字段与生成时计算值完全一致且后续不随 `market_bars`/`feature_records` revision 变化（真实 PostgreSQL 验证）；4H ATR14 历史不足 14 根已收盘 4H K 线时 `fail closed`（`error_code='ATR14_4H_INSUFFICIENT'`），不产出正式快照；§8.3 四项映射逐项真实 PostgreSQL 测试：映射一历史 4H bar 不足 21 根时返回 `INSUFFICIENT_DATA` 而非猜测计数，`PO_TREND_UP_STRUCTURE`/`PO_TREND_DOWN_STRUCTURE` 在 `computeConsecutiveBreakoutBars` 计数未超过阈值时不得被误判为已进入延续状态；映射三 `falseBreakoutRisk!=='NONE'` 触发否决但**不得**在 `evidenceText` 中出现暗示跨 bar 确认的措辞（`'confirmation_failed'` 类文案）；映射四 `btcTrendState`/`ethBtcRollingCorrelation` 缺失、相关性低于 `correlationFloor`、或 `btcTrendState='flat'` 三种场景下 `btcAlignmentServer` 必须返回 `'UNKNOWN'`，不得默认 `'SUPPORT'`；`ForecastGenerator`（`'forecast-generator'`）与 `OutcomeEvaluator`（`'forecast-outcome-evaluator'`）两个独立 lease 并发运行且互不干扰（一方续约失败不影响另一方继续正常写入的专项测试）；过期 fencing token 提交（无论来自哪个调度器）在数据库事务内被拒绝，且不留下 `forecast_snapshots`/`forecast_snapshot_sources`/`forecast_quality_events`/`forecast_outcome_events` 任一表的残行（真实并发冲突场景验证）。 |
+| **P0** | `dataCutoffTime` 前的未来数据不得进入 `ForecastSnapshot`；`referenceBar`/`targetBar` 必须是已收盘 K 线；`ForecastOutcomeEvent` 不得覆盖 `ForecastSnapshot` 任何字段（数据库触发器+外键 `ON DELETE RESTRICT` 双重验证）；`scenarioWeights` 三项之和恒为 100 且无 NaN/Infinity/负值；`pathDataComplete` 九项不变量全部验证（含 §11 真值表 4 种组合场景）；`targetStateAtGeneration`/`fusionStateAtGeneration` 恒为 `'UNKNOWN'`（数据库 CHECK + 应用层双重验证）；`proxyStateAtGeneration` 判定不受 `auxiliaryEvidence` 影响（§9.3 冲突不改变状态的专项测试）；`algorithmVersion` 同一版本内 `directionThreshold`/`evaluationVersion` 不得动态调整；服务器时间不可用时 fail closed；幂等生成/回填（`UNIQUE(prediction_id)`/`UNIQUE(prediction_id,evaluation_version)` 数据库约束+并发双实例竞争测试）；同一事务原子写入（snapshot+sources+quality_event），失败整体回滚，不产生孤儿记录；`forecast_snapshots` 数据库层拒绝 UPDATE/DELETE（触发器验证）；旧 fencing token 被数据库拒绝，拒绝后无残留写入。**（P1-1/P1-2/P1-3 首次关闭新增）**：24H/72H 两组固定输入（已知4H ATR14+referencePrice）产出的 `rawThreshold`/`directionThreshold` 与 §4.1 公式手算结果逐位一致；`directionThreshold` 上下限 clamp（构造 `rawThreshold` 分别小于 floor、大于 ceiling、落在区间内三种场景，验证 clamp 结果）；`actualReturn` 恰好等于 `+directionThreshold`/`-directionThreshold` 边界值时分别判定为 `UP`/`DOWN`（不落入 `RANGE`，`>=`/`<=` 边界包含性专项测试）；`forecast_snapshots` 落库后 `rawThreshold`/`thresholdFloor`/`thresholdCeiling`/`thresholdFormulaVersion`/`atr14FourHourAtGeneration` 五项审计字段与生成时计算值完全一致且后续不随 `market_bars`/`feature_records` revision 变化（真实 PostgreSQL 验证）；`ForecastGenerator`（`'forecast-generator'`）与 `OutcomeEvaluator`（`'forecast-outcome-evaluator'`）两个独立 lease 并发运行且互不干扰（一方续约失败不影响另一方继续正常写入的专项测试）；过期 fencing token 提交（无论来自哪个调度器）在数据库事务内被拒绝，且不留下 `forecast_snapshots`/`forecast_snapshot_sources`/`forecast_quality_events`/`forecast_outcome_events` 任一表的残行（真实并发冲突场景验证）。**（本轮 P1-1 修正新增，ATR14 取数深度）**：①4H K线恰好只有14根（不足15根）时返回 `ATR14_4H_INSUFFICIENT` 并 `fail closed`；②恰好15根连续已收盘4H K线时成功计算 `atr14FourHourAtGeneration`（14个完整TR样本均值）；③15根窗口内存在缺失/重复/乱序/未收盘K线中任一情形时同样 `fail closed`；④固定输入（15根已知OHLC的4H K线+`referencePrice`）产出的 `atr14FourHourAtGeneration`/`rawThreshold`/`directionThreshold` 与手算结果逐位一致（真实 PostgreSQL 验证）。**（本轮 P1-2A 修正新增，连续计数回放深度）**：连续突破/跌破根数分别为 `0`/`1`/`2`/`3`/`>3`（即达到`M=3`上限）五种场景下 `computeConsecutiveBreakoutBars` 返回值正确；遇到第一根不符合当前方向的candidate bar立即停止计数（不继续向更早bar扫描）；每个candidate bar的判定只使用其自身严格之前的20根历史（构造两个candidate共享同一段历史但各自20根窗口不同的场景，验证互不污染）；任一candidate bar缺少完整20根前置历史，或23根回放窗口内存在缺失/重复/乱序/未收盘bar时返回 `INSUFFICIENT_DATA`，不得猜测；修改某candidate bar**之后**的bar数据（更晚的candidate或超出23根范围的未来K线）不改变该candidate bar自身已计算出的历史判定结果（真实 PostgreSQL 验证，含 as-of 时间推进对照）。**（本轮 P1-2B 修正新增，BTC相关性符号语义）**：正相关（`correlation>=+0.3`）+候选方向与`btcTrendState`表面相同 → `SUPPORT`；正相关+表面相反 → `OPPOSE`；负相关（`correlation<=-0.3`）+表面相同 → `OPPOSE`；负相关+表面相反 → `SUPPORT`；`correlation`恰好等于`+0.3`时进入正相关分支（不得误判为UNKNOWN区间）；`correlation`恰好等于`-0.3`时进入负相关分支；`|correlation|<0.3`（不含两端）时返回`UNKNOWN`；`correlation`缺失/`NaN`/`Infinity`、`btcTrendState`缺失/`flat`、或数据不完整时返回`UNKNOWN`，不得默认`SUPPORT`或`ALIGNED`（真实 PostgreSQL 验证，覆盖全部四种符号×方向组合）。 |
 | **P1** | `predictionId` 命名空间与浏览器端不冲突（`-SRV-`前缀+独立`algorithmVersion`专项测试）；24H 每 4 小时/72H 每日生成节奏上限；walk-forward 三区间严格按时间排列不重叠不打乱；区间调度算法按 `targetEndTime` 排序；`missingBarRefs` 记录具体 bar 而非泛化原因；`endpointDataComplete`/`pathDataComplete` 独立判定（§10.5.0 边界，专项测试referenceBar缺失但path完整的场景）；MFE/MAE 的 UP/DOWN/RANGE 三种口径分别验证；区间覆盖四项计算正确性；`featureValuesUsed`/`contentHash`与 V1.4B `feature_records`一致性（复制值副本不随源数据 revision 变化的专项测试，即 §7.3 红线的直接验证）；PO_ 状态 9 项映射到 V1.4B 特征后的判定结果与原浏览器端判定逻辑的业务意图一致性抽样比对。**（P1-2/P1-3 关闭新增）**：§8.3 映射二 `isNearSupport`/`isNearResistance` 与直接的价格-区间比较（若历史上有可对照样本）业务意图一致性抽样；`swingHigh`/`swingLow` 只作点值失效线使用、代码中不出现任何 `.lower`/`.upper` 派生自这两个字段的场景（静态扫描）；CI 强制门禁组合命令（`test:postgres`）必须包含 V1.4C 新增的真实 PostgreSQL 测试文件（比照 V1.4B `test:postgres:revision` 的接线修复模式，新测试文件必须与 `package.json` 改动、`review-regression.test.js` 结构性断言在同一 commit 内一起接入，不得分两轮，见 §16 第 9 步）。 |
 | **P2** | 生成/回填耗时性能；只读 API 新增端点（`/api/v1/forecast/*`）响应格式；`auxiliaryEvidence`/`stateEvidence` 展示层措辞是否清晰区分；日志可读性；`fusionStateAtGeneration`等占位字段的注释/文档标注是否清晰（防止被误当作真实融合结果）；`forecast_generation_runs`/`forecast_evaluation_runs` 两张独立审计表的可读性（能否清晰区分两个调度器各自的运行历史，不需要额外过滤逻辑）。 |
 
@@ -571,8 +642,8 @@ contentHash = canonicalJsonHash({
 ```
 新增文件：
 server/src/forecast/forecast-contract.js      — ForecastSnapshot/ForecastOutcomeEvent字段契约与校验
-server/src/forecast/threshold-formula.js      — directionThreshold/rawThreshold/clamp计算（§4.1，P1-1）
-server/src/forecast/po-feature-mapping.js     — §8.3四项映射：连续bar计数、支撑压力距离判定、falseBreakoutRisk、btcAlignmentServer（P1-2）
+server/src/forecast/threshold-formula.js      — directionThreshold/rawThreshold/clamp计算，4H ATR14取15根K线/14个TR样本（§4.1，P1-1）
+server/src/forecast/po-feature-mapping.js     — §8.3四项映射：连续bar计数（20+M=23根回放，M=3）、支撑压力距离判定、falseBreakoutRisk、btcAlignmentServer（带符号相关性）（P1-2A/P1-2B）
 server/src/forecast/po-state-engine.js        — PO_*状态判定（§8/§9），只读消费feature_records+po-feature-mapping.js
 server/src/forecast/bar-path-locator.js       — referenceBar/targetBar/路径遍历、4H ATR14历史计算（§10/§4.1）
 server/src/forecast/generator-service.js      — ForecastGenerator独立调度器，lease='forecast-generator'（§7.1/§7.2）
@@ -639,13 +710,14 @@ package.json / 任何数据库迁移 / 任何测试代码（本轮红线）
 - **生效版本**：V1.4C。
 - **是否影响历史记录**：不影响，浏览器端历史 `predictionId` 格式不变，仍可正常关联查询。
 
-### 17.4 `directionThreshold` 具体数值——P1-1 已关闭，本轮补齐唯一权威公式
+### 17.4 `directionThreshold` 具体数值——P1-1 已关闭，本轮（第二轮）修正 4H ATR14 取数深度
 
-- **旧口径**：`V1_4_FORECAST_DATA_SPEC.md` 全文只提及 `directionThreshold` 须"在算法版本冻结的同一时刻一并选定并写入版本说明"（GMKG §10.3 原文红线的抽象要求），未给出任何具体数值或公式；上一版本文档（v1.4c-spec-draft-1）核对后同样未找到浏览器端可复用的具体数值，因而标注为【待 Codex 实施层确认】，未给出确定性公式。
-- **新冻结口径**：本文档 §4.1 给出唯一权威公式——`rawThreshold = atr14FourHourAtGeneration / referencePrice × sqrt(periods)`，`directionThreshold = clamp(rawThreshold, floor, ceiling)`，24H/72H 分别冻结 `periods`/`floor`/`ceiling` 三组具体数值，`thresholdFormulaVersion='v1.4c-threshold-formula-1'`。
-- **覆盖原因**：Codex 对提交 `e421f8c870b692ce2fb800d8080c1aeb899bd64f` 的 V1.4C 定向复审关闭 P1-1，要求给出立即可编码的确定性公式，不再允许"留待实施层选定"这一开放式表述——既有文档本身的开放式留白不构成冲突，但对于本文档而言，继续保留这一留白已不满足"规范先行、Codex 不自由发挥"的项目纪律，因此本轮补齐。
-- **生效版本**：`thresholdFormulaVersion='v1.4c-threshold-formula-1'`（V1.4C 本轮新增，非既有文档继承）。
-- **是否影响历史记录**：不适用——此前无任何服务器端实现产出过 `directionThreshold` 真实值，浏览器端记录使用浏览器自己的口径（若存在），不受本次服务器端公式冻结影响。
+- **旧口径（第一轮，`ccb8f1844034b0332cbe4e20dbeac7305bfe131a`）**：`V1_4_FORECAST_DATA_SPEC.md` 全文只提及 `directionThreshold` 须"在算法版本冻结的同一时刻一并选定并写入版本说明"（GMKG §10.3 原文红线的抽象要求），未给出任何具体数值或公式；上一版本文档（v1.4c-spec-draft-1）核对后同样未找到浏览器端可复用的具体数值，因而标注为【待 Codex 实施层确认】，未给出确定性公式。第一轮修订（v1.4c-spec-draft-2）补齐了公式本身（`rawThreshold=atr14FourHourAtGeneration/referencePrice×sqrt(periods)`，clamp），但 ATR14 的取数规则错误地写成"取最近14根已收盘4H K线"（`thresholdFormulaVersion='v1.4c-threshold-formula-1'`）。
+- **本轮（第二轮）发现的问题**：14周期ATR的标准真实波幅算法里，每根bar的TR都需要**前一根bar的收盘价**才能计算，因此14周期ATR实际需要 `14+1=15` 根K线（14根只能产生13个完整TR样本），第一轮的"14根"表述本身是**错误**的，不是"留白"或"待细化"，而是公式实现层面的真实缺陷（Codex 定向复审发现）。
+- **新冻结口径**：本文档 §4.1 修正为——查询最近**15根**连续、已收盘4H K线，第1根仅提供`prevClose`，后14根产生14个完整TR样本，`atr14FourHourAtGeneration=average(TR[1..14])`；`bars.length<15`或15根窗口内存在缺失/重复/乱序/未收盘时返回`ATR14_4H_INSUFFICIENT`并fail closed；下游`rawThreshold`/`directionThreshold`公式本身不变，仍为`atr14FourHourAtGeneration/referencePrice×sqrt(periods)`并clamp；`thresholdFormulaVersion`由`'v1.4c-threshold-formula-1'`递增为`'v1.4c-threshold-formula-2'`。
+- **覆盖原因**：Codex 对提交 `ccb8f1844034b0332cbe4e20dbeac7305bfe131a` 的 V1.4C 增量复审发现第一轮公式的 ATR14 取数深度计算错误，要求修正为正确的 `period+1=15` 根，不得继续使用会产生13个（而非14个）完整TR样本的"14根"表述。
+- **生效版本**：`thresholdFormulaVersion='v1.4c-threshold-formula-2'`（本轮修订，V1.4C 独立命名空间，非既有文档继承）。
+- **是否影响历史记录**：不适用——此前无任何服务器端实现产出过 `directionThreshold`/`atr14FourHourAtGeneration` 真实值（第一轮规范虽已冻结公式，但截至本轮修订前未有任何 V1.4C 生产代码被编写，见本文档 §1.1"本轮不修改任何生产代码"的持续红线），浏览器端记录使用浏览器自己的口径（若存在），不受本次服务器端公式修正影响。
 
 ### 17.5 `fusionStateAtGeneration` 占位取值方式——新增裁决
 
@@ -667,14 +739,17 @@ GMKG §10.1 与 `V1_4_FORECAST_DATA_SPEC.md` 均未定义任何"辅助证据"概
 
 **这是本轮核对中最重要的一处、必须显式提醒 Codex 实施层的差异**：V1.4A `market_bars` 与 V1.4B `feature_records` 都采用"同一自然键、内容变化时**追加 revision**，DEDUPED/REVISED 两态"的协议（本仓库此前经历过一次因为该协议的时间字段实现错误而触发的真实 P1 缺陷修复，见 `V1_4B_TEST_RESULTS.md` revision 时间推进测试章节）。**`forecast_snapshots` 表故意不采用这一协议**——`ForecastSnapshot` 只有 `INSERTED`/`DEDUPED` 两态，**没有 `REVISED` 态**，数据库层甚至不设 `revision_number` 列，触发器直接拒绝一切 UPDATE（比 `market_bars`/`feature_records`——它们只拒绝对**旧行**的 UPDATE，但允许 INSERT 新 revision 行——更严格）。这不是"忘记加 revision 支持"，而是 GMKG §10.1 红线（"原始预测不可被后续结果覆盖"）与 CEO 裁决四.6（"不给 ForecastSnapshot 设计可变 revision 语义"）的刻意选择：**Codex 实施层不得因为看到 V1.4A/B 的既有 revision 协议代码模式，就想当然地照搬到 `forecast_snapshots` 上**——这是本文档与既有代码模式之间唯一一处"形似神不似"的陷阱点，必须在 `V1_4C_CODEX_IMPLEMENTATION_TASK.md` 中重复强调。
 
-### 17.9 PO_ 状态输入特征映射——P1-2 已关闭，§8.3 给出 4 项确定性冻结
+### 17.9 PO_ 状态输入特征映射——P1-2 已关闭，本轮（第二轮）修正映射一回放深度算法与映射四相关性符号语义
 
-- **旧口径**：`V1_4_FORECAST_DATA_SPEC.md` §4.1/§4.2 定义 PO_ 状态判定规则时，其输入特征（`e4.*`/`e1.*`/`buildSRZones()`/`btcAlignment()`/`falseBreakoutTier`）是**浏览器端 `v1-core.js` 的具体函数输出**，与 V1.4B 服务器端独立实现的 54 项具名特征在字段名、部分语义粒度上**不是同一套**；上一版本文档（v1.4c-spec-draft-1）§8.2 建立了映射表，但对 `breakoutBarsCount`/`srZones.lower/upper`/`falseBreakoutTier`/`btcAlignment` 4 项明确标注"无直接等价物"，不代为裁决，留给 Codex 实施前的独立裁决步骤。
-- **新冻结口径**：本文档 §8.3 给出 4 项确定性公式/规则：①`breakoutBarsCount`/`breakdownBarsCount` 改为 V1.4C 独立实现的 `computeConsecutiveBreakoutBars()`，基于真实 4H `market_bars` 历史逐根回放计算，数据不足时返回 `INSUFFICIENT_DATA`，不猜测；②`srZones.lower/upper` 不再构造区间宽度，`swingHigh`/`swingLow` 只作单一失效线使用，"贴近"类判定改用 `distanceToSupportAtr`/`distanceToResistanceAtr` 配合复用自既有文档的 `0.3×ATR` 容差；③`falseBreakoutTier` 的否决条件改为 `falseBreakoutRisk!=='NONE'`（弱化为当根拒绝信号，不冒充跨 bar 确认）；④`btcAlignment` 改为显式三态 `btcAlignmentServer()`，新冻结 `correlationFloor=0.3` 常量，数据不足/相关性不足/趋势缺失时返回 `'UNKNOWN'`，不默认 `'SUPPORT'`。§8.4 进一步逐项列出这 4 项裁决对 9 种 PO_ 状态进入/保持/退出/否决条件的具体影响。
-- **覆盖原因**：Codex 对同一提交的定向复审关闭 P1-2，要求这 4 项映射不再留待实施层裁决，而是由规范本身给出确定性公式，同时明确记录这些裁决对 9 个 PO_ 状态判定条件的逐项影响，避免 Codex 在编码阶段对"业务意图是否保持不变"产生分歧解读。
-- **生效版本**：§8.3 冻结公式随本文档版本生效；`btcAlignmentFormulaVersion='v1.4c-btc-alignment-1'` 为本轮新增独立版本号。
-- **是否影响历史记录**：不适用——此前无任何服务器端 PO_ 状态判定实现产出过基于这 4 项映射的真实结果。
-- **未被既有文档定义、本轮新增冻结的具体数值需特别说明**：`correlationFloor=0.3`（映射四）是本轮**新引入**的数值，既有六份 V1.4 文档与 GMKG 总架构均未定义 ETH-BTC 滚动相关性的判定阈值，读者若认为该数值需要调整，应递增 `btcAlignmentFormulaVersion` 而非静默修改；映射二复用的 `0.3×ATR` 容差**不是**新数值，是 `V1_4_FORECAST_DATA_SPEC.md` §4.2 原文已经在多条 PO_ 规则中使用的既有常量，本轮只是将其用途从"区间边界外的额外容差"收窄为"到失效线的距离容差阈值"，数值延续、语义收窄，已在 §8.3 映射二中明确说明。
+- **旧口径（第一轮，`ccb8f1844034b0332cbe4e20dbeac7305bfe131a`）**：`V1_4_FORECAST_DATA_SPEC.md` §4.1/§4.2 定义 PO_ 状态判定规则时，其输入特征（`e4.*`/`e1.*`/`buildSRZones()`/`btcAlignment()`/`falseBreakoutTier`）是**浏览器端 `v1-core.js` 的具体函数输出**，与 V1.4B 服务器端独立实现的 54 项具名特征在字段名、部分语义粒度上**不是同一套**；上一版本文档（v1.4c-spec-draft-1）§8.2 建立了映射表，但对 `breakoutBarsCount`/`srZones.lower/upper`/`falseBreakoutTier`/`btcAlignment` 4 项明确标注"无直接等价物"，不代为裁决。第一轮修订（v1.4c-spec-draft-2）§8.3 给出了 4 项确定性公式，但其中两项存在真实算法缺陷（Codex 定向复审发现）：①映射一"至少21根"的规则只能可靠判断最新1根bar的突破状态，无法得到连续2根或更多根的真实计数（因为所有候选bar共享同一个冻结的20根基准窗口，而非各自独立的前置窗口）；②映射四`btcAlignmentServer`只检查`|ethBtcRollingCorrelation|<correlationFloor`的绝对值，忽略了相关性正负号，导致ETH/BTC强负相关时SUPPORT/OPPOSE判断相反。
+- **本轮修正的映射一（连续bar计数回放深度）**：改为每个candidate bar拥有其自身独立的、严格早于它的20根历史基准；冻结最大回放上限`consecutiveBarCountMaxLookback=3`（`consecutiveBarCountFormulaVersion='v1.4c-bar-count-lookback-1'`，见§8.3选择依据），总回放深度固定为`20+3=23`根；从最早candidate正向逐根计算，再从最新candidate反向计数、遇首个不符方向的bar停止；数据不足或窗口不连续时返回`INSUFFICIENT_DATA`。
+- **本轮修正的映射四（BTC相关性符号语义）**：改为`effectiveBtcDirection()`——正相关（`>=+0.3`）沿用`btcTrendState`原方向，负相关（`<=-0.3`）取反方向，相关性不足（`(-0.3,+0.3)`区间，不含两端）返回`UNKNOWN`；再与`candidateDirection`比较得`SUPPORT`/`OPPOSE`；`correlationFloor=0.3`数值不变，仅修正正负号使用方式；`btcAlignmentFormulaVersion`由`'v1.4c-btc-alignment-1'`递增为`'v1.4c-btc-alignment-2'`。
+- **未受本轮影响**：映射二（srZones→distanceToSupportAtr/distanceToResistanceAtr）、映射三（falseBreakoutRisk单根拒绝证据）未发现新问题，本轮未修改。
+- §8.4 已同步更新，逐项复核并更新了映射一/映射四相关的 `PO_BREAKOUT_UP_STRUCTURE`/`PO_TREND_UP_STRUCTURE`/`PO_BREAKDOWN_STRUCTURE`/`PO_TREND_DOWN_STRUCTURE` 四个状态的进入/保持/退出/否决条件描述，确认业务语义（`count∈[1,2]`vs`>2`的判定边界、`SUPPORT`/`OPPOSE`的消费方式）未发生变化，只是底层算法更正确。
+- **覆盖原因**：Codex 对提交 `ccb8f1844034b0332cbe4e20dbeac7305bfe131a` 的 V1.4C 增量复审发现上述两项算法缺陷，要求给出真正能区分"连续N根"的回放算法与真正考虑相关性符号的BTC联动判定，不得延续错误公式。
+- **生效版本**：`consecutiveBarCountFormulaVersion='v1.4c-bar-count-lookback-1'`（本轮首次冻结）；`btcAlignmentFormulaVersion='v1.4c-btc-alignment-2'`（本轮修订）。
+- **是否影响历史记录**：不适用——此前无任何服务器端 PO_ 状态判定实现产出过基于这些映射的真实结果（第一轮规范虽已冻结公式，但截至本轮修订前未有任何 V1.4C 生产代码被编写）。
+- **未被既有文档定义、本轮新增/沿用冻结的具体数值需特别说明**：`consecutiveBarCountMaxLookback=3`（映射一，本轮新增，选择依据见§8.3——PO_状态机只需区分`0`/`[1,2]`/`>2`三档，`M=3`是能可靠证明"确已超过2"的最小回放深度）；`correlationFloor=0.3`（映射四，第一轮已引入，数值延续未变，本轮只修正符号使用方式）；映射二复用的 `0.3×ATR` 容差**不是**新数值，是 `V1_4_FORECAST_DATA_SPEC.md` §4.2 原文已经在多条 PO_ 规则中使用的既有常量，语义收窄用法见第一轮记录，本轮未变。
 
 ### 17.10 与 `V1_4_ACCEPTANCE_TESTS.md`/`V1_4B_IMPLEMENTATION_REPORT.md`/`V1_4B_TEST_RESULTS.md` 的一致性
 
@@ -688,17 +763,21 @@ GMKG §10.1 与 `V1_4_FORECAST_DATA_SPEC.md` 均未定义任何"辅助证据"概
 - **生效版本**：V1.4C 本轮修订。
 - **是否影响历史记录**：不适用——此前无任何服务器端调度器实现产出过审计记录。
 
-### 17.12 未解决冲突汇总（本轮更新）
+### 17.12 未解决冲突汇总（本轮/第二轮更新）
 
-本轮（及上一轮）核对**未发现**真正意义上的"两份既有文档对同一问题给出矛盾答案、必须二选一"的冲突。全部差异属于以下三类，且均已逐项处理：
+本三轮核对**未发现**真正意义上的"两份既有文档对同一问题给出矛盾答案、必须二选一"的冲突。全部差异属于以下三类：
 1. **结构性留白**（GMKG §10.1 缺少 PO_ 状态快照字段插槽、`fusionStateAtGeneration` 占位方式未定义）——本文档以【V1.4C新增】方式补齐，不修改原有字段；
 2. **新实现引入的新概念**（`auxiliaryEvidence`/`sourceOrigin`/`predictionId`前缀）——纯新增，不覆盖任何既有定义；
-3. **两套独立代码实现之间的接口映射空白**（§8.3 PO_ 状态特征映射、§4.1 directionThreshold 公式、§7.1/§7.2 Outcome 调度与 lease 所有权）——**本轮已全部关闭**，不再有标注"待 Codex 实施层确认"或"口径待定"的未决事项。
+3. **两套独立代码实现之间的接口映射空白**（§8.3 PO_ 状态特征映射、§4.1 directionThreshold 公式、§7.1/§7.2 Outcome 调度与 lease 所有权）——第一轮已全部关闭，本轮（第二轮）在 Codex 增量复审中进一步发现第一轮公式本身存在**两处真实算法缺陷**（ATR14 取数深度错误、连续bar计数回放窗口未独立、BTC相关性符号被忽略），均已在本轮修订中修正，不再有标注"待 Codex 实施层确认"或"口径待定"的未决事项。
 
-**唯一需要读者特别注意、不属于"冲突"但极易在实施时被误解为"和 V1.4A/B 一样处理即可"的一点，仍然是 §17.8 记录的 `ForecastSnapshot` 不可变协议与既有 revision 协议的刻意差异**——本轮的三项 P1 关闭均未改变这一结论。
+**本轮修改过程中核实但未发现新增冲突的检查点（按用户要求逐项列出，供审阅确认覆盖完整）**：①连续bar计数上限`M=3`是否与PO_状态机§4.2原文"0/[1,2]/>2"三档判定边界一致——确认一致，`count`最大只会取到`M=3`本身，恰好等价于">2"判定所需的最小确定性证据；②`btcAlignmentServer`修正后返回值仍是`SUPPORT`/`OPPOSE`/`UNKNOWN`三态，未改变§8.3/§8.4中PO_状态判定层对该函数返回值的消费方式（仍是`===SUPPORT`触发加分），只改变了内部计算逻辑，不需要修改§8.4影响表中"消费方式"的描述，只需要更新其"内部计算方式"的措辞（已完成）；③本轮修正未涉及§6 PostgreSQL表结构或§7事务/lease契约（两处修正均为只读查询计算，不产生新的写入路径）；④原P1-3 `OutcomeEvaluator`独立lease冻结结论（§7.1/§7.2/§6.4/§6.6/§17.11）本轮未改动，逐项核对确认与本轮修正的§4.1/§8.3内容无交叉依赖。
 
-**本轮新增冻结、但既有六份 V1.4 文档与 GMKG 总架构均未提供依据的数值汇总**（供未来审阅时快速定位"这是哪里来的数字"）：`periods`/`floor`/`ceiling`（§4.1，24H=6/0.008/0.05，72H=18/0.015/0.08）、`correlationFloor=0.3`（§8.3 映射四）——均已各自绑定独立版本号（`thresholdFormulaVersion`/`btcAlignmentFormulaVersion`），需要调整时递增版本号，不得静默改值。
+**一处需要显式披露、不构成"冲突"但值得记录的设计取舍**：`computeConsecutiveBreakoutBars()`受`M=3`固定上限约束，`count`的返回值域是`{0,1,2,3}`（`3`代表"至少3根，即>2"），**不代表**真实连续根数的精确值（若实际连续突破根数为8根，本算法仍只返回`3`）——这是刻意的设计取舍（§8.3已说明：PO_状态机只需三档判定，不需要精确计数，扩大`M`只会增加查询范围与资源消耗而不提升判定正确性），不是缺陷，但若未来任何新需求要求`evidenceText`展示精确连续根数（而非"至少3根"），需要重新评估`M`的取值，不能直接假设当前`M=3`足够。
+
+**唯一需要读者特别注意、不属于"冲突"但极易在实施时被误解为"和 V1.4A/B 一样处理即可"的一点，仍然是 §17.8 记录的 `ForecastSnapshot` 不可变协议与既有 revision 协议的刻意差异**——本轮的修正均未改变这一结论。
+
+**截至本轮，全部新增冻结、但既有六份 V1.4 文档与 GMKG 总架构均未提供依据的数值汇总**（供未来审阅时快速定位"这是哪里来的数字"）：`periods`/`floor`/`ceiling`（§4.1，24H=6/0.008/0.05，72H=18/0.015/0.08，第一轮引入，本轮未变）、`correlationFloor=0.3`（§8.3映射四，第一轮引入，数值未变，本轮修正符号用法）、`consecutiveBarCountMaxLookback=3`（§8.3映射一，**本轮新增**）——均已各自绑定独立版本号（`thresholdFormulaVersion`/`btcAlignmentFormulaVersion`/`consecutiveBarCountFormulaVersion`），需要调整时递增版本号，不得静默改值。
 
 ---
 
-**文档结束。本规范由 CEO 冻结裁决一至十逐项落地；Codex 对提交 `e421f8c870b692ce2fb800d8080c1aeb899bd64f` 的定向复审发现的 P1-1（directionThreshold 口径）、P1-2（4 项 PO 特征映射）、P1-3（Outcome 回填调度与 lease 所有权）三项，均已在本轮修订中给出确定性公式/规则并关闭，不再需要 Codex 实施层自行裁决。截至本版本，§17 未发现任何仍需 CEO 进一步裁决的真正冲突或未决事项。**
+**文档结束。本规范由 CEO 冻结裁决一至十逐项落地。Codex 对提交 `e421f8c870b692ce2fb800d8080c1aeb899bd64f` 的定向复审发现的 P1-1（directionThreshold 口径）、P1-2（4 项 PO 特征映射）、P1-3（Outcome 回填调度与 lease 所有权）三项，已在第一轮修订（`ccb8f1844034b0332cbe4e20dbeac7305bfe131a`）中给出确定性公式/规则并关闭；Codex 对该第一轮提交的增量复审进一步发现三处遗留的真实算法缺陷（P1-1 ATR14 取数深度、P1-2A 连续bar计数回放深度、P1-2B BTC相关性符号语义），均已在本轮（第二轮）修订中修正并关闭，原 P1-3 结论未受影响、未改动。截至本版本，§17 未发现任何仍需 CEO 进一步裁决的真正冲突或未决事项。**
