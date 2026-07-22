@@ -3,6 +3,8 @@ name: V1.4A/V1.4B PostgreSQL 14 integration
 on:
   push:
     branches: [main, codex/v1.4a-server-data-foundation, codex/v1.4b-feature-engine-foundation]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
