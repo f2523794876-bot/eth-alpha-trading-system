@@ -14,7 +14,7 @@ import { ALGORITHM_VERSION } from '../../src/forecast/forecast-version.js';
 
 const url = process.env.TEST_DATABASE_URL, enabled = Boolean(url), pgtest = enabled ? test : test.skip;
 const FOUR_HOUR_MS = 14400000;
-const END = 1_784_400_000_000; // 全流程种子数据锚点（复用V1.4B测试同一锚点，隔离于独立测试库，不与其他文件冲突）
+const END = 1_767_311_999_999; // P1-2修复后referenceBar须精确落在4H/UTC自然日边界，此锚点=2026-01-01T23:59:59.999Z同时满足两者（(END+1)%FOUR_HOUR_MS===0 且 (END+1)%ONE_DAY_MS===0）
 let pool, repo, seedLease, featureLease;
 
 const response = (body, receivedAt = END + 5_000_000) => ({ body, requestId: randomUUID(), status: 200, headers: {}, startedAt: receivedAt - 1, receivedAt });
@@ -59,7 +59,9 @@ async function seedFullPipeline() {
   await seedFact('long_short_ratios', [{ symbol: 'ETHUSDT', timestamp: END - 1, longShortRatio: '1.1', longAccount: '0.52', shortAccount: '0.48' }], normalizeLongShort, '15m');
   await seedFact('taker_flow', [{ timestamp: END - 1, buySellRatio: '1.2', buyVol: '120', sellVol: '100' }], normalizeTakerFlow, '15m');
   const feature = await new FeatureEngine({ repository: repo, now: () => END + 1 }).generatePoint({ targetBarCloseTime: END }, featureLease);
-  assert.equal(feature.status, 'INSERTED');
+  // seedFullPipeline()可能在同一文件内被多个测试调用（同一END锚点、同一份市场数据），第二次调用命中相同内容
+  // 会合法地DEDUPED（同一自然键内容未变），不代表种子失败——只有真正的写入错误才需要失败，接受两种终态
+  assert.ok(['INSERTED', 'DEDUPED'].includes(feature.status), `unexpected feature engine status: ${feature.status}`);
   return feature;
 }
 const okServerTime = (at) => async () => ({ ok: true, sourceServerTime: at });
@@ -280,4 +282,108 @@ pgtest('旧fencing token提交在事务内被拒绝，回滚后无孤儿snapshot
   assert.equal(afterSrc, beforeSrc);
   assert.equal(afterQe, beforeQe);
   assert.equal(gen.leaseLost, true);
+});
+
+// Codex复审P1-2修复专项：UNIQUE(prediction_id)不足以限制生成节奏（不同referenceBar产生不同predictionId），
+// 必须由§7.6"24H每4小时/72H每UTC自然日最多一次"应用层节奏门禁本身来保证。本测试用真实PostgreSQL数据模拟连续多次
+// 15分钟轮询，直接断言24H/72H实际生成数量与referenceBar时间——而不是像此前V1_4C_TEST_RESULTS.md错误声称的
+// "由UNIQUE(prediction_id)天然保证"（该结论已在实施报告/测试结果文档中更正，见文档变更记录）。
+//
+// 独立种子（不复用seedFullPipeline/END锚点，理由两条）：①seedBars()把整批30根bar的fetchedAt统一设为END本身，
+// asOfTime<END的轮询会被as-of可见性过滤掉全部bar（与"节奏未到"混淆，无法单独验证节奏门禁本身）；②END在本文件其他
+// 测试中已被用于24H/END这一具体predictionId，复用会产生跨测试的隐性耦合。改用全新锚点RHYTHM_END（=END-10天，同样
+// 同时是4H边界与UTC日边界）与显式更早的fetchedAt，让"整批历史数据早已可见"，使轮询过程中唯一的门禁变量是节奏本身。
+pgtest('P1-2修复：连续多次15m轮询模拟——24H每4小时/72H每UTC自然日最多生成一条正式快照，referenceBar精确对齐节奏边界', async () => {
+  await pool.query("UPDATE collector_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE lease_name=$1", [LEASE_NAME]);
+
+  const RHYTHM_END = END - 10 * 86400000; // 仍同时是4H边界与UTC日边界（减去整数个自然日不改变边界对齐性质）
+  const seedFetchedAt = RHYTHM_END - 30 * 900000; // 早于本测试全部轮询时刻，供不参与节奏边界判定的衍生品事实使用
+  // 每根bar各自独立成一次"抓取"，fetchedAt=该bar自身closeTime+微小余量——不得用单一批级fetchedAt（validTimeOrder红线
+  // 要求fetchedAt>=closeTime，若批内最新一根bar的closeTime晚于共享fetchedAt会导致整批被判定为未收盘/半成品而写入失败，
+  // 此前正是因此触发"stored count 0"的真实bug）。这也更贴近真实场景：每根K线在自己收盘后不久才被采集到。
+  async function seedBarsBatch(instrument, interval, step, anchorCloseTime, count = 30) {
+    for (let i = 0; i < count; i++) {
+      const closeTime = anchorCloseTime - (count - 1 - i) * step, openTime = closeTime - step + 1, p = 1800 + (instrument === 'BTCUSDT' ? 60000 : 0) + i;
+      const row = [openTime, String(p - 1), String(p + 2), String(p - 2), String(p), String(100 + i), closeTime, String((100 + i) * p), 10, String((100 + i) * .55), '500', '0'];
+      const barFetchedAt = closeTime + 1000;
+      const sourceId = 'binance-spot-rest', endpointId = 'binance-spot-klines', r = response([row], barFetchedAt);
+      const rawPayloadId = await repo.saveRaw(r, { sourceId, endpointId, contentHash: canonicalJsonHash([row]), schemaVersion: 'v1.4a-server-schema-1', qualityState: 'NORMAL' }, seedLease);
+      const normalized = normalizeKlines({ rows: [row], sourceId, endpointId, instrument, marketType: 'spot', interval, serverTime: barFetchedAt, fetchedAt: barFetchedAt, rawPayloadId, requestId: r.requestId });
+      if (normalized.rejected.length) throw new Error(`seedBarsBatch rejected: ${JSON.stringify(normalized.rejected)}`);
+      await repo.upsertMarketBars(normalized.formal, seedLease);
+    }
+  }
+  async function seedFactAt(table, body, normalizer, interval = null) {
+    const endpoints = { funding_rates: 'binance-futures-funding-rate', open_interest: 'binance-futures-open-interest', long_short_ratios: 'binance-futures-global-long-short', taker_flow: 'binance-futures-taker-flow' };
+    const endpointId = endpoints[table], r = response(body, seedFetchedAt);
+    const rawPayloadId = await repo.saveRaw(r, { sourceId: 'binance-usdt-futures-rest', endpointId, contentHash: canonicalJsonHash(body), schemaVersion: 'v1.4a-server-schema-1', qualityState: 'NORMAL' }, seedLease);
+    const rows = Array.isArray(body) ? body : [body];
+    const facts = rows.map(row => normalizer(row, { sourceId: 'binance-usdt-futures-rest', endpointId, instrument: 'ETHUSDT', marketType: 'usdt_perpetual', interval, fetchedAt: seedFetchedAt, rawPayloadId, requestId: r.requestId, qualityState: 'NORMAL' }));
+    await repo.savePointFacts(table, facts, seedLease);
+  }
+  // 30根/周期，覆盖offset -29..0（即RHYTHM_END-14400000这一4H边界在范围内，但更早一个4H边界RHYTHM_END-28800000在范围外）
+  for (const [symbol, interval, step] of [['ETHUSDT', '15m', 900000], ['ETHUSDT', '1h', 3600000], ['ETHUSDT', '4h', FOUR_HOUR_MS], ['BTCUSDT', '15m', 900000], ['BTCUSDT', '1h', 3600000], ['BTCUSDT', '4h', FOUR_HOUR_MS]])
+    await seedBarsBatch(symbol, interval, step, RHYTHM_END);
+  // FeatureEngine自身要求15m/1h窗口有足够回看深度（"Critical ETH 15m window missing"）；这与"offset -32边界必须不可见"
+  // 的节奏测试目标无关，故用完全独立、更早、不重叠的一批15m/1h bar单独满足它，不扩大上面30根节奏测试窗口本身
+  const FEATURE_SEED_END = RHYTHM_END - 45 * 900000; // 早于节奏测试窗口(-29..0)与"未到边界"探测点(-32)，互不重叠
+  for (const [symbol, interval, step] of [['ETHUSDT', '15m', 900000], ['ETHUSDT', '1h', 3600000], ['BTCUSDT', '15m', 900000], ['BTCUSDT', '1h', 3600000]])
+    await seedBarsBatch(symbol, interval, step, FEATURE_SEED_END);
+  await seedFactAt('funding_rates', [{ symbol: 'ETHUSDT', fundingTime: seedFetchedAt - 1, fundingRate: '0.0001', markPrice: '1829' }], normalizeFunding);
+  await seedFactAt('open_interest', { symbol: 'ETHUSDT', time: seedFetchedAt - 1, openInterest: '100000' }, normalizeOpenInterest);
+  await seedFactAt('long_short_ratios', [{ symbol: 'ETHUSDT', timestamp: seedFetchedAt - 1, longShortRatio: '1.1', longAccount: '0.52', shortAccount: '0.48' }], normalizeLongShort, '15m');
+  await seedFactAt('taker_flow', [{ timestamp: seedFetchedAt - 1, buySellRatio: '1.2', buyVol: '120', sellVol: '100' }], normalizeTakerFlow, '15m');
+  // feature_record锚定在独立的FEATURE_SEED_END（远早于本测试全部轮询时刻，满足target_bar_close_time<=asOfTime恒成立，
+  // 且拥有自己完整的15m/1h回看窗口，不依赖节奏测试窗口本身的bar数量）
+  const featureResult = await new FeatureEngine({ repository: repo, now: () => seedFetchedAt + 1 }).generatePoint({ targetBarCloseTime: FEATURE_SEED_END, asOfTime: seedFetchedAt + 1 }, featureLease);
+  assert.ok(['INSERTED', 'DEDUPED'].includes(featureResult.status), `feature seed failed: ${featureResult.status}`);
+
+  const referenceBarCloseTimeOf = (result) => result.record?.referenceBarRef?.closeTime ?? result.record?.reference_bar_ref?.closeTime ?? null;
+  let currentAsOfTime = null;
+  const gen = new ForecastGenerator({ pool, holderId: 'v14c-rhythm-gen', serverTimeProvider: async () => ({ ok: true, sourceServerTime: currentAsOfTime }), leaseTtlMs: 60000 });
+  // offset单位=15分钟；-18..-17落在RHYTHM_END-28800000之前的未采集范围（应not due）；-16..-1落在[RHYTHM_END-14400000,RHYTHM_END)
+  // （应全部解析到同一个referenceBar=RHYTHM_END-14400000）；0..+2落在[RHYTHM_END,RHYTHM_END+1800000]（应全部解析到RHYTHM_END）
+  const offsets = Array.from({ length: 21 }, (_, i) => i - 18);
+  const results24 = [], results72 = [];
+  for (const offset of offsets) {
+    // +5000缓冲：每根bar的fetchedAt=其自身closeTime+1000（模拟收盘后短暂延迟才被采集到），轮询时刻需晚于该延迟
+    // 才能看到恰好落在边界上的那根bar；5000远小于15分钟步长，不影响落入哪一个节奏窗口的判定
+    currentAsOfTime = RHYTHM_END + offset * 900000 + 5000;
+    const r24 = await gen.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h' });
+    results24.push({ offset, status: r24.status, referenceBarCloseTime: referenceBarCloseTimeOf(r24) });
+    const r72 = await gen.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '72h' });
+    results72.push({ offset, status: r72.status, referenceBarCloseTime: referenceBarCloseTimeOf(r72) });
+  }
+
+  // 24H：恰好2次INSERTED（两个不同的4H边界），其余轮询要么BLOCKED（尚未到边界/数据未采集）要么DEDUPED（已生成过的同一边界）
+  const inserted24 = results24.filter(r => r.status === 'INSERTED');
+  assert.equal(inserted24.length, 2, `24H应恰好生成2次，实际:${JSON.stringify(results24)}`);
+  assert.deepEqual(inserted24.map(r => r.referenceBarCloseTime).sort((a, b) => a - b), [RHYTHM_END - FOUR_HOUR_MS, RHYTHM_END]);
+  assert.equal(results24.filter(r => r.status === 'BLOCKED').length, 2); // offset -18,-17
+  assert.equal(results24.filter(r => r.status === 'DEDUPED').length, offsets.length - 2 - 2);
+  // 高频轮询验证：offset -16..-1（16次轮询）全部解析到同一个referenceBar，只有第一次INSERTED，其余15次DEDUPED
+  const sameWindowPolls = results24.filter(r => r.offset >= -16 && r.offset <= -1);
+  assert.equal(sameWindowPolls.length, 16);
+  assert.ok(sameWindowPolls.every(r => r.referenceBarCloseTime === RHYTHM_END - FOUR_HOUR_MS));
+  assert.equal(sameWindowPolls.filter(r => r.status === 'INSERTED').length, 1);
+  assert.equal(sameWindowPolls.filter(r => r.status === 'DEDUPED').length, 15);
+
+  // 72H：恰好1次INSERTED（唯一命中的UTC自然日边界=RHYTHM_END），其余轮询要么not due（前一个日边界在采集范围外）要么DEDUPED
+  const inserted72 = results72.filter(r => r.status === 'INSERTED');
+  assert.equal(inserted72.length, 1, `72H应恰好生成1次，实际:${JSON.stringify(results72)}`);
+  assert.equal(inserted72[0].referenceBarCloseTime, RHYTHM_END);
+  assert.equal(results72.filter(r => r.status === 'BLOCKED').length, 18); // offset -18..-1均not due（上一个日边界在种子范围之外）
+  assert.equal(results72.filter(r => r.status === 'DEDUPED').length, 2); // offset +1,+2复用同一份RHYTHM_END快照
+
+  // 重启/双实例竞争：用全新的第二个Generator实例（不同holderId，模拟进程重启后重新acquire）在"当前窗口"再轮询一次，
+  // 必须确定性地解析到与第一个实例完全相同的referenceBar并DEDUPED，而不是产生新的、不同的样本
+  await pool.query("UPDATE collector_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE lease_name=$1", [LEASE_NAME]);
+  currentAsOfTime = RHYTHM_END + 900000;
+  const restarted = new ForecastGenerator({ pool, holderId: 'v14c-rhythm-gen-restarted', serverTimeProvider: async () => ({ ok: true, sourceServerTime: currentAsOfTime }), leaseTtlMs: 60000 });
+  const afterRestart24 = await restarted.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h' });
+  assert.equal(afterRestart24.status, 'DEDUPED');
+  assert.equal(referenceBarCloseTimeOf(afterRestart24), RHYTHM_END);
+  const afterRestart72 = await restarted.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '72h' });
+  assert.equal(afterRestart72.status, 'DEDUPED');
+  assert.equal(referenceBarCloseTimeOf(afterRestart72), RHYTHM_END);
 });

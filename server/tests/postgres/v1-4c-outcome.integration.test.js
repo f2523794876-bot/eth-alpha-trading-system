@@ -14,7 +14,7 @@ import { OutcomeEvaluator, LEASE_NAME } from '../../src/outcome/evaluator-servic
 
 const url = process.env.TEST_DATABASE_URL, enabled = Boolean(url), pgtest = enabled ? test : test.skip;
 const FIFTEEN_MIN_MS = 900000, FOUR_HOUR_MS = 14400000;
-const END = 1_784_400_000_000;
+const END = 1_767_311_999_999; // P1-2修复：referenceBar须精确落在4H/UTC自然日边界，此值同时满足两者
 let pool, repo, seedLease, featureLease;
 
 const response = (body, receivedAt) => ({ body, requestId: randomUUID(), status: 200, headers: {}, startedAt: receivedAt - 1, receivedAt });

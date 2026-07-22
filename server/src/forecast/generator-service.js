@@ -41,11 +41,33 @@ function buildAuxiliaryConflictNotes(proxyState, auxiliaryEvidence) {
   return notes;
 }
 
+// P0-1修复：正式启动使用的默认生成目标——V1.4B FeatureEngine只对ETHUSDT产出feature_records（BTC仅作为联动输入信号，
+// 不是独立预测标的，同po-state-engine.js btcTrendState/ethBtcRollingCorrelation的输入定位），故只生成ETH的24H/72H两条。
+export const DEFAULT_GENERATION_TARGETS = Object.freeze([
+  Object.freeze({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h' }),
+  Object.freeze({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '72h' })
+]);
+
 export class ForecastGenerator {
-  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000 }) {
+  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000, logger = console }) {
     if (!pool || !holderId || typeof serverTimeProvider !== 'function') throw new Error('ForecastGenerator requires pool/holderId/serverTimeProvider');
-    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs;
-    this.timers = []; this.running = false; this.leaseLost = false; this.lease = null;
+    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs; this.logger = logger;
+    this.timers = []; this.heartbeatTimer = null; this.running = false; this.leaseLost = false; this.lease = null;
+    // 独立abortController（P0-1/P1-1要求）：不与CollectorService共享，仅表达本调度器自身的生命周期终止信号
+    this.abortController = new AbortController();
+  }
+
+  // P0-1修复：正式生产启动入口。独立于CollectorService（不同类实例、不同timers数组、不同running/lease状态、
+  // 不同abortController），只复用同一套已验证的collector_leases表结构与SQL模式（同表不同lease_name行）。
+  async start({ targets = DEFAULT_GENERATION_TARGETS, intervalMs = 5 * 60000, heartbeatIntervalMs = Math.floor(this.leaseTtlMs / 3) } = {}) {
+    if (this.running) throw Object.assign(new Error('Forecast generator already running'), { code: 'FORECAST_GENERATOR_ALREADY_RUNNING' });
+    this.abortController = new AbortController();
+    const lease = await this.acquireLease();
+    if (!lease) throw Object.assign(new Error('Forecast generator lease held by another holder'), { code: 'FORECAST_GENERATOR_LEASE_HELD' });
+    this.running = true; this.leaseLost = false;
+    this.schedule(intervalMs, targets);
+    this.scheduleHeartbeat(heartbeatIntervalMs);
+    return this.status();
   }
 
   schedule(intervalMs, targets) {
@@ -57,8 +79,61 @@ export class ForecastGenerator {
     };
     this.timers.push(setTimeout(tick, intervalMs));
   }
-  clearSchedulers() { this.running = false; for (const t of this.timers) clearTimeout(t); this.timers = []; }
-  loseLease() { this.leaseLost = true; this.lease = null; this.clearSchedulers(); }
+
+  // P1-1修复（Codex复审）：60秒默认lease若无人续约，下一轮transaction()内assertLease()必然因token过期抛
+  // FENCING_TOKEN_REJECTED，永久停止调度——此前遗漏心跳环节。复用CollectorService（server/src/collector/service.js
+  // heartbeat()/schedule()）已验证的心跳模式：独立定时器链、续约失败立即loseLease()自行停止，不影响OutcomeEvaluator。
+  scheduleHeartbeat(intervalMs = Math.floor(this.leaseTtlMs / 3)) {
+    const tick = async () => {
+      if (!this.running) return;
+      try { await this.heartbeat(); }
+      catch (error) { this.logger?.error?.('forecast generator heartbeat failed', { code: error.code || error.message }); }
+      if (this.running) this.heartbeatTimer = setTimeout(tick, intervalMs);
+    };
+    this.heartbeatTimer = setTimeout(tick, intervalMs);
+  }
+
+  async heartbeat() {
+    if (!this.lease) throw Object.assign(new Error('No active forecast generator lease to heartbeat'), { code: 'LEASE_LOST' });
+    const result = await this.pool.query(
+      `UPDATE collector_leases SET heartbeat_at=clock_timestamp(),expires_at=clock_timestamp()+($4||' milliseconds')::interval
+       WHERE lease_name=$1 AND holder_id=$2 AND fencing_token=$3 AND expires_at>clock_timestamp()
+       RETURNING lease_name AS "leaseName",holder_id AS "holderId",fencing_token::bigint AS "fencingToken",expires_at AS "expiresAt"`,
+      [LEASE_NAME, this.holderId, this.lease.fencingToken, this.leaseTtlMs]
+    );
+    const renewed = result.rows[0] || null;
+    if (!renewed) { this.loseLease('LEASE_LOST'); throw Object.assign(new Error('Forecast generator lease lost'), { code: 'LEASE_LOST' }); }
+    this.lease = renewed;
+    return renewed;
+  }
+
+  clearSchedulers() {
+    this.running = false;
+    for (const t of this.timers) clearTimeout(t);
+    this.timers = [];
+    if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
+  }
+  loseLease(reason = 'LEASE_LOST') {
+    if (this.leaseLost) return;
+    this.leaseLost = true; this.lease = null;
+    this.clearSchedulers();
+    this.abortController.abort(reason);
+  }
+
+  // P0-1修复：graceful shutdown——停止调度、终止abortController、不额外关闭pool（pool由bootstrap统一生命周期管理，
+  // 与CollectorService.stop()的closeRepository参数模式一致，但ForecastGenerator本身不持有repository实例）。
+  async stop() {
+    this.running = false;
+    this.clearSchedulers();
+    this.abortController.abort('shutdown');
+  }
+
+  status() {
+    return {
+      running: this.running, holderId: this.holderId, leaseLost: this.leaseLost,
+      lease: this.lease ? { leaseName: this.lease.leaseName, holderId: this.lease.holderId, fencingToken: this.lease.fencingToken, expiresAt: this.lease.expiresAt } : null
+    };
+  }
 
   async acquireLease() {
     const result = await this.pool.query(
@@ -143,7 +218,9 @@ export class ForecastGenerator {
     };
 
     const located = await locateReferenceBarAndPath(client, { instrument, horizon, asOfTime, symbol });
-    if (!located.referenceBarRef) return blocked('REFERENCE_BAR_MISSING', located.exclusionReasons);
+    // P1-2修复：referenceBar未命中horizon节奏边界（24H=4小时/72H=UTC自然日）也会走到这里，属于正常的"本轮尚未到生成
+    // 时刻"，不是数据缺陷——高频轮询在两次节奏边界之间反复命中此分支正是"不得凑样本量"红线的预期行为。
+    if (!located.referenceBarRef) return blocked('REFERENCE_BAR_NOT_DUE_OR_MISSING', located.exclusionReasons);
 
     const atr = await computeFourHourAtr14(client, { instrument, asOfTime });
     if (!atr.ok) return blocked('ATR14_4H_INSUFFICIENT', [atr.reason]);

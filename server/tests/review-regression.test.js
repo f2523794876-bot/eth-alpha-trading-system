@@ -52,3 +52,42 @@ test('V1_4C_SCOPE_SPEC.md §16第8步：V1.4C三组真实PostgreSQL测试与pack
 });
 
 test('真实链保留生产数据库写入断言且仅精确451调用SKIP',async()=>{const source=await readFile(new URL('./live/postgres-live-e2e.test.js',import.meta.url),'utf8');assert.match(source,/runLiveRestOperation/);assert.match(source,/t\.skip\('EXTERNAL_REGION_BLOCKED/);for(const productionCall of ['collector.collectBars','collector.collectPoint','collector.collectBarsFromResponse','collector.readiness'])assert.ok(source.includes(productionCall),productionCall);assert.doesNotMatch(source,/MemoryRepository/);});
+
+test('Codex复审P0-1修复：ForecastGenerator/OutcomeEvaluator已接入生产启动入口，独立于CollectorService的start/stop',async()=>{
+  const indexSource=await readFile(new URL('../src/index.js',import.meta.url),'utf8');
+  assert.match(indexSource,/import\s*\{\s*ForecastGenerator\s*\}\s*from\s*'\.\/forecast\/generator-service\.js'/,'index.js必须导入ForecastGenerator');
+  assert.match(indexSource,/import\s*\{\s*OutcomeEvaluator\s*\}\s*from\s*'\.\/outcome\/evaluator-service\.js'/,'index.js必须导入OutcomeEvaluator');
+  assert.match(indexSource,/new ForecastGenerator\(/,'index.js必须实例化ForecastGenerator');
+  assert.match(indexSource,/new OutcomeEvaluator\(/,'index.js必须实例化OutcomeEvaluator');
+  assert.match(indexSource,/forecastGenerator\.start\(\)/,'bootstrap()必须调用forecastGenerator.start()');
+  assert.match(indexSource,/outcomeEvaluator\.start\(\)/,'bootstrap()必须调用outcomeEvaluator.start()');
+  assert.match(indexSource,/forecastGenerator\.stop\(\)/,'graceful shutdown必须包含forecastGenerator.stop()');
+  assert.match(indexSource,/outcomeEvaluator\.stop\(\)/,'graceful shutdown必须包含outcomeEvaluator.stop()');
+  // 两者必须各自持有独立holderId（不得与collector共用同一个collectorId直接作为holderId，避免与primary-collector lease混淆）
+  assert.match(indexSource,/forecast-generator/);
+  assert.match(indexSource,/outcome-evaluator/);
+});
+
+test('Codex复审P1-1修复：Generator/Evaluator各自实现独立heartbeat续约与graceful shutdown（复用CollectorService心跳模式）',async()=>{
+  const genSource=await readFile(new URL('../src/forecast/generator-service.js',import.meta.url),'utf8');
+  const evalSource=await readFile(new URL('../src/outcome/evaluator-service.js',import.meta.url),'utf8');
+  for(const [name,source] of [['generator-service.js',genSource],['evaluator-service.js',evalSource]]){
+    assert.match(source,/async start\(/,`${name}缺少start()生产启动方法`);
+    assert.match(source,/async heartbeat\(\)/,`${name}缺少heartbeat()续约方法`);
+    assert.match(source,/scheduleHeartbeat\(/,`${name}缺少独立心跳定时器scheduleHeartbeat()`);
+    assert.match(source,/UPDATE collector_leases SET heartbeat_at=clock_timestamp\(\)/,`${name}的heartbeat()必须真正续约expires_at，而非空实现`);
+    assert.match(source,/this\.loseLease\('LEASE_LOST'\)/,`${name}续约失败必须调用loseLease()立即停止自身调度`);
+    assert.match(source,/this\.abortController\s*=\s*new AbortController\(\)/,`${name}必须持有独立abortController`);
+    assert.match(source,/async stop\(\)/,`${name}缺少graceful shutdown的stop()方法`);
+  }
+});
+
+test('Codex复审P1-2修复：referenceBar选择须精确对齐生成节奏边界，不再是"最近一根已收盘bar"',async()=>{
+  const locatorSource=await readFile(new URL('../src/forecast/bar-path-locator.js',import.meta.url),'utf8');
+  assert.match(locatorSource,/export function computeAlignedReferenceCloseTime/,'bar-path-locator.js必须导出节奏边界计算函数');
+  assert.match(locatorSource,/close_time=to_timestamp\(\$2\/1000\.0\)/,'referenceBar查询必须是精确相等匹配对齐边界，不得用ORDER BY ... LIMIT 1回退到"最近一根"');
+  assert.doesNotMatch(locatorSource,/ORDER BY open_time DESC, revision_number DESC LIMIT 1[\s\S]{0,50}\[instrument, asOfTime\]/,'referenceBar查询不得再退化为"最近一根已收盘bar"模式');
+  const testResultsSource=await readFile(new URL('../../V1_4C_TEST_RESULTS.md',import.meta.url),'utf8');
+  assert.doesNotMatch(testResultsSource,/天然保证/,'V1_4C_TEST_RESULTS.md不得再声称生成节奏由UNIQUE(prediction_id)"天然保证"——该结论已被Codex复审判定为错误并更正');
+  assert.match(testResultsSource,/computeAlignedReferenceCloseTime|节奏边界|RHYTHM_END/,'V1_4C_TEST_RESULTS.md必须记录P1-2节奏门禁的真实验证方式（而非UNIQUE约束）');
+});

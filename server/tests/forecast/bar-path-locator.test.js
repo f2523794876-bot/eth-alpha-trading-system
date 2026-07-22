@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { computeFourHourAtr14, computeConsecutiveBreakoutBars, locateReferenceBarAndPath, locatePathForEvaluation } from '../../src/forecast/bar-path-locator.js';
 
-const FOUR_HOUR_MS = 14400000, TIMEFRAME_MS = 900000;
+const FOUR_HOUR_MS = 14400000, TIMEFRAME_MS = 900000, ONE_DAY_MS = 86400000;
 
 function toRow(b) {
   return { open_time: new Date(b.open_time), close_time: new Date(b.close_time), open: String(b.open ?? 100), high: String(b.high ?? 101), low: String(b.low ?? 99), close: String(b.close ?? 100), revision_number: b.revision_number ?? 0 };
@@ -117,16 +117,38 @@ test('computeConsecutiveBreakoutBars：向下跌破对称计算', async () => {
   assert.equal(result.count, 3);
 });
 
-test('locateReferenceBarAndPath：referenceBar恒选取as-of时刻最近的一根已收盘bar', async () => {
-  const bars15m = genContiguous(5, TIMEFRAME_MS, 0);
+// Codex复审P1-2修复：referenceBar不再是"as-of时刻最近一根已收盘bar"，而必须精确落在horizon节奏边界上
+// （24H=4小时边界，72H=UTC自然日边界）——否则每次15m轮询都会产生不同referenceBar/predictionId，
+// UNIQUE(prediction_id)对此完全无效（见bar-path-locator.js computeAlignedReferenceCloseTime注释）。
+test('locateReferenceBarAndPath：24H referenceBar必须精确落在4小时边界上，边界内轮询复用同一根，边界前not due', async () => {
+  const boundaryClose = FOUR_HOUR_MS - 1; // 第一个正的4H边界收盘时间
+  const bars15m = genContiguous(16, TIMEFRAME_MS, 0); // 16根15m恰好一个4H周期，最后一根（index15）落在边界上
   const q = makeQueryable([], bars15m);
-  const result = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '24h', asOfTime: bars15m[2].close_time, symbol: 'ETH' });
-  assert.equal(result.referenceBarRef.sequenceIndex, 0);
-  assert.equal(result.referenceBarRef.closeTime, bars15m[2].close_time);
+  const onBoundary = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '24h', asOfTime: boundaryClose, symbol: 'ETH' });
+  assert.equal(onBoundary.referenceBarRef.sequenceIndex, 0);
+  assert.equal(onBoundary.referenceBarRef.closeTime, boundaryClose);
+  // 边界之后、下一个4H边界之前的任意轮询时刻，仍解析到同一根referenceBar（不会产生新的、不同的referenceBar）
+  const midWindow = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '24h', asOfTime: boundaryClose + 5 * TIMEFRAME_MS, symbol: 'ETH' });
+  assert.equal(midWindow.referenceBarRef?.closeTime, boundaryClose);
+  // 第一个边界到达之前轮询：not due，不得退而求其次选用邻近已收盘bar顶替
+  const beforeBoundary = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '24h', asOfTime: bars15m[2].close_time, symbol: 'ETH' });
+  assert.equal(beforeBoundary.referenceBarRef, null);
+  assert.deepEqual(beforeBoundary.exclusionReasons, ['reference_bar_not_due_or_missing']);
+});
+
+test('locateReferenceBarAndPath：72H referenceBar对齐UTC自然日边界（比4H边界更粗），不与24H共用同一节奏', async () => {
+  const dayBoundaryClose = ONE_DAY_MS - 1;
+  const fourHourBoundaryClose = FOUR_HOUR_MS - 1; // 同样是"4H边界"但不是"日边界"
+  const q = makeQueryable([], genContiguous(97, TIMEFRAME_MS, 0));
+  const at4hBoundaryOnly = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '72h', asOfTime: fourHourBoundaryClose, symbol: 'ETH' });
+  assert.equal(at4hBoundaryOnly.referenceBarRef, null); // 4H边界不等于日边界，72H在此时刻仍not due
+  const atDayBoundary = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '72h', asOfTime: dayBoundaryClose, symbol: 'ETH' });
+  assert.equal(atDayBoundary.referenceBarRef?.closeTime, dayBoundaryClose);
 });
 
 test('locateReferenceBarAndPath：生成时刻(asOfTime=referenceBar自身收盘时间)目标路径尚不存在，96根全部missing，pathDataComplete=false（符合"生成时路径必然未来"的真实语义，回填由locatePathForEvaluation在到期后独立完成）', async () => {
-  const bars15m = genContiguous(1, TIMEFRAME_MS, 0);
+  const boundaryOpen = FOUR_HOUR_MS - TIMEFRAME_MS; // 使该唯一bar的closeTime恰好落在4H边界
+  const bars15m = genContiguous(1, TIMEFRAME_MS, boundaryOpen);
   const q = makeQueryable([], bars15m);
   const result = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '24h', asOfTime: bars15m[0].close_time, symbol: 'ETH' });
   assert.equal(result.endpointDataComplete, false);
@@ -139,7 +161,7 @@ test('locateReferenceBarAndPath：referenceBar缺失 => endpointDataComplete=fal
   const q = makeQueryable([], []);
   const result = await locateReferenceBarAndPath(q, { instrument: 'ETHUSDT', horizon: '24h', asOfTime: 1_000_000, symbol: 'ETH' });
   assert.equal(result.endpointDataComplete, false);
-  assert.deepEqual(result.exclusionReasons, ['reference_bar_missing']);
+  assert.deepEqual(result.exclusionReasons, ['reference_bar_not_due_or_missing']);
 });
 
 test('locatePathForEvaluation：完整路径给出actualStartPrice/actualEndPrice/actualHigh/actualLow', async () => {

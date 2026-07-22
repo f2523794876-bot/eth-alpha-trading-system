@@ -27,10 +27,25 @@ function rowToSnapshot(row) {
 }
 
 export class OutcomeEvaluator {
-  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000, evaluationVersion = EVALUATION_VERSION }) {
+  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000, evaluationVersion = EVALUATION_VERSION, logger = console }) {
     if (!pool || !holderId || typeof serverTimeProvider !== 'function') throw new Error('OutcomeEvaluator requires pool/holderId/serverTimeProvider');
-    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs; this.evaluationVersion = evaluationVersion;
-    this.timers = []; this.running = false; this.leaseLost = false; this.lease = null;
+    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs; this.evaluationVersion = evaluationVersion; this.logger = logger;
+    this.timers = []; this.heartbeatTimer = null; this.running = false; this.leaseLost = false; this.lease = null;
+    // 独立abortController（P0-1/P1-1要求）：不与ForecastGenerator或CollectorService共享
+    this.abortController = new AbortController();
+  }
+
+  // P0-1修复：正式生产启动入口，与ForecastGenerator完全独立（不同类实例、不同timers、不同running/lease状态、
+  // 不同abortController），只共享同一套collector_leases表结构（同表不同lease_name行）。
+  async start({ intervalMs = 5 * 60000, heartbeatIntervalMs = Math.floor(this.leaseTtlMs / 3) } = {}) {
+    if (this.running) throw Object.assign(new Error('Outcome evaluator already running'), { code: 'OUTCOME_EVALUATOR_ALREADY_RUNNING' });
+    this.abortController = new AbortController();
+    const lease = await this.acquireLease();
+    if (!lease) throw Object.assign(new Error('Outcome evaluator lease held by another holder'), { code: 'OUTCOME_EVALUATOR_LEASE_HELD' });
+    this.running = true; this.leaseLost = false;
+    this.schedule(intervalMs);
+    this.scheduleHeartbeat(heartbeatIntervalMs);
+    return this.status();
   }
 
   schedule(intervalMs) {
@@ -42,8 +57,58 @@ export class OutcomeEvaluator {
     };
     this.timers.push(setTimeout(tick, intervalMs));
   }
-  clearSchedulers() { this.running = false; for (const t of this.timers) clearTimeout(t); this.timers = []; }
-  loseLease() { this.leaseLost = true; this.lease = null; this.clearSchedulers(); }
+
+  // P1-1修复（Codex复审）：理由同generator-service.js scheduleHeartbeat()头部注释——独立定时器链、
+  // 续约失败立即loseLease()自行停止，不依赖也不影响ForecastGenerator的调度/心跳。
+  scheduleHeartbeat(intervalMs = Math.floor(this.leaseTtlMs / 3)) {
+    const tick = async () => {
+      if (!this.running) return;
+      try { await this.heartbeat(); }
+      catch (error) { this.logger?.error?.('outcome evaluator heartbeat failed', { code: error.code || error.message }); }
+      if (this.running) this.heartbeatTimer = setTimeout(tick, intervalMs);
+    };
+    this.heartbeatTimer = setTimeout(tick, intervalMs);
+  }
+
+  async heartbeat() {
+    if (!this.lease) throw Object.assign(new Error('No active outcome evaluator lease to heartbeat'), { code: 'LEASE_LOST' });
+    const result = await this.pool.query(
+      `UPDATE collector_leases SET heartbeat_at=clock_timestamp(),expires_at=clock_timestamp()+($4||' milliseconds')::interval
+       WHERE lease_name=$1 AND holder_id=$2 AND fencing_token=$3 AND expires_at>clock_timestamp()
+       RETURNING lease_name AS "leaseName",holder_id AS "holderId",fencing_token::bigint AS "fencingToken",expires_at AS "expiresAt"`,
+      [LEASE_NAME, this.holderId, this.lease.fencingToken, this.leaseTtlMs]
+    );
+    const renewed = result.rows[0] || null;
+    if (!renewed) { this.loseLease('LEASE_LOST'); throw Object.assign(new Error('Outcome evaluator lease lost'), { code: 'LEASE_LOST' }); }
+    this.lease = renewed;
+    return renewed;
+  }
+
+  clearSchedulers() {
+    this.running = false;
+    for (const t of this.timers) clearTimeout(t);
+    this.timers = [];
+    if (this.heartbeatTimer) { clearTimeout(this.heartbeatTimer); this.heartbeatTimer = null; }
+  }
+  loseLease(reason = 'LEASE_LOST') {
+    if (this.leaseLost) return;
+    this.leaseLost = true; this.lease = null;
+    this.clearSchedulers();
+    this.abortController.abort(reason);
+  }
+
+  async stop() {
+    this.running = false;
+    this.clearSchedulers();
+    this.abortController.abort('shutdown');
+  }
+
+  status() {
+    return {
+      running: this.running, holderId: this.holderId, leaseLost: this.leaseLost,
+      lease: this.lease ? { leaseName: this.lease.leaseName, holderId: this.lease.holderId, fencingToken: this.lease.fencingToken, expiresAt: this.lease.expiresAt } : null
+    };
+  }
 
   async acquireLease() {
     const result = await this.pool.query(

@@ -14,7 +14,7 @@ import { OutcomeEvaluator, LEASE_NAME as EVALUATOR_LEASE } from '../../src/outco
 
 const url = process.env.TEST_DATABASE_URL, enabled = Boolean(url), pgtest = enabled ? test : test.skip;
 const FIFTEEN_MIN_MS = 900000, FOUR_HOUR_MS = 14400000;
-const END = 1_784_400_000_000;
+const END = 1_767_311_999_999; // P1-2修复：referenceBar须精确落在4H/UTC自然日边界，此值同时满足两者
 let pool, repo, seedLease, featureLease;
 
 const response = (body, receivedAt) => ({ body, requestId: randomUUID(), status: 200, headers: {}, startedAt: receivedAt - 1, receivedAt });
@@ -158,4 +158,92 @@ pgtest('Generator无写forecast_outcome_events的能力（结构性验证），�
       [snapshot.prediction_id, runRow.evaluation_run_id, '1'.repeat(64)]
     ), error => error.code === '23514');
   }
+});
+
+// Codex复审P0-1/P1-1修复专项：正式start()/stop()生产接线 + 独立心跳续约（复用CollectorService已验证的心跳模式）。
+// 此前两个调度器只有类定义、从未接入生产启动入口，且60秒默认lease无人续约、下一轮必然因token过期loseLease永久停止——
+// 本组测试用真实PostgreSQL时间推进证明：心跳能跨越多个lease TTL周期继续工作、续约失败后真正停止且无残行、
+// 一方续约失败不影响另一方。
+pgtest('P0-1/P1-1修复：start()真实启动Generator/Evaluator，独立running/heartbeatTimer/abortController', async () => {
+  await expireBothLeases();
+  const gen = new ForecastGenerator({ pool, holderId: 'v14c-lc-start-gen', serverTimeProvider: okServerTime(END), leaseTtlMs: 60000 });
+  const evaluator = new OutcomeEvaluator({ pool, holderId: 'v14c-lc-start-eval', serverTimeProvider: okServerTime(END), leaseTtlMs: 60000, evaluationVersion: 'v1.4c-lc-start-test' });
+  await gen.start({ intervalMs: 10_000 });
+  await evaluator.start({ intervalMs: 10_000 });
+  assert.equal(gen.running, true);
+  assert.equal(evaluator.running, true);
+  assert.ok(gen.heartbeatTimer, 'Generator心跳定时器必须已启动');
+  assert.ok(evaluator.heartbeatTimer, 'Evaluator心跳定时器必须已启动');
+  assert.notEqual(gen.abortController, evaluator.abortController); // 独立abortController，不共享引用
+  assert.notEqual(gen.timers, evaluator.timers); // 独立定时器数组
+  const rows = await pool.query("SELECT lease_name,holder_id FROM collector_leases WHERE lease_name IN ($1,$2) ORDER BY lease_name", [GENERATOR_LEASE, EVALUATOR_LEASE]);
+  assert.equal(rows.rows.find(r => r.lease_name === GENERATOR_LEASE).holder_id, 'v14c-lc-start-gen');
+  assert.equal(rows.rows.find(r => r.lease_name === EVALUATOR_LEASE).holder_id, 'v14c-lc-start-eval');
+  await gen.stop(); await evaluator.stop();
+  assert.equal(gen.running, false);
+  assert.equal(evaluator.running, false);
+  assert.equal(gen.abortController.signal.aborted, true);
+  assert.equal(evaluator.abortController.signal.aborted, true);
+});
+
+pgtest('P1-1修复：心跳独立续约，真实时间推进跨越多个lease TTL周期后仍继续工作（fencing_token不变，expires_at持续推进）', async () => {
+  await expireBothLeases();
+  const leaseTtlMs = 900;
+  const gen = new ForecastGenerator({ pool, holderId: 'v14c-lc-heartbeat-gen', serverTimeProvider: okServerTime(END), leaseTtlMs });
+  const evaluator = new OutcomeEvaluator({ pool, holderId: 'v14c-lc-heartbeat-eval', serverTimeProvider: okServerTime(END), leaseTtlMs, evaluationVersion: 'v1.4c-lc-heartbeat-test' });
+  // intervalMs设置得远大于本测试的真实等待时长，确保本测试期间只观察心跳、不触发生成/回填事务本身
+  await gen.start({ intervalMs: 60_000, heartbeatIntervalMs: 250 });
+  await evaluator.start({ intervalMs: 60_000, heartbeatIntervalMs: 250 });
+  const genFencingBefore = gen.lease.fencingToken, evalFencingBefore = evaluator.lease.fencingToken;
+  const expiresBefore = (await pool.query('SELECT lease_name,expires_at FROM collector_leases WHERE lease_name IN ($1,$2)', [GENERATOR_LEASE, EVALUATOR_LEASE])).rows;
+
+  await new Promise(resolve => setTimeout(resolve, leaseTtlMs * 3 + 500)); // 真实等待超过3个lease TTL周期
+
+  assert.equal(gen.running, true);
+  assert.equal(gen.leaseLost, false);
+  assert.equal(evaluator.running, true);
+  assert.equal(evaluator.leaseLost, false);
+  // 心跳只UPDATE heartbeat_at/expires_at，不改变fencing_token——证明是持续续约而非重新acquire
+  assert.equal(gen.lease.fencingToken, genFencingBefore);
+  assert.equal(evaluator.lease.fencingToken, evalFencingBefore);
+  const rowsAfter = await pool.query("SELECT lease_name, expires_at, fencing_token FROM collector_leases WHERE lease_name IN ($1,$2)", [GENERATOR_LEASE, EVALUATOR_LEASE]);
+  for (const row of rowsAfter.rows) {
+    assert.ok(row.expires_at.getTime() > Date.now(), `${row.lease_name} lease必须仍未过期（真实数据库时间）`);
+    const before = expiresBefore.find(r => r.lease_name === row.lease_name);
+    assert.ok(row.expires_at.getTime() > before.expires_at.getTime(), `${row.lease_name} expires_at必须持续被心跳推进`);
+  }
+  await gen.stop(); await evaluator.stop();
+});
+
+pgtest('P1-1修复：心跳续约失败后真正停止调度，不留旧fencing token残行；另一调度器不受影响', async () => {
+  await expireBothLeases();
+  const leaseTtlMs = 900;
+  const gen = new ForecastGenerator({ pool, holderId: 'v14c-lc-hbfail-gen', serverTimeProvider: okServerTime(END), leaseTtlMs });
+  const evaluator = new OutcomeEvaluator({ pool, holderId: 'v14c-lc-hbfail-eval', serverTimeProvider: okServerTime(END), leaseTtlMs, evaluationVersion: 'v1.4c-lc-hbfail-test' });
+  await gen.start({ intervalMs: 60_000, heartbeatIntervalMs: 250 });
+  await evaluator.start({ intervalMs: 60_000, heartbeatIntervalMs: 250 });
+  assert.equal(gen.running, true);
+  assert.equal(evaluator.running, true);
+
+  // 模拟Generator的lease被另一实例抢占（真实推进fencing_token，使当前持有的token失效），不触碰Evaluator的lease行
+  await pool.query('UPDATE collector_leases SET fencing_token=fencing_token+1 WHERE lease_name=$1', [GENERATOR_LEASE]);
+  const beforeGenRuns = Number((await pool.query('SELECT count(*) FROM forecast_generation_runs')).rows[0].count);
+
+  await new Promise(resolve => setTimeout(resolve, 250 + 500)); // 等待心跳定时器真正触发一次（真实时间推进）
+
+  assert.equal(gen.running, false, 'Generator心跳续约失败后必须真正停止');
+  assert.equal(gen.leaseLost, true);
+  assert.equal(gen.abortController.signal.aborted, true);
+  assert.equal(gen.heartbeatTimer, null, '停止后心跳定时器必须被清除，不得继续触发');
+  assert.equal(gen.timers.length, 0, '停止后生成轮询定时器必须被清除');
+  // Evaluator完全不受影响，继续正常运行并持续心跳
+  assert.equal(evaluator.running, true);
+  assert.equal(evaluator.leaseLost, false);
+
+  await new Promise(resolve => setTimeout(resolve, 1000)); // 继续等待，确认Generator真的永久停止，不会自行恢复
+  const afterGenRuns = Number((await pool.query('SELECT count(*) FROM forecast_generation_runs')).rows[0].count);
+  assert.equal(afterGenRuns, beforeGenRuns, '停止后不得再产生任何forecast_generation_runs残行（含使用旧token的写入）');
+  assert.equal(evaluator.running, true, 'Evaluator在Generator停止后经过更长时间仍应继续运行');
+
+  await evaluator.stop();
 });

@@ -4,6 +4,21 @@ import { computeFourHourAtr14FromBars } from './threshold-formula.js';
 
 const TIMEFRAME_MS = 900000; // 15分钟，GMKG §10.1 BarRef.timeframeMs固定值
 const FOUR_HOUR_MS = 14400000;
+const ONE_DAY_MS = 86400000;
+
+// Codex复审P1-2修复：§7.6"24H每4小时最多生成一次(每根已收盘4H K线收盘时触发)、72H每日最多一次"要求referenceBar
+// 本身落在生成节奏边界上——不是"最近一根已收盘15m bar"。旧实现每次都取最新已收盘bar做referenceBar，导致每次15m
+// 轮询都产生不同referenceBarRef.closeTime→不同predictionId，UNIQUE(prediction_id)约束对此完全无效（不同逻辑预测
+// 本就允许并存）。边界时刻是asOfTime的纯算术函数，不依赖数据库状态或调用时机，保证重启/双实例竞争下确定性一致：
+// 同一asOfTime落在同一节奏窗口内，无论谁在何时查询，都解析到同一个（且只有一个）候选referenceBar closeTime。
+export function rhythmBoundaryMs(horizon) {
+  return horizon === '24h' ? FOUR_HOUR_MS : horizon === '72h' ? ONE_DAY_MS : null;
+}
+export function computeAlignedReferenceCloseTime(asOfTime, horizon) {
+  const boundary = rhythmBoundaryMs(horizon);
+  if (!boundary || !Number.isFinite(asOfTime)) return null;
+  return Math.floor((asOfTime + 1) / boundary) * boundary - 1;
+}
 
 const toMs = v => (v instanceof Date ? v.getTime() : Number(v));
 
@@ -75,15 +90,20 @@ export async function locateReferenceBarAndPath(queryable, { instrument, horizon
   const expectedBarCount = horizon === '24h' ? 96 : horizon === '72h' ? 288 : null;
   if (!expectedBarCount) throw Object.assign(new Error(`Invalid horizon: ${horizon}`), { code: 'INVALID_HORIZON' });
 
+  // referenceBar必须精确落在horizon节奏边界上（见上方computeAlignedReferenceCloseTime注释），用精确相等查询而非
+  // "最近一根已收盘bar"——若该边界时刻的bar尚未收盘/尚未采集到，视为"本轮尚未到生成时刻"，fail closed，不得退而求其
+  // 次选用邻近bar顶替（那会重新引入"每次轮询产生不同referenceBar"的P1-2缺陷）。
+  const alignedCloseTime = computeAlignedReferenceCloseTime(asOfTime, horizon);
   const refResult = await queryable.query(
     `SELECT open_time, close_time, close::text FROM market_bars
      WHERE instrument=$1 AND market_type='spot' AND interval_name='15m'
-       AND close_time<=to_timestamp($2/1000.0) AND available_at<=to_timestamp($2/1000.0) AND fetched_at<=to_timestamp($2/1000.0)
-     ORDER BY open_time DESC, revision_number DESC LIMIT 1`,
-    [instrument, asOfTime]
+       AND close_time=to_timestamp($2/1000.0)
+       AND available_at<=to_timestamp($3/1000.0) AND fetched_at<=to_timestamp($3/1000.0)
+     ORDER BY revision_number DESC LIMIT 1`,
+    [instrument, alignedCloseTime, asOfTime]
   );
   if (!refResult.rows[0]) {
-    return { referenceBarRef: null, targetBarRef: null, observedBars: [], missingBarRefs: [], endpointDataComplete: false, pathDataComplete: false, pathEligibleForStatistics: false, directionEligibleForStatistics: false, referencePrice: null, exclusionReasons: ['reference_bar_missing'] };
+    return { referenceBarRef: null, targetBarRef: null, observedBars: [], missingBarRefs: [], endpointDataComplete: false, pathDataComplete: false, pathEligibleForStatistics: false, directionEligibleForStatistics: false, referencePrice: null, exclusionReasons: ['reference_bar_not_due_or_missing'] };
   }
   const referenceBar = refResult.rows[0];
   const referenceBarRef = buildBarRef(referenceBar, 0, symbol);
