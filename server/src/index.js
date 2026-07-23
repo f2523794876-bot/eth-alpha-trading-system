@@ -16,9 +16,9 @@ export async function bootstrap(config=loadConfig()){
   // 类实例、timers、lease、abortController、running状态，互不共享调度状态；只共享同一个Postgres连接池与无状态的
   // measureServerTime()工具函数（不构成"调度状态共享"，同一份服务器时间校验逻辑本就该只有一处实现，见V1_4C_SCOPE_SPEC.md §7.5）。
   const forecastServerTime=()=>measureServerTime(adapter,{maxClockOffsetMs:config.maxClockOffsetMs});
-  const forecastGenerator=new ForecastGenerator({pool,holderId:`${config.collectorId}-forecast-generator`,serverTimeProvider:forecastServerTime,leaseTtlMs:config.leaseTtlMs});
+  const forecastGenerator=new ForecastGenerator({pool,holderId:`${config.collectorId}-forecast-generator`,serverTimeProvider:forecastServerTime,leaseTtlMs:config.leaseTtlMs,featureWaitMs:config.forecastFeatureWaitMs,featureWaitAttempts:config.forecastFeatureWaitAttempts});
   const outcomeEvaluator=new OutcomeEvaluator({pool,holderId:`${config.collectorId}-outcome-evaluator`,serverTimeProvider:forecastServerTime,leaseTtlMs:config.leaseTtlMs});
-  await collector.start();await api.start();await forecastGenerator.start();await outcomeEvaluator.start();
+  await collector.start();await api.start();await forecastGenerator.start({intervalMs:config.forecastPollMs});await outcomeEvaluator.start({intervalMs:config.outcomePollMs});
   let stopping=false;const stop=async signal=>{if(stopping)return;stopping=true;console.info('graceful shutdown',{signal});await api.stop();await Promise.allSettled([collector.stop(),forecastGenerator.stop(),outcomeEvaluator.stop()]);};
   process.once('SIGTERM',()=>stop('SIGTERM'));process.once('SIGINT',()=>stop('SIGINT'));
   return {collector,repository,api,forecastGenerator,outcomeEvaluator,stop};

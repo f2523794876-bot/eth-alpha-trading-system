@@ -1,5 +1,46 @@
 # V1_4C_TEST_RESULTS.md — V1.4C 服务器端预测基础设施测试结果
 
+## 0A. FeatureGenerator生产生命周期专项（2026-07-23）
+
+新增14项可在无数据库环境执行的行为测试：
+
+- 10项独立服务生命周期：新正式15m K线自动生成、时间键幂等、无K线安全空转、租约
+  互斥、过期接管、重启补漏、单目标故障隔离、心跳丢失停止、SIGTERM等待在途事务、
+  systemd独立服务/collector非强依赖。
+- 4项预测就绪门：精确reference时间键、稍晚特征有界重试、超时返回null并fail
+  closed、停止时中断等待。
+
+专项执行结果：**14 passed，0 failed，0 skipped**。
+
+真实PostgreSQL套件新增生产路径断言：独立服务扫描真实`market_bars`并写入精确
+`feature_records`，重复轮询仍只有一行；既有V1.4C forecast端到端测试同步改为为每个
+24h/72h reference边界生成精确特征，禁止旧特征回退。该套件需要隔离
+`TEST_DATABASE_URL`，当前受限Mac沙箱未提供PostgreSQL，留待CI/复审环境执行。组合
+门禁预期由原62项增至**63项**（13+5+9+17+10+9）；本地只验证到22项正确识别为
+SKIP，未把它们计为通过。
+
+本环境合并非联网扫描（`server/tests/*.test.js`、features、forecast）共258项：
+**247 passed，11 failed**。11项全部是API测试启动本机监听端口时被沙箱拒绝，错误均为
+`listen EPERM 127.0.0.1`；没有业务断言失败。拆除需要监听端口的API用例后，可执行的
+247项全部通过。该环境限制不得记为产品通过，CI/标准本机仍须重新执行完整命令并达到
+0失败。
+
+分组复核：
+
+- `server/tests/forecast/*.test.js`：**96 passed，0 failed**；
+- `feature-generator-service.test.js`：**10 passed，0 failed**；
+- `review-regression.test.js`：**17 passed，0 failed**；
+- 本轮涉及的PostgreSQL文件在未配置`TEST_DATABASE_URL`时：**22 skipped**，未冒充通过；
+- 两次构建产物SHA-256均为
+  `fe969b5d76cbecb4a19b47093ee698f12d38bbf01e0fd36b50dc1add3ac2c5c8`，且构建前后
+  正式HTML哈希不变。
+
+真实Binance REST在本沙箱执行13项：0 passed、10 failed、3 skipped。失败根因是环境
+DNS禁用（`ENOTFOUND api.binance.com`/`fapi.binance.com`，后续同端点触发
+`CIRCUIT_OPEN`）；3项REST+PostgreSQL因无`TEST_DATABASE_URL`跳过。该结果明确记为
+**环境阻塞/未验收**，不是产品通过，也没有用伪响应代替真实REST。复审或CI环境必须
+重新执行真实网络与真实PostgreSQL门禁。
+
 ## 0. 文档变更记录（Codex 独立复审 REQUEST CHANGES 后的修订）
 
 Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审判定 REQUEST CHANGES，指出三项问题（P0-1 两个调度器从未接入生产启动入口、P1-1 心跳续约缺失、P1-2 生成节奏门禁未真正实现），并指出本文档 §4 表格中"24H每4小时/72H每日生成节奏"一行错误地声称该上限单靠 `UNIQUE(prediction_id)` 约束即可自动成立——这一结论是**错误的**：不同的 `referenceBar.closeTime` 会产生不同的 `predictionId`，`UNIQUE(prediction_id)` 约束只能防止*同一个* `referenceBar` 被重复计为两条快照，无法阻止应用层对*不同* `referenceBar`（例如每次 15 分钟轮询都取"最新一根已收盘 bar"）反复生成，从而使 24H/72H 正式样本量随轮询频率线性增长。该结论已在本轮修订中更正，见 §4 与 §9（新增）。本文档 §2/§3/§6/§7/§8 的测试数量、通过结果也已同步更新为修复后的最终真实执行结果。

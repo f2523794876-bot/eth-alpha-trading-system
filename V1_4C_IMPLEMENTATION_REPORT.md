@@ -1,5 +1,46 @@
 # V1_4C_IMPLEMENTATION_REPORT.md — V1.4C 服务器端预测基础设施实施报告
 
+## 0A. 生产验证后永久修复：FeatureGenerator正式生命周期（2026-07-23）
+
+真实生产验证证明：行情采集、人工`features:generate`、24h/72h预测与结果回填各自可用，
+但生产入口只启动collector、ForecastGenerator和OutcomeEvaluator，FeatureEngine仅有
+一次性CLI，导致新15m正式K线之后没有自动特征，预测可能长期
+`FEATURE_RECORD_MISSING`。本轮不改变特征算法或预测规则，只补齐生产生命周期。
+
+### 调度设计
+
+1. 新增独立`FeatureGeneratorService`及独立systemd unit，租约固定为
+   `feature-generator`，具有心跳、过期接管、fencing、AbortSignal、在途事务等待和
+   SIGTERM释放租约。
+2. 启动立即扫描缺失时间键，之后默认每15秒扫描；只选择Binance服务器时间之前已正式
+   收盘、已available/fetched的ETHUSDT 15m K线。每轮默认最多32条，服务重启自动补漏。
+3. `feature_records`既有稳定自然键与事务fencing继续保证幂等；同一时间键不重复写入，
+   单目标失败记录在`feature_generation_runs.blocked_count`，不令collector退出。
+4. ForecastGenerator改为只读取与`referenceBar.closeTime`完全相等且版本匹配的特征。
+   默认2秒×最多4次有界等待；仍缺失则本轮`FEATURE_RECORD_MISSING`，下一轮自动重试。
+   禁止回退到上一根特征，因此不依赖两个5分钟定时器的偶然先后顺序。
+5. collector unit仅`Wants`特征服务而非`Requires`：特征故障不停止行情采集；预测仍
+   fail closed。ForecastGenerator/OutcomeEvaluator保持原独立租约和事务边界。
+
+### 本轮修改/新增
+
+- `server/src/features/generator-service.js`
+- `server/src/features/generator-service-entry.js`
+- `server/src/db/postgres.js`、`server/src/db/memory.js`
+- `server/src/forecast/generator-service.js`
+- `server/src/config.js`、`server/src/index.js`、`server/package.json`
+- `deploy/systemd/eth-alpha-feature-generator.service`
+- `deploy/systemd/eth-alpha-collector.service`
+- `server/tests/features/feature-generator-service.test.js`
+- `server/tests/forecast/feature-readiness.test.js`
+- `server/tests/postgres/v1-4b-feature.integration.test.js`
+- `server/tests/postgres/v1-4c-forecast.integration.test.js`
+- `server/tests/review-regression.test.js`
+- `server/README.md`、`V1_4_ACCEPTANCE_TESTS.md`及本轮两份V1.4C报告
+
+未执行生产数据库写入、未安装/启动systemd、未部署服务器。部署命令仅作为复审通过后的
+操作说明提供。
+
 ## 0. 本轮修订说明（Codex 独立复审 REQUEST CHANGES 后的修复）
 
 Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审给出 REQUEST CHANGES，要求修复三项问题：

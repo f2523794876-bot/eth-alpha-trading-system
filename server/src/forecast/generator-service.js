@@ -9,7 +9,7 @@ import { computeDirectionThreshold } from './threshold-formula.js';
 import { evaluatePoState } from './po-state-engine.js';
 import { finalizeForecastSnapshot, computeExpectedPriceZones, deriveExpectedDirection, computeRawScenarioScore, buildTriggerConditions, buildInvalidationConditions } from './forecast-contract.js';
 import { canonicalJsonHash } from '../domain/hash.js';
-import { FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION } from '../features/feature-version.js';
+import { FEATURE_ALGORITHM_VERSION, FEATURE_SET_VERSION, SOURCE_DATASET_VERSION } from '../features/feature-version.js';
 
 export const LEASE_NAME = 'forecast-generator';
 const AUXILIARY_EVIDENCE_FIELDS = ['fundingRate', 'fundingRateZScore', 'openInterest', 'openInterestChange', 'openInterestChangeRatio', 'longShortRatio', 'longShortRatioZScore', 'takerBuySellRatio', 'derivativesAvailability'];
@@ -49,9 +49,9 @@ export const DEFAULT_GENERATION_TARGETS = Object.freeze([
 ]);
 
 export class ForecastGenerator {
-  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000, logger = console }) {
+  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000, featureWaitMs = 2000, featureWaitAttempts = 4, logger = console }) {
     if (!pool || !holderId || typeof serverTimeProvider !== 'function') throw new Error('ForecastGenerator requires pool/holderId/serverTimeProvider');
-    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs; this.logger = logger;
+    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs; this.featureWaitMs = featureWaitMs; this.featureWaitAttempts = featureWaitAttempts; this.logger = logger;
     this.timers = []; this.heartbeatTimer = null; this.running = false; this.leaseLost = false; this.lease = null;
     // 独立abortController（P0-1/P1-1要求）：不与CollectorService共享，仅表达本调度器自身的生命周期终止信号
     this.abortController = new AbortController();
@@ -164,6 +164,31 @@ export class ForecastGenerator {
     } finally { client.release(); }
   }
 
+  async waitForExactFeature(client, { instrument, targetBarCloseTime, asOfTime }) {
+    const attempts = Math.max(1, Number(this.featureWaitAttempts) || 1);
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (this.abortController.signal.aborted) throw Object.assign(new Error('Forecast generator stopping'), { code: 'FORECAST_GENERATOR_STOPPING' });
+      const result = await client.query(
+        `SELECT feature_record_id, feature_values, quality_state, completeness FROM feature_records
+         WHERE symbol=$1 AND target_interval='15m' AND target_bar_close_time=to_timestamp($2/1000.0)
+           AND as_of_time<=to_timestamp($3/1000.0) AND feature_set_version=$4
+         ORDER BY revision_number DESC LIMIT 1`,
+        [instrument, targetBarCloseTime, asOfTime, FEATURE_SET_VERSION]
+      );
+      if (result.rows[0]) return { row: result.rows[0], attempts: attempt };
+      if (attempt < attempts) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, this.featureWaitMs);
+          this.abortController.signal.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(Object.assign(new Error('Forecast generator stopping'), { code: 'FORECAST_GENERATOR_STOPPING' }));
+          }, { once: true });
+        });
+      }
+    }
+    return { row: null, attempts };
+  }
+
   // forecast_snapshots.generation_run_id有NOT NULL外键指向本表，本方法必须先以INSERT在generateSnapshot开头"预占"该行
   // （status='RUNNING'），再由后续blocked()/成功路径用ON CONFLICT DO UPDATE原地更新最终状态——不得先插入forecast_snapshots
   // 再补记录run，否则违反外键约束（同一事务内，被引用行必须先于引用行存在）。
@@ -229,16 +254,18 @@ export class ForecastGenerator {
     try { threshold = computeDirectionThreshold({ atr14FourHourAtGeneration: atr.atr14FourHourAtGeneration, referencePrice: located.referencePrice, horizon }); }
     catch (error) { return blocked(error.code || 'THRESHOLD_COMPUTATION_FAILED', [error.message]); }
 
-    // feature_records.symbol是V1.4B交易对格式('ETHUSDT')，与本函数入参symbol('ETH'，GMKG输出instrument标签)含义不同；
-    // 必须使用instrument（'ETHUSDT'）查询，否则永远查不到已生成的feature_records行（symbol='ETH'从未被FeatureEngine写入过）
-    const featureResult = await client.query(
-      `SELECT feature_record_id, feature_values, quality_state, completeness FROM feature_records
-       WHERE symbol=$1 AND target_interval='15m' AND target_bar_close_time<=to_timestamp($2/1000.0) AND as_of_time<=to_timestamp($2/1000.0)
-       ORDER BY target_bar_close_time DESC, revision_number DESC LIMIT 1`,
-      [instrument, asOfTime]
-    );
-    const featureRow = featureResult.rows[0];
-    if (!featureRow) return blocked('FEATURE_RECORD_MISSING', ['no as-of visible feature_records row']);
+    // 预测必须消费与referenceBar完全相同时间键的特征。旧实现按“<= asOfTime取最近一条”会在新特征尚未生成时
+    // 静默复用上一根K线特征。这里做有限次、可中止等待；超过上限仍未就绪就fail closed，交由下一调度周期重试。
+    const featureResult = await this.waitForExactFeature(client, {
+      instrument,
+      targetBarCloseTime: located.referenceBarRef.closeTime,
+      asOfTime
+    });
+    const featureRow = featureResult.row;
+    if (!featureRow) return blocked('FEATURE_RECORD_MISSING', [
+      `exact feature not ready: ${instrument}/15m/${located.referenceBarRef.closeTime}`,
+      `bounded attempts exhausted: ${featureResult.attempts}`
+    ]);
     const fv = featureRow.feature_values;
 
     const [breakoutCount, breakdownCount] = await Promise.all([

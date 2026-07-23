@@ -6,6 +6,7 @@ import {runMigrations} from '../../src/db/migrate.js';
 import {normalizeKlines,normalizeFunding,normalizeOpenInterest,normalizeLongShort,normalizeTakerFlow} from '../../src/domain/normalize.js';
 import {canonicalJsonHash} from '../../src/domain/hash.js';
 import {FeatureEngine} from '../../src/features/feature-engine.js';
+import {FeatureGeneratorService} from '../../src/features/generator-service.js';
 
 const url=process.env.TEST_DATABASE_URL,enabled=Boolean(url),pgtest=enabled?test:test.skip,END=1_784_400_000_000;
 let pool,repo,lease;
@@ -20,3 +21,19 @@ pgtest('003迁移真实建立特征表、合法多空比种子写库并通过时
 pgtest('真实PostgreSQL as-of生产链生成54项特征与完整lineage',async()=>{const result=await new FeatureEngine({repository:repo,now:()=>END+1}).generatePoint({targetBarCloseTime:END},lease);assert.equal(result.status,'INSERTED');const stored=await repo.getFeatureById(result.record.featureId);assert.equal(Object.keys(stored.feature_values).length,54);const refs=await repo.getFeatureLineage(result.record.featureId);assert.ok(refs.length>=180);assert.ok(refs.every(x=>x.available_at.getTime()<=END));});
 pgtest('相同输入幂等DEDUPED，内容变化原子追加revision事件',async()=>{const engine=new FeatureEngine({repository:repo,now:()=>END+2}),same=await engine.generatePoint({targetBarCloseTime:END},lease);assert.equal(same.status,'DEDUPED');const open=END-899999,row=[open,'1828','1832','1826','1830','129',END,'236000',10,'70','128000','0'],r=response([row]),rawPayloadId=await repo.saveRaw(r,{sourceId:'binance-spot-rest',endpointId:'binance-spot-klines',contentHash:canonicalJsonHash([row]),schemaVersion:'v1.4a-server-schema-1',qualityState:'NORMAL'},lease),normalized=normalizeKlines({rows:[row],sourceId:'binance-spot-rest',endpointId:'binance-spot-klines',instrument:'ETHUSDT',marketType:'spot',interval:'15m',serverTime:END,fetchedAt:END,rawPayloadId,requestId:r.requestId});await repo.upsertMarketBars(normalized.formal,lease);const revised=await engine.generatePoint({targetBarCloseTime:END},lease);assert.equal(revised.status,'REVISED');assert.equal(Number((await pool.query('SELECT count(*) FROM feature_revision_events')).rows[0].count),1);assert.equal(Number((await pool.query('SELECT count(*) FROM feature_records')).rows[0].count),2);});
 pgtest('feature来源引用无孤儿且旧fencing token被数据库拒绝',async()=>{assert.equal(Number((await pool.query('SELECT count(*) FROM feature_source_refs r LEFT JOIN feature_records f ON f.feature_record_id=r.feature_record_id WHERE f.feature_record_id IS NULL')).rows[0].count),0);await pool.query("UPDATE collector_leases SET expires_at=clock_timestamp()-interval '1 second' WHERE lease_name='feature-generator'");await assert.rejects(new FeatureEngine({repository:repo,now:()=>END+3}).generatePoint({targetBarCloseTime:END},lease),e=>e.code==='FENCING_TOKEN_REJECTED');});
+pgtest('独立FeatureGenerator服务发现新正式15m时间键并经真实PostgreSQL幂等补生成',async()=>{
+  const nextClose=END+900000,nextOpen=nextClose-899999,row=[nextOpen,'1829','1833','1827','1831','130',nextClose,'238030',10,'71','130001','0'],r=response([row],nextClose+1000);
+  const collectorLease=await repo.acquireLease('primary-collector','v14c-feature-service-seed',60000);
+  const rawPayloadId=await repo.saveRaw(r,{sourceId:'binance-spot-rest',endpointId:'binance-spot-klines',contentHash:canonicalJsonHash([row]),schemaVersion:'v1.4a-server-schema-1',qualityState:'NORMAL'},collectorLease);
+  const normalized=normalizeKlines({rows:[row],sourceId:'binance-spot-rest',endpointId:'binance-spot-klines',instrument:'ETHUSDT',marketType:'spot',interval:'15m',serverTime:nextClose+1000,fetchedAt:nextClose+1000,rawPayloadId,requestId:r.requestId});
+  assert.equal(normalized.formal.length,1);
+  await repo.upsertMarketBars(normalized.formal,collectorLease);
+  const service=new FeatureGeneratorService({repository:repo,holderId:'v14c-feature-service',serverTimeProvider:async()=>({ok:true,sourceServerTime:nextClose+2000}),now:()=>nextClose+2000,leaseTtlMs:60000,pollMs:60000,logger:{info(){},warn(){},error(){}}});
+  await service.start();
+  const rows=await pool.query('SELECT * FROM feature_records WHERE symbol=$1 AND target_interval=$2 AND target_bar_close_time=to_timestamp($3/1000.0)',['ETHUSDT','15m',nextClose]);
+  assert.equal(rows.rowCount,1);
+  const repeated=await service.runOnce();
+  assert.equal(repeated.generated,0);
+  assert.equal((await pool.query('SELECT count(*)::int AS n FROM feature_records WHERE symbol=$1 AND target_interval=$2 AND target_bar_close_time=to_timestamp($3/1000.0)',['ETHUSDT','15m',nextClose])).rows[0].n,1);
+  await service.stop();
+});

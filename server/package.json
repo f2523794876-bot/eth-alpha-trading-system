@@ -22,6 +22,7 @@
     "test:postgres:v1.4c-lease": "node --test tests/postgres/v1-4c-lease-concurrency.integration.test.js",
     "maintenance:health": "node src/maintenance/cleanup-health.js",
     "features:generate": "node src/features/generate-features.js",
+    "features:serve": "node src/features/generator-service-entry.js",
     "check": "node --check src/index.js && node --test tests/*.test.js tests/forecast/*.test.js"
   },
   "dependencies": { "pg": "^8.16.3" }

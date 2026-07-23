@@ -1,7 +1,7 @@
 [Unit]
-Description=ETH Alpha V1.4A public market data collector
-After=network-online.target postgresql.service eth-alpha-feature-generator.service
-Wants=network-online.target eth-alpha-feature-generator.service
+Description=ETH Alpha V1.4C continuous feature generator
+After=network-online.target postgresql.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -10,7 +10,7 @@ Group=eth-alpha
 WorkingDirectory=/opt/eth-alpha/eth-alpha-trading-system/server
 EnvironmentFile=/etc/eth-alpha/collector.env
 ExecStartPre=/usr/bin/node /opt/eth-alpha/eth-alpha-trading-system/server/src/db/migrate.js up
-ExecStart=/usr/bin/node /opt/eth-alpha/eth-alpha-trading-system/server/src/index.js
+ExecStart=/usr/bin/node /opt/eth-alpha/eth-alpha-trading-system/server/src/features/generator-service-entry.js
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=60

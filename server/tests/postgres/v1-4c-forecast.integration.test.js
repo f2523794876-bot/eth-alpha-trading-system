@@ -333,10 +333,13 @@ pgtest('P1-2修复：连续多次15m轮询模拟——24H每4小时/72H每UTC自
   await seedFactAt('open_interest', { symbol: 'ETHUSDT', time: seedFetchedAt - 1, openInterest: '100000' }, normalizeOpenInterest);
   await seedFactAt('long_short_ratios', [{ symbol: 'ETHUSDT', timestamp: seedFetchedAt - 1, longShortRatio: '1.1', longAccount: '0.52', shortAccount: '0.48' }], normalizeLongShort, '15m');
   await seedFactAt('taker_flow', [{ timestamp: seedFetchedAt - 1, buySellRatio: '1.2', buyVol: '120', sellVol: '100' }], normalizeTakerFlow, '15m');
-  // feature_record锚定在独立的FEATURE_SEED_END（远早于本测试全部轮询时刻，满足target_bar_close_time<=asOfTime恒成立，
-  // 且拥有自己完整的15m/1h回看窗口，不依赖节奏测试窗口本身的bar数量）
-  const featureResult = await new FeatureEngine({ repository: repo, now: () => seedFetchedAt + 1 }).generatePoint({ targetBarCloseTime: FEATURE_SEED_END, asOfTime: seedFetchedAt + 1 }, featureLease);
-  assert.ok(['INSERTED', 'DEDUPED'].includes(featureResult.status), `feature seed failed: ${featureResult.status}`);
+  // 生产契约要求预测只能消费与referenceBar相同时间键的特征，不能回退到更早FEATURE_SEED_END的旧特征。
+  // 为本节奏测试会实际命中的两个reference边界各生成一条精确特征；FEATURE_SEED_END只负责补足历史窗口。
+  for (const targetBarCloseTime of [RHYTHM_END - FOUR_HOUR_MS, RHYTHM_END]) {
+    const featureResult = await new FeatureEngine({ repository: repo, now: () => targetBarCloseTime + 5000 })
+      .generatePoint({ targetBarCloseTime, asOfTime: targetBarCloseTime + 5000 }, featureLease);
+    assert.ok(['INSERTED', 'DEDUPED'].includes(featureResult.status), `exact feature seed failed at ${targetBarCloseTime}: ${featureResult.status}`);
+  }
 
   const referenceBarCloseTimeOf = (result) => result.record?.referenceBarRef?.closeTime ?? result.record?.reference_bar_ref?.closeTime ?? null;
   let currentAsOfTime = null;
