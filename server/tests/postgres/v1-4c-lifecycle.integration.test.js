@@ -42,15 +42,20 @@ async function safeEndPool(candidatePool) {
   try { await candidatePool.end(); } catch { /* 已关闭或正在关闭，清理路径本就允许重复调用 */ }
 }
 
-async function waitForBlockedLockRequest(adminPool, { relation = 'collector_leases', timeoutMs = 5000, pollMs = 20 } = {}) {
+// row级FOR UPDATE/FOR SHARE的真实等待在PostgreSQL里通常表现为等待方持有一条locktype='transactionid'的未授予
+// pg_locks行（等待持有冲突锁的那个事务结束），该行的relation/database列按文档定义为NULL——不能像table级锁那样
+// 用relation做过滤。同时用pg_stat_activity.wait_event_type='Lock'交叉确认（PostgreSQL用它标记"正在等待获取任意
+// 锁"的后端），两者任一命中即视为已探测到真实阻塞，避免依赖locktype的内部实现细节。
+async function waitForBlockedLockRequest(adminPool, { timeoutMs = 5000, pollMs = 20 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const result = await adminPool.query(
-      `SELECT count(*)::int AS n FROM pg_locks l
-       WHERE l.relation = $1::regclass AND NOT l.granted`,
-      [relation]
+      `SELECT
+         (SELECT count(*) FROM pg_locks WHERE NOT granted AND pid <> pg_backend_pid()) +
+         (SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND pid <> pg_backend_pid())
+       AS n`
     );
-    if (result.rows[0].n > 0) return true;
+    if (Number(result.rows[0].n) > 0) return true;
     await new Promise(resolve => setTimeout(resolve, pollMs));
   }
   return false;
@@ -58,7 +63,7 @@ async function waitForBlockedLockRequest(adminPool, { relation = 'collector_leas
 
 async function readLeaseRow(adminPool, leaseName) {
   const result = await adminPool.query(
-    'SELECT lease_name, holder_id, fencing_token::bigint AS "fencingToken", expires_at AS "expiresAt" FROM collector_leases WHERE lease_name=$1',
+    'SELECT lease_name, holder_id AS "holderId", fencing_token::bigint AS "fencingToken", expires_at AS "expiresAt" FROM collector_leases WHERE lease_name=$1',
     [leaseName]
   );
   return result.rows[0] || null;
@@ -88,7 +93,7 @@ async function expireLease(adminPool, leaseName) {
 // A. Lease释放：真实owner/token/fencing隔离（PG-1 / PG-2）
 // ============================================================
 
-pgtest('PG-1/PG-2 ForecastGenerator.releaseLease()：错误owner与旧token均不影响真实lease行，正确owner+token真实使其过期', async () => {
+pgtest('PG-1/PG-2 ForecastGenerator.releaseLease()：错误owner与旧token均不影响真实lease行，正确owner+token真实使其过期', { timeout: 30_000 }, async () => {
   await expireLease(pool, GENERATOR_LEASE);
   const gen = new ForecastGenerator({ pool, holderId: 'v14c-lifecycle-gen-release', serverTimeProvider: okServerTime(NEVER_DUE), leaseTtlMs: 60000 });
   const lease = await gen.acquireLease();
@@ -117,7 +122,7 @@ pgtest('PG-1/PG-2 ForecastGenerator.releaseLease()：错误owner与旧token均�
   assert.equal(String(after.fencingToken), String(lease.fencingToken));
 });
 
-pgtest('PG-1/PG-2 OutcomeEvaluator.releaseLease()：错误owner与旧token均不影响真实lease行，正确owner+token真实使其过期', async () => {
+pgtest('PG-1/PG-2 OutcomeEvaluator.releaseLease()：错误owner与旧token均不影响真实lease行，正确owner+token真实使其过期', { timeout: 30_000 }, async () => {
   await expireLease(pool, EVALUATOR_LEASE);
   const evaluator = new OutcomeEvaluator({ pool, holderId: 'v14c-lifecycle-eval-release', serverTimeProvider: okServerTime(NEVER_DUE), leaseTtlMs: 60000, evaluationVersion: 'v1.4c-lifecycle-eval-release' });
   const lease = await evaluator.acquireLease();
@@ -138,7 +143,7 @@ pgtest('PG-1/PG-2 OutcomeEvaluator.releaseLease()：错误owner与旧token均不
   assert.ok(after.expiresAt.getTime() <= Date.now(), '正确owner+token释放后必须真实过期');
 });
 
-pgtest('PG-1 stop()端到端路径：真实调用stop()后lease行在数据库中确实已过期', async () => {
+pgtest('PG-1 stop()端到端路径：真实调用stop()后lease行在数据库中确实已过期', { timeout: 30_000 }, async () => {
   await expireLease(pool, GENERATOR_LEASE);
   await expireLease(pool, EVALUATOR_LEASE);
   const gen = new ForecastGenerator({ pool, holderId: 'v14c-lifecycle-gen-e2e', serverTimeProvider: okServerTime(NEVER_DUE), leaseTtlMs: 60000 });
@@ -158,14 +163,15 @@ pgtest('PG-1 stop()端到端路径：真实调用stop()后lease行在数据库�
 //    而不是固定sleep：assertLease()的FOR SHARE在Postgres锁管理器层面真实阻塞，直到barrier被显式释放。
 // ============================================================
 
-pgtest('PG-3 ForecastGenerator.stop()在runOnce()真实事务被行锁阻塞期间不会提前返回，锁释放后才返回并完成lease收尾', async () => {
+pgtest('PG-3 ForecastGenerator.stop()在runOnce()真实事务被行锁阻塞期间不会提前返回，锁释放后才返回并完成lease收尾', { timeout: 30_000 }, async () => {
   await expireLease(pool, GENERATOR_LEASE);
   const gen = new ForecastGenerator({ pool, holderId: 'v14c-lifecycle-gen-block', serverTimeProvider: okServerTime(NEVER_DUE), leaseTtlMs: 60000 });
   await gen.start({ intervalMs: 10_000_000, heartbeatIntervalMs: 10_000_000 }); // acquireLease()以其自身独立的INSERT...ON CONFLICT提交，早于下方barrier加锁，不会自我阻塞
 
   const barrier = await acquireRowLockBarrier(pool, GENERATOR_LEASE);
+  let runPromise;
   try {
-    const runPromise = gen.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h' });
+    runPromise = gen.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h' });
     const blocked = await waitForBlockedLockRequest(pool, { timeoutMs: 5000 });
     assert.ok(blocked, 'runOnce()内assertLease()的FOR SHARE必须在真实PostgreSQL锁管理器上产生一条未授予的锁请求');
     assert.equal(gen.inflight.size, 1, 'runOnce()应已注册进inflight，证明确实在途');
@@ -182,7 +188,10 @@ pgtest('PG-3 ForecastGenerator.stop()在runOnce()真实事务被行锁阻塞期�
     assert.equal(stopFlag.settled, true, '行锁释放、真实事务结束后stop()必须能够返回');
     assert.equal(stopFlag.error, undefined, 'stop()不应因等待真实事务而抛出异常');
   } finally {
+    // 无论上面哪一步断言失败，都必须先解锁再等待runPromise真正落定，避免遗留一个仍在阻塞、
+    // 未被任何人等待的真实事务/客户端连接漏到下一个测试。
     await barrier.release().catch(() => {});
+    if (runPromise) await runPromise.catch(() => {});
   }
 
   const row = await readLeaseRow(pool, GENERATOR_LEASE);
@@ -190,14 +199,15 @@ pgtest('PG-3 ForecastGenerator.stop()在runOnce()真实事务被行锁阻塞期�
   assert.equal(gen.inflight.size, 0, '事务结束后inflight不得残留');
 });
 
-pgtest('PG-3 OutcomeEvaluator.stop()在runOnce()真实事务被行锁阻塞期间不会提前返回，锁释放后才返回并完成lease收尾', async () => {
+pgtest('PG-3 OutcomeEvaluator.stop()在runOnce()真实事务被行锁阻塞期间不会提前返回，锁释放后才返回并完成lease收尾', { timeout: 30_000 }, async () => {
   await expireLease(pool, EVALUATOR_LEASE);
   const evaluator = new OutcomeEvaluator({ pool, holderId: 'v14c-lifecycle-eval-block', serverTimeProvider: okServerTime(NEVER_DUE), leaseTtlMs: 60000, evaluationVersion: 'v1.4c-lifecycle-eval-block' });
   await evaluator.start({ intervalMs: 10_000_000, heartbeatIntervalMs: 10_000_000 });
 
   const barrier = await acquireRowLockBarrier(pool, EVALUATOR_LEASE);
+  let runPromise;
   try {
-    const runPromise = evaluator.runOnce();
+    runPromise = evaluator.runOnce();
     const blocked = await waitForBlockedLockRequest(pool, { timeoutMs: 5000 });
     assert.ok(blocked, 'runOnce()内assertLease()的FOR SHARE必须在真实PostgreSQL锁管理器上产生一条未授予的锁请求');
     assert.equal(evaluator.inflight.size, 1);
@@ -214,6 +224,7 @@ pgtest('PG-3 OutcomeEvaluator.stop()在runOnce()真实事务被行锁阻塞期�
     assert.equal(stopFlag.error, undefined);
   } finally {
     await barrier.release().catch(() => {});
+    if (runPromise) await runPromise.catch(() => {});
   }
 
   const row = await readLeaseRow(pool, EVALUATOR_LEASE);
@@ -225,7 +236,7 @@ pgtest('PG-3 OutcomeEvaluator.stop()在runOnce()真实事务被行锁阻塞期�
 // C. bootstrap()分阶段启动失败在真实pg.Pool连接下逆序回滚（PG-4），共享池只关闭一次（PG-5）
 // ============================================================
 
-pgtest('PG-4/PG-5 startStagesWithRollback：真实连接下ForecastGenerator已启动、OutcomeEvaluator启动失败，逆序回滚真实释放Generator的lease，某stage.stop()报错不阻断其余回滚，原始错误被保留，共享池只关闭一次', async () => {
+pgtest('PG-4/PG-5 startStagesWithRollback：真实连接下ForecastGenerator已启动、OutcomeEvaluator启动失败，逆序回滚真实释放Generator的lease，某stage.stop()报错不阻断其余回滚，原始错误被保留，共享池只关闭一次', { timeout: 30_000 }, async () => {
   // 独立于文件级共享pool的第二个真实pg.Pool——本测试会在末尾真实调用.end()，必须避免影响其他测试共用的pool
   const rollbackPool = await createPgPool({ databaseUrl: url, dbSsl: false });
   try {
@@ -288,8 +299,9 @@ pgtest('PG-4/PG-5 startStagesWithRollback：真实连接下ForecastGenerator已�
 // D. 正常关停顺序：Forecast/Outcome等待在途真实事务、完成lease收尾，然后才关闭共享pg.Pool（PG-6）
 // ============================================================
 
-pgtest('PG-6 正常关停：stopStagesInOrder等待真实在途事务与lease收尾完成后，共享池才会被关闭', async () => {
+pgtest('PG-6 正常关停：stopStagesInOrder等待真实在途事务与lease收尾完成后，共享池才会被关闭', { timeout: 30_000 }, async () => {
   const shutdownPool = await createPgPool({ databaseUrl: url, dbSsl: false });
+  let barrier, runPromise;
   try {
     await expireLease(shutdownPool, GENERATOR_LEASE);
     const gen = new ForecastGenerator({ pool: shutdownPool, holderId: 'v14c-lifecycle-shutdown-gen', serverTimeProvider: okServerTime(NEVER_DUE), leaseTtlMs: 60000 });
@@ -300,8 +312,8 @@ pgtest('PG-6 正常关停：stopStagesInOrder等待真实在途事务与lease收
     ];
     const closeDatabase = createIdempotentCloser(async () => { await shutdownPool.end(); });
 
-    const barrier = await acquireRowLockBarrier(shutdownPool, GENERATOR_LEASE);
-    const runPromise = gen.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h' });
+    barrier = await acquireRowLockBarrier(shutdownPool, GENERATOR_LEASE);
+    runPromise = gen.runOnce({ instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h' });
     const blocked = await waitForBlockedLockRequest(shutdownPool, { timeoutMs: 5000 });
     assert.ok(blocked, 'runOnce()必须真实被行锁阻塞');
 
@@ -325,6 +337,8 @@ pgtest('PG-6 正常关停：stopStagesInOrder等待真实在途事务与lease收
 
     await assert.rejects(shutdownPool.query('SELECT 1'), '关停完成后共享池必须已被真实关闭');
   } finally {
+    if (barrier) await barrier.release().catch(() => {});
+    if (runPromise) await runPromise.catch(() => {});
     await safeEndPool(shutdownPool);
   }
 });
