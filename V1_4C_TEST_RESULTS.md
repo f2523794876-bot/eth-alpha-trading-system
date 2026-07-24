@@ -1,5 +1,85 @@
 # V1_4C_TEST_RESULTS.md — V1.4C 服务器端预测基础设施测试结果
 
+## 0B. P0-1/P1-1服务生命周期加固专项（本轮，2026-07-24）
+
+Codex对提交`41b03b3`的独立复审判定**REQUEST CHANGES**，指出三项待修复问题：
+
+- **P0-1**：启动失败后没有回滚已启动服务——若`forecastGenerator.start()`/`outcomeEvaluator.start()`失败，此前已启动的`collector`/`api`不会被可靠停止，顶层只设置`process.exitCode=1`，残留定时器/监听端口可能使进程继续存活。
+- **P1-1**：`ForecastGenerator`/`OutcomeEvaluator`的`stop()`只清定时器和触发`AbortController`，未等待正在执行的`runOnce()`真正结束就可能被上层视为"已停止"，也没有释放自身持有的lease。
+- **P2-1**：测试报告数字与实际结果不一致——本文档当时仍写`209/209`，而修复前离线`npm test`实际已是`214/214/0/0`，证据滞后。
+
+### 本轮修复内容
+
+1. **P0-1**：新增`server/src/lifecycle.js`，导出通用、可注入的`startStagesWithRollback()`/`stopStagesInOrder()`/`createIdempotentCloser()`。`server/src/index.js`的`bootstrap()`改为将`collector`/`api`/`forecastGenerator`/`outcomeEvaluator`四个组件表达为`{name,start,stop}`阶段数组，按顺序启动；任一阶段`start()`失败时对已成功启动的阶段按逆序调用`stop()`回滚，单个阶段`stop()`报错只记录、不阻断其余阶段回滚、也不替换最终抛出的原始启动错误；全部组件（含回滚）结束后才通过`createIdempotentCloser()`关闭共享Postgres连接池且保证只关闭一次；不依赖`process.exit()`，回滚完成后原样重新抛出启动错误，使进程能够真正失败退出。正常关停复用同一个`stopStagesInOrder()`，与失败回滚遵循同一套逆序生命周期顺序（`outcomeEvaluator→forecastGenerator→api→collector`最后才关数据库）。
+2. **P1-1**：`ForecastGenerator`（`server/src/forecast/generator-service.js`）与`OutcomeEvaluator`（`server/src/outcome/evaluator-service.js`）各自独立新增`inflight`跟踪集合与`track()`方法（未复用彼此代码，只共享同一套已在`FeatureGeneratorService`验证过的模式，独立理解后各自实现）；`schedule()`/`scheduleHeartbeat()`的调度tick与对外的`runOnce()`统一经`track()`注册进`inflight`。`stop()`重写为幂等（内部缓存`stopPromise`，并发/重复调用只执行一次真正的清理），顺序为：停止调度并清定时器→`abortController.abort()`中断可取消工作→`await Promise.allSettled([...inflight])`等待全部已注册在途任务结束→仅在`lease`存在且未被判定丢失(`leaseLost`)时，按`lease_name`+`holder_id`+`fencing_token`三者精确匹配调用新增的`releaseLease()`释放自身lease（不可能影响其他owner持有的同名lease行）；释放失败被记录但不会让`stop()`本身抛出。
+3. **P2-1**：本文件与`V1_4C_IMPLEMENTATION_REPORT.md`同步更新为本轮修复后**实际执行**得到的真实测试数字（见下），不预先假设固定数值。
+
+### 新增专项测试（18项，全部离线可执行，不依赖数据库/网络）
+
+- `server/tests/lifecycle-rollback.test.js`（6项）：ForecastGenerator启动失败触发collector/api逆序回滚且outcomeEvaluator从未被启动；OutcomeEvaluator启动失败触发collector/api/forecastGenerator逆序回滚且forecastGenerator已获取的lease被释放；某组件`stop()`报错不阻断其余组件回滚，且最终抛出的仍是原始启动错误而非清理错误；共享数据库连接在回滚与正常关停两条路径下都只关闭一次；正常关停按逆序执行且Forecast/Outcome先于数据库关闭完成收尾；`createIdempotentCloser()`本身的并发/重复调用幂等性。
+- `server/tests/forecast/forecast-generator-shutdown.test.js`（6项）：`runOnce()`执行中调用`stop()`必须等待其结束才返回并随后释放lease；`stop()`之后不再产生新的调度执行；不释放其他owner/token持有的lease；重复调用`stop()`幂等且只释放一次；`runOnce()`因fencing token被拒绝失败时`inflight`不残留；lease释放失败被记录而不让`stop()`抛出。
+- `server/tests/forecast/outcome-evaluator-shutdown.test.js`（6项，独立实现，未复制`forecast-generator-shutdown.test.js`或Codex修复包中的代码，只与之共享测试基础设施`tests/helpers/fake-lease-pool.js`）：覆盖与上一条完全对应的六类场景。
+
+### 离线测试实际结果（本轮，`cd server && npm test`）
+
+```
+tests 232
+pass 232
+fail 0
+skip 0
+```
+
+修复前基线`41b03b3`离线`npm test`实际为`214/214/0/0`（非文档曾声称的`209/209`）；本轮新增18项专项测试，`214+18=232`，与实际执行结果一致——数字是执行后据实记录，不是预先假设。
+
+`npm run check`（`node --check src/index.js && npm test`同等范围）：exit 0，`232/232/0/0`；另对本轮新增/修改的四个源文件单独执行`node --check`（`src/lifecycle.js`/`src/index.js`/`src/forecast/generator-service.js`/`src/outcome/evaluator-service.js`）均通过。
+
+附加验证（不计入`npm test`范围，单独执行确认无回归）：`npm run test:features` → `44/44 pass，0 fail`。
+
+### PostgreSQL集成测试：本轮**未执行**
+
+原因：当前实施环境未设置`TEST_DATABASE_URL`。`pg_isready`探测到`127.0.0.1:5432`有可达的PostgreSQL实例，但该实例正是本机生产服务`eth-alpha-collector`（systemd单元，`/opt/eth-alpha/eth-alpha-trading-system`，以`eth-alpha`系统用户运行，本次任务账号无读写权限）实际连接使用的数据库所在实例；任务边界明确禁止连接或修改生产数据库，且要求PostgreSQL集成测试"仅在已经配置隔离测试数据库且不会接触生产库时执行"。本轮未新建隔离测试角色/数据库、未设置`TEST_DATABASE_URL`，因此`npm run test:postgres`及其六个子命令（`test:postgres:v1.4a`/`:features`/`:revision`/`:v1.4c-forecast`/`:v1.4c-outcome`/`:v1.4c-lease`）均**未执行**，不得视为通过，也没有用模拟/历史结果冒充本轮已验证。下方§2表格中标注为"历史记录"的PostgreSQL数字来自此前（配置了隔离测试库的环境下）的记录，非本轮重新验证；本轮改动的4个文件（`lifecycle.js`/`index.js`/`generator-service.js`/`evaluator-service.js`）均不涉及该表所覆盖的P0/P1业务验收矩阵本身（预测公式、Snapshot/Outcome数据口径、时间契约均未改动），但lease释放/心跳相关代码路径的真实PostgreSQL端到端验证仍待CI或配置了隔离库的环境补充执行。
+
+## 0A. FeatureGenerator生产生命周期专项（2026-07-23）
+
+新增14项可在无数据库环境执行的行为测试：
+
+- 10项独立服务生命周期：新正式15m K线自动生成、时间键幂等、无K线安全空转、租约
+  互斥、过期接管、重启补漏、单目标故障隔离、心跳丢失停止、SIGTERM等待在途事务、
+  systemd独立服务/collector非强依赖。
+- 4项预测就绪门：精确reference时间键、稍晚特征有界重试、超时返回null并fail
+  closed、停止时中断等待。
+
+专项执行结果：**14 passed，0 failed，0 skipped**。
+
+真实PostgreSQL套件新增生产路径断言：独立服务扫描真实`market_bars`并写入精确
+`feature_records`，重复轮询仍只有一行；既有V1.4C forecast端到端测试同步改为为每个
+24h/72h reference边界生成精确特征，禁止旧特征回退。该套件需要隔离
+`TEST_DATABASE_URL`，当前受限Mac沙箱未提供PostgreSQL，留待CI/复审环境执行。组合
+门禁预期由原62项增至**63项**（13+5+9+17+10+9）；本地只验证到22项正确识别为
+SKIP，未把它们计为通过。
+
+本环境合并非联网扫描（`server/tests/*.test.js`、features、forecast）共258项：
+**247 passed，11 failed**。11项全部是API测试启动本机监听端口时被沙箱拒绝，错误均为
+`listen EPERM 127.0.0.1`；没有业务断言失败。拆除需要监听端口的API用例后，可执行的
+247项全部通过。该环境限制不得记为产品通过，CI/标准本机仍须重新执行完整命令并达到
+0失败。
+
+分组复核：
+
+- `server/tests/forecast/*.test.js`：**96 passed，0 failed**；
+- `feature-generator-service.test.js`：**10 passed，0 failed**；
+- `review-regression.test.js`：**17 passed，0 failed**；
+- 本轮涉及的PostgreSQL文件在未配置`TEST_DATABASE_URL`时：**22 skipped**，未冒充通过；
+- 两次构建产物SHA-256均为
+  `fe969b5d76cbecb4a19b47093ee698f12d38bbf01e0fd36b50dc1add3ac2c5c8`，且构建前后
+  正式HTML哈希不变。
+
+真实Binance REST在本沙箱执行13项：0 passed、10 failed、3 skipped。失败根因是环境
+DNS禁用（`ENOTFOUND api.binance.com`/`fapi.binance.com`，后续同端点触发
+`CIRCUIT_OPEN`）；3项REST+PostgreSQL因无`TEST_DATABASE_URL`跳过。该结果明确记为
+**环境阻塞/未验收**，不是产品通过，也没有用伪响应代替真实REST。复审或CI环境必须
+重新执行真实网络与真实PostgreSQL门禁。
+
 ## 0. 文档变更记录（Codex 独立复审 REQUEST CHANGES 后的修订）
 
 Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审判定 REQUEST CHANGES，指出三项问题（P0-1 两个调度器从未接入生产启动入口、P1-1 心跳续约缺失、P1-2 生成节奏门禁未真正实现），并指出本文档 §4 表格中"24H每4小时/72H每日生成节奏"一行错误地声称该上限单靠 `UNIQUE(prediction_id)` 约束即可自动成立——这一结论是**错误的**：不同的 `referenceBar.closeTime` 会产生不同的 `predictionId`，`UNIQUE(prediction_id)` 约束只能防止*同一个* `referenceBar` 被重复计为两条快照，无法阻止应用层对*不同* `referenceBar`（例如每次 15 分钟轮询都取"最新一根已收盘 bar"）反复生成，从而使 24H/72H 正式样本量随轮询频率线性增长。该结论已在本轮修订中更正，见 §4 与 §9（新增）。本文档 §2/§3/§6/§7/§8 的测试数量、通过结果也已同步更新为修复后的最终真实执行结果。
@@ -10,18 +90,20 @@ Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审判定
 - PostgreSQL（本地实例，通过 `psql`/`pg_isready` 确认可达），隔离测试角色 `eth_alpha_test`、隔离测试库 `eth_alpha_v14a_test`（沿用 V1.4A/B 既有测试库命名，满足 `/test|ci|v14/i` 隔离校验正则）
 - 所有真实 PostgreSQL 测试均在每个测试文件的 `before()` 钩子内先执行 `runMigrations(pool,'down')` 再 `runMigrations(pool,'up')`，确保每个文件从全新 schema 开始，互不残留状态
 
-## 2. 命令与 exit code 汇总（本轮修复后最终结果）
+## 2. 命令与 exit code 汇总
 
-| 命令 | exit code | tests | pass | fail | skip |
-|---|---|---|---|---|---|
-| `npm test`（`tests/*.test.js` + `tests/forecast/*.test.js`，含 review-regression 结构性门禁） | 0 | 209 | 209 | 0 | 0 |
-| `npm run test:postgres:v1.4a`（既有，含004迁移后31表断言更新） | 0 | 13 | 13 | 0 | 0 |
-| `npm run test:postgres:features`（既有V1.4B） | 0 | 4 | 4 | 0 | 0 |
-| `npm run test:postgres:revision`（既有V1.4B） | 0 | 9 | 9 | 0 | 0 |
-| `npm run test:postgres:v1.4c-forecast`（新增，含本轮P1-2真实节奏门禁测试） | 0 | 17 | 17 | 0 | 0 |
-| `npm run test:postgres:v1.4c-outcome`（新增） | 0 | 10 | 10 | 0 | 0 |
-| `npm run test:postgres:v1.4c-lease`（新增，含本轮P0-1/P1-1真实心跳测试） | 0 | 9 | 9 | 0 | 0 |
-| `npm run test:postgres`（上述6步组合命令，一次性顺序执行） | 0 | 62 | 62 | 0 | 0 |
+| 命令 | exit code | tests | pass | fail | skip | 本轮（2026-07-24）是否重新执行 |
+|---|---|---|---|---|---|---|
+| `npm test`（`tests/*.test.js` + `tests/forecast/*.test.js`，含 review-regression 结构性门禁 + 本轮新增18项生命周期测试） | 0 | 232 | 232 | 0 | 0 | **是，本轮实际执行，见§0B** |
+| `npm run test:postgres:v1.4a`（既有，含004迁移后31表断言更新） | 0 | 13 | 13 | 0 | 0 | 否——历史记录，本轮未配置`TEST_DATABASE_URL`，未执行，见§0B |
+| `npm run test:postgres:features`（既有V1.4B） | 0 | 4 | 4 | 0 | 0 | 否——同上，未执行 |
+| `npm run test:postgres:revision`（既有V1.4B） | 0 | 9 | 9 | 0 | 0 | 否——同上，未执行 |
+| `npm run test:postgres:v1.4c-forecast`（含P1-2真实节奏门禁测试） | 0 | 17 | 17 | 0 | 0 | 否——同上，未执行 |
+| `npm run test:postgres:v1.4c-outcome` | 0 | 10 | 10 | 0 | 0 | 否——同上，未执行 |
+| `npm run test:postgres:v1.4c-lease`（含P0-1/P1-1真实心跳测试） | 0 | 9 | 9 | 0 | 0 | 否——同上，未执行 |
+| `npm run test:postgres`（上述6步组合命令，一次性顺序执行） | 0 | 62 | 62 | 0 | 0 | 否——同上，未执行 |
+
+上表PostgreSQL相关7行的`exit code`/`tests`/`pass`/`fail`/`skip`列为此前（配置了隔离`TEST_DATABASE_URL`的环境下）的历史记录，**本轮未重新执行**，不作为本轮验收依据；本轮唯一实际重新执行并验证的是`npm test`一行，详见§0B。
 
 **离线复现性**：未设置 `TEST_DATABASE_URL` 时，三个V1.4C真实PostgreSQL测试文件通过 `pgtest = enabled ? test : test.skip` 全部优雅降级为 SKIP，不会导致离线环境下 `npm test`/CI 无网络阶段失败。
 
@@ -82,7 +164,7 @@ Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审判定
 | review-regression.test.js结构性验证该接线 | 同上；本轮新增3项结构性测试分别验证P0-1生产接线、P1-1心跳实现、P1-2节奏边界实现，见§9 | 通过 |
 | **两个调度器正式接入生产启动入口（P0-1，本轮修复）** | **`server/src/index.js` `bootstrap()`导入并实例化`ForecastGenerator`/`OutcomeEvaluator`，调用各自`start()`/`stop()`，纳入graceful shutdown；`v1-4c-lease-concurrency`#7用真实PostgreSQL验证两者能各自成功`start()`并持有独立lease/running/heartbeatTimer/abortController** | **通过（新增）** |
 | **独立心跳续约，跨lease TTL周期持续工作（P1-1，本轮修复）** | **`generator-service.js`/`evaluator-service.js`新增`heartbeat()`/`scheduleHeartbeat()`，复用CollectorService已验证的UPDATE续约SQL模式；`v1-4c-lease-concurrency`#8用真实时间推进（等待>3个lease TTL周期）验证fencing_token不变、expires_at持续被推进；#9验证心跳续约失败后真正停止（running=false/leaseLost=true/timers清空）且不产生残行，另一调度器不受影响** | **通过（新增）** |
-| 既有V1.4A/B测试不得回归 | `npm run test:postgres:v1.4a`13/13、`:features`4/4、`:revision`9/9全部通过；`npm test`209/209通过 | 通过 |
+| 既有V1.4A/B测试不得回归 | `npm run test:postgres:v1.4a`13/13、`:features`4/4、`:revision`9/9（历史记录，本轮未重新执行，见§0B）；`npm test`本轮实际执行232/232通过 | 通过 |
 
 ## 5. P2 披露
 
@@ -102,45 +184,63 @@ Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审判定
 
 **回归结论：0项回归。**
 
-## 7. 命令行原始输出摘录（本轮修复后，完整可复现）
+## 7. 命令行原始输出摘录
+
+### 本轮（2026-07-24，P0-1/P1-1生命周期修复）实际执行
 
 ```
-$ cd server && TEST_DATABASE_URL=postgresql://eth_alpha_test:***@127.0.0.1:5432/eth_alpha_v14a_test npm test
+$ cd server && npm test
 ...
-1..209
-# tests 209
+1..232
+# tests 232
 # suites 0
-# pass 209
+# pass 232
 # fail 0
 # cancelled 0
 # skipped 0
 # todo 0
 
-$ export TEST_DATABASE_URL="postgresql://eth_alpha_test:***@127.0.0.1:5432/eth_alpha_v14a_test"
-$ npm run test:postgres
+$ echo $?
+0
+
+$ npm run check
 ...
+1..232
+# pass 232
+# fail 0
+$ echo $?
+0
+
+$ npm run test:features
+...
+1..44
+# pass 44
+# fail 0
+```
+
+`npm run test:postgres`及其六个子命令本轮**未执行**（未配置`TEST_DATABASE_URL`，见§0B），以下为此前环境的历史记录，非本轮输出：
+
+```
+（历史记录，非本轮执行）
 （v1.4a）        # tests 13 / pass 13 / fail 0
 （features）     # tests 4  / pass 4  / fail 0
 （revision）     # tests 9  / pass 9  / fail 0
 （v1.4c-forecast）# tests 17 / pass 17 / fail 0
 （v1.4c-outcome） # tests 10 / pass 10 / fail 0
 （v1.4c-lease）   # tests 9  / pass 9  / fail 0
-
-$ echo $?
-0
 ```
 
 ## 8. 完成门禁自查
 
-- [x] 全部P0、P1测试通过（32/32 P0，13/13 P1条目，含本轮新增3项）
-- [x] P2问题全部披露（6条，见§5，含本轮新增2条）
-- [x] 既有测试无回归（0项回归，见§6）
-- [x] `test:postgres`实际执行全部三组V1.4C真实PostgreSQL测试（62项汇总执行，exit 0）
-- [x] 无范围外文件修改（新增`server/src/index.js`的必要接线修改、既有`postgres-production.integration.test.js`的表数断言更新，均已在实施报告中逐项说明理由）
-- [x] 无网络依赖的测试可离线复现（未设TEST_DATABASE_URL时全部SKIP，不阻塞`npm test`）
-- [x] 数据库测试使用隔离数据库（`eth_alpha_v14a_test`，正则校验`test|ci|v14`）并完成清理（每文件`before()`内down+up重置）
-- [x] 无`.only`、`.skip`（业务性）、弱化断言或伪造结果
-- [x] `git diff --check`无输出
+- [x] 全部P0、P1测试通过（32/32 P0，13/13 P1条目——历史记录，本轮未改动业务逻辑，未重新执行其PostgreSQL验证部分，见§0B）
+- [x] P2问题全部披露（6条，见§5）
+- [x] 既有测试无回归（本轮`npm test`232/232，含18项新增生命周期测试，0 fail）
+- [ ] `test:postgres`本轮**未执行**（未配置隔离`TEST_DATABASE_URL`，不得视为通过，见§0B详细说明；历史62项为此前环境记录）
+- [x] 无范围外文件修改（本轮只修改`server/src/index.js`/`server/src/lifecycle.js`（新增）/`server/src/forecast/generator-service.js`/`server/src/outcome/evaluator-service.js`及对应测试与本文档/实施报告，未触及交易策略、预测公式、Snapshot/Outcome数据口径、时间契约或数据库schema）
+- [x] 无网络依赖的测试可离线复现（`npm test`不依赖网络/数据库，232/232）
+- [ ] 本轮未新建/使用隔离数据库（PostgreSQL集成测试未执行，见§0B）
+- [x] 无`.only`、`.skip`（业务性）、弱化断言或伪造结果——本轮新增18项测试均为真实执行的正向/负向断言，无任何跳过或伪造
+- [x] `git diff --check`无输出（本轮提交前已复核）
 
 ## 9. Codex 复审三项修复的详细证据（本轮新增）
 

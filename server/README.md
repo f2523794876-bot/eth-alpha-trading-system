@@ -77,6 +77,20 @@ npm run features:generate -- --target=1784400000000 --as-of=1784400001000
 npm run features:generate -- --from=1784300000000 --to=1784400000000 --dry-run
 ```
 
+生产环境不再依赖上述人工命令。`npm run features:serve` 启动独立常驻的
+`FeatureGeneratorService`：它持有独立 `feature-generator` 租约，每15秒（
+`FEATURE_GENERATOR_POLL_MS`）按 Binance 服务器时间扫描已正式入库且尚无对应
+`v1.4b-unified-1` 特征的 ETHUSDT 15m 时间键，启动时立即补生成、随后持续轮询。
+单轮最多处理 `FEATURE_GENERATOR_BATCH_SIZE`（默认32）个时间键；重复执行由
+`feature_records` 稳定自然键幂等。租约心跳失败会停止调度与新写入，SIGTERM会等待
+在途事务后释放租约。
+
+预测器只接受 `target_bar_close_time` 与当前预测 `referenceBar.closeTime` **完全相等**
+的特征；不会回退使用上一根K线的旧特征。特征尚未就绪时按
+`FORECAST_FEATURE_WAIT_MS`（默认2秒）最多等待
+`FORECAST_FEATURE_WAIT_ATTEMPTS`（默认4次），仍缺失则本轮
+`FEATURE_RECORD_MISSING` fail closed，下一轮 `FORECAST_POLL_MS` 再重试。
+
 参数使用白名单，单次最多1000行、最大366天。错误响应不暴露堆栈、环境变量或数据库信息。若对外提供，应在反向代理增加 TLS、来源控制和只读访问策略。
 
 ## 运维
@@ -88,7 +102,17 @@ sudo -u postgres pg_dump --format=custom eth_alpha > eth_alpha-$(date -u +%Y%m%d
 sudo -u postgres pg_restore --clean --if-exists --dbname=eth_alpha_restore eth_alpha-*.dump
 ```
 
-systemd模板位于 `deploy/systemd/eth-alpha-collector.service`，本提交不会自动安装或启用它。部署顺序固定为：创建最低权限数据库与用户 → `npm ci --omit=dev` → `node src/db/migrate.js up` → 核对 `/health/ready` → 再启用服务。unit 的 `ExecStartPre` 会再次执行仅向上的幂等迁移检查，checksum或迁移失败会阻止服务启动，绝不自动执行破坏性 down。建议 journald 限额或 logrotate 每日轮转、保留30天运行日志。原始响应数据库层拒绝 UPDATE/DELETE；受控归档应先使用 `pg_dump`/对象存储保留完整JSON与哈希，当前版本不提供在线删除入口。正式事实和修订事件不得静默删除。
+systemd模板位于 `deploy/systemd/eth-alpha-collector.service` 与
+`deploy/systemd/eth-alpha-feature-generator.service`，本提交不会自动安装或启用它们。
+部署顺序固定为：创建最低权限数据库与用户 → `npm ci --omit=dev` →
+`node src/db/migrate.js up` → 安装两个unit → 先启动feature generator、再启动collector
+（collector内含forecast/outcome调度器）→ 核对 `/health/ready` 和特征/预测运行记录。
+collector对feature服务使用`Wants`而非`Requires`：特征服务故障不会令行情采集器退出；
+预测侧则通过精确时间键和有界等待fail closed。两个unit的`ExecStartPre`都会再次执行仅
+向上的幂等迁移检查，checksum或迁移失败会阻止服务启动，绝不自动执行破坏性down。
+建议journald限额或logrotate每日轮转、保留30天运行日志。原始响应数据库层拒绝
+UPDATE/DELETE；受控归档应先使用`pg_dump`/对象存储保留完整JSON与哈希，当前版本不
+提供在线删除入口。正式事实和修订事件不得静默删除。
 
 `data_health_snapshots`属于可重建健康遥测，默认保留90天，可用 `HEALTH_RETENTION_DAYS`调整。先执行 `npm run maintenance:health -- --dry-run`核对数量，再执行 `npm run maintenance:health`清理。该命令的SQL只触及 `data_health_snapshots`；绝不删除 `raw_payloads`、正式事实、修订事件、特征记录或特征血缘。正式历史仍须先备份再归档。
 
@@ -102,6 +126,8 @@ readiness 新鲜度按每个周期独立计算：15m、1h、4h分别使用自身
 - `CLOCK_OFFSET_EXCEEDED`：执行 `timedatectl status` 检查UTC/NTP；修复系统时钟后等待健康校验。
 - `RATE_LIMITED`：检查响应头、降低调度并等待 `Retry-After`，不可紧密重试。
 - `COLLECTOR_LEASE_HELD`：确认是否已有健康实例；租约到期前不要强制启动第二实例。
+- `FEATURE_GENERATOR_LEASE_HELD`：已有特征服务持有租约；检查其心跳，不要并发启动第二写入者。
+- `FEATURE_RECORD_MISSING`：确认feature服务状态和`feature_generation_runs`；预测器会有界等待并在下一轮重试，禁止复制旧特征冒充当前时间键。
 - 未解决缺口：检查 `data_gaps` 与 `backfill_jobs`，保留错误原因后重试，禁止伪造K线。
 - 数据库失败：服务 readiness 应失败；恢复数据库并验证迁移checksum、自然键和最新健康快照。
 

@@ -9,7 +9,7 @@ import { computeDirectionThreshold } from './threshold-formula.js';
 import { evaluatePoState } from './po-state-engine.js';
 import { finalizeForecastSnapshot, computeExpectedPriceZones, deriveExpectedDirection, computeRawScenarioScore, buildTriggerConditions, buildInvalidationConditions } from './forecast-contract.js';
 import { canonicalJsonHash } from '../domain/hash.js';
-import { FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION } from '../features/feature-version.js';
+import { FEATURE_ALGORITHM_VERSION, FEATURE_SET_VERSION, SOURCE_DATASET_VERSION } from '../features/feature-version.js';
 
 export const LEASE_NAME = 'forecast-generator';
 const AUXILIARY_EVIDENCE_FIELDS = ['fundingRate', 'fundingRateZScore', 'openInterest', 'openInterestChange', 'openInterestChangeRatio', 'longShortRatio', 'longShortRatioZScore', 'takerBuySellRatio', 'derivativesAvailability'];
@@ -49,12 +49,24 @@ export const DEFAULT_GENERATION_TARGETS = Object.freeze([
 ]);
 
 export class ForecastGenerator {
-  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000, logger = console }) {
+  constructor({ pool, holderId, now = Date.now, serverTimeProvider, leaseTtlMs = 60000, featureWaitMs = 2000, featureWaitAttempts = 4, logger = console }) {
     if (!pool || !holderId || typeof serverTimeProvider !== 'function') throw new Error('ForecastGenerator requires pool/holderId/serverTimeProvider');
-    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs; this.logger = logger;
+    this.pool = pool; this.holderId = holderId; this.now = now; this.serverTimeProvider = serverTimeProvider; this.leaseTtlMs = leaseTtlMs; this.featureWaitMs = featureWaitMs; this.featureWaitAttempts = featureWaitAttempts; this.logger = logger;
     this.timers = []; this.heartbeatTimer = null; this.running = false; this.leaseLost = false; this.lease = null;
     // 独立abortController（P0-1/P1-1要求）：不与CollectorService共享，仅表达本调度器自身的生命周期终止信号
     this.abortController = new AbortController();
+    // P1-1修复：独立inflight跟踪集合——所有由schedule()/scheduleHeartbeat()触发的异步执行，以及外部直接调用的
+    // runOnce()，统一经track()注册；stop()据此等待在途任务真正结束后才安全释放lease，不再是"清定时器就算停止"。
+    this.inflight = new Set();
+    // stop()幂等：首次调用即缓存performStop()返回的Promise并同步赋值（早于任何await），
+    // 并发/重复调用stop()都会拿到同一个Promise，保证release lease等副作用只发生一次。
+    this.stopPromise = null;
+  }
+
+  track(promise) {
+    this.inflight.add(promise);
+    promise.then(() => this.inflight.delete(promise), () => this.inflight.delete(promise));
+    return promise;
   }
 
   // P0-1修复：正式生产启动入口。独立于CollectorService（不同类实例、不同timers数组、不同running/lease状态、
@@ -72,11 +84,16 @@ export class ForecastGenerator {
 
   schedule(intervalMs, targets) {
     this.running = true;
-    const tick = async () => {
+    // P1-1修复：整轮tick（含其内部对每个target的runOnce调用）经track()注册进inflight——stop()调用clearSchedulers()
+    // 取消的只是"尚未触发"的setTimeout，已经触发、正在执行的tick必须被stop()等待完，不能被半途丢弃。
+    const tick = () => this.track((async () => {
       if (!this.running) return;
-      for (const target of targets) { try { await this.runOnce(target); } catch { /* 失败已记录于forecast_generation_runs/forecast_quality_events，调度循环本身不中止 */ } }
+      for (const target of targets) {
+        if (!this.running) break;
+        try { await this.runOnce(target); } catch { /* 失败已记录于forecast_generation_runs/forecast_quality_events，调度循环本身不中止 */ }
+      }
       if (this.running) this.timers.push(setTimeout(tick, intervalMs));
-    };
+    })());
     this.timers.push(setTimeout(tick, intervalMs));
   }
 
@@ -84,12 +101,12 @@ export class ForecastGenerator {
   // FENCING_TOKEN_REJECTED，永久停止调度——此前遗漏心跳环节。复用CollectorService（server/src/collector/service.js
   // heartbeat()/schedule()）已验证的心跳模式：独立定时器链、续约失败立即loseLease()自行停止，不影响OutcomeEvaluator。
   scheduleHeartbeat(intervalMs = Math.floor(this.leaseTtlMs / 3)) {
-    const tick = async () => {
+    const tick = () => this.track((async () => {
       if (!this.running) return;
       try { await this.heartbeat(); }
       catch (error) { this.logger?.error?.('forecast generator heartbeat failed', { code: error.code || error.message }); }
       if (this.running) this.heartbeatTimer = setTimeout(tick, intervalMs);
-    };
+    })());
     this.heartbeatTimer = setTimeout(tick, intervalMs);
   }
 
@@ -120,17 +137,44 @@ export class ForecastGenerator {
     this.abortController.abort(reason);
   }
 
-  // P0-1修复：graceful shutdown——停止调度、终止abortController、不额外关闭pool（pool由bootstrap统一生命周期管理，
+  // P1-1修复：graceful shutdown——顺序为 停止接收新任务/清定时器 → abort在途可取消工作 → 等待所有已注册inflight
+  // 任务真正结束 → 在安全条件下释放本服务自身持有的lease。不额外关闭pool（pool由bootstrap统一生命周期管理，
   // 与CollectorService.stop()的closeRepository参数模式一致，但ForecastGenerator本身不持有repository实例）。
+  // stop()本身通过缓存stopPromise保证幂等：并发/重复调用只会执行一次performStop()，避免重复释放lease。
   async stop() {
+    if (!this.stopPromise) this.stopPromise = this.performStop();
+    return this.stopPromise;
+  }
+
+  async performStop() {
     this.running = false;
     this.clearSchedulers();
     this.abortController.abort('shutdown');
+    await Promise.allSettled([...this.inflight]);
+    // 先从实例上摘除this.lease再发起释放请求，即使releaseLease()本身失败/重试，也不会有第二次调用把同一把
+    // lease再释放一次；leaseLost为true说明heartbeat早已判定lease丢失(owner可能已变更)，不得再对其发起释放。
+    const lease = this.lease;
+    this.lease = null;
+    if (lease && !this.leaseLost) {
+      try { await this.releaseLease(lease); }
+      catch (error) { this.logger?.warn?.('forecast generator lease release failed', { code: error.code || error.message }); }
+    }
+  }
+
+  // releaseLease()与acquireLease()同表同结构，WHERE子句同时约束lease_name/holder_id/fencing_token三者——
+  // 只有精确持有当前fencing_token的那一行才会被本方法置为已过期，不可能影响其他holder或更新过token的同名lease行。
+  async releaseLease(lease) {
+    const result = await this.pool.query(
+      `UPDATE collector_leases SET expires_at=clock_timestamp(),heartbeat_at=clock_timestamp() WHERE lease_name=$1 AND holder_id=$2 AND fencing_token=$3
+       RETURNING lease_name AS "leaseName",holder_id AS "holderId",fencing_token::bigint AS "fencingToken",expires_at AS "expiresAt"`,
+      [lease.leaseName, lease.holderId, lease.fencingToken]
+    );
+    return result.rows[0] || null;
   }
 
   status() {
     return {
-      running: this.running, holderId: this.holderId, leaseLost: this.leaseLost,
+      running: this.running, holderId: this.holderId, leaseLost: this.leaseLost, pendingOperations: this.inflight.size,
       lease: this.lease ? { leaseName: this.lease.leaseName, holderId: this.lease.holderId, fencingToken: this.lease.fencingToken, expiresAt: this.lease.expiresAt } : null
     };
   }
@@ -164,6 +208,31 @@ export class ForecastGenerator {
     } finally { client.release(); }
   }
 
+  async waitForExactFeature(client, { instrument, targetBarCloseTime, asOfTime }) {
+    const attempts = Math.max(1, Number(this.featureWaitAttempts) || 1);
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      if (this.abortController.signal.aborted) throw Object.assign(new Error('Forecast generator stopping'), { code: 'FORECAST_GENERATOR_STOPPING' });
+      const result = await client.query(
+        `SELECT feature_record_id, feature_values, quality_state, completeness FROM feature_records
+         WHERE symbol=$1 AND target_interval='15m' AND target_bar_close_time=to_timestamp($2/1000.0)
+           AND as_of_time<=to_timestamp($3/1000.0) AND feature_set_version=$4
+         ORDER BY revision_number DESC LIMIT 1`,
+        [instrument, targetBarCloseTime, asOfTime, FEATURE_SET_VERSION]
+      );
+      if (result.rows[0]) return { row: result.rows[0], attempts: attempt };
+      if (attempt < attempts) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, this.featureWaitMs);
+          this.abortController.signal.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(Object.assign(new Error('Forecast generator stopping'), { code: 'FORECAST_GENERATOR_STOPPING' }));
+          }, { once: true });
+        });
+      }
+    }
+    return { row: null, attempts };
+  }
+
   // forecast_snapshots.generation_run_id有NOT NULL外键指向本表，本方法必须先以INSERT在generateSnapshot开头"预占"该行
   // （status='RUNNING'），再由后续blocked()/成功路径用ON CONFLICT DO UPDATE原地更新最终状态——不得先插入forecast_snapshots
   // 再补记录run，否则违反外键约束（同一事务内，被引用行必须先于引用行存在）。
@@ -186,7 +255,13 @@ export class ForecastGenerator {
     );
   }
 
-  async runOnce({ instrument = 'ETHUSDT', symbol = 'ETH', horizon }) {
+  // P1-1修复：runOnce()是唯一对外的执行入口（无论来自schedule()调度还是测试/外部直接调用），必须统一经track()
+  // 注册进inflight才能保证stop()等待到它——真正的业务逻辑放在executeRunOnce()中，runOnce()只负责跟踪。
+  runOnce(options) {
+    return this.track(this.executeRunOnce(options));
+  }
+
+  async executeRunOnce({ instrument = 'ETHUSDT', symbol = 'ETH', horizon }) {
     if (!this.lease) await this.acquireLease();
     if (!this.lease) return { status: 'BLOCKED', reason: 'LEASE_UNAVAILABLE' };
     const runId = randomUUID();
@@ -229,16 +304,18 @@ export class ForecastGenerator {
     try { threshold = computeDirectionThreshold({ atr14FourHourAtGeneration: atr.atr14FourHourAtGeneration, referencePrice: located.referencePrice, horizon }); }
     catch (error) { return blocked(error.code || 'THRESHOLD_COMPUTATION_FAILED', [error.message]); }
 
-    // feature_records.symbol是V1.4B交易对格式('ETHUSDT')，与本函数入参symbol('ETH'，GMKG输出instrument标签)含义不同；
-    // 必须使用instrument（'ETHUSDT'）查询，否则永远查不到已生成的feature_records行（symbol='ETH'从未被FeatureEngine写入过）
-    const featureResult = await client.query(
-      `SELECT feature_record_id, feature_values, quality_state, completeness FROM feature_records
-       WHERE symbol=$1 AND target_interval='15m' AND target_bar_close_time<=to_timestamp($2/1000.0) AND as_of_time<=to_timestamp($2/1000.0)
-       ORDER BY target_bar_close_time DESC, revision_number DESC LIMIT 1`,
-      [instrument, asOfTime]
-    );
-    const featureRow = featureResult.rows[0];
-    if (!featureRow) return blocked('FEATURE_RECORD_MISSING', ['no as-of visible feature_records row']);
+    // 预测必须消费与referenceBar完全相同时间键的特征。旧实现按“<= asOfTime取最近一条”会在新特征尚未生成时
+    // 静默复用上一根K线特征。这里做有限次、可中止等待；超过上限仍未就绪就fail closed，交由下一调度周期重试。
+    const featureResult = await this.waitForExactFeature(client, {
+      instrument,
+      targetBarCloseTime: located.referenceBarRef.closeTime,
+      asOfTime
+    });
+    const featureRow = featureResult.row;
+    if (!featureRow) return blocked('FEATURE_RECORD_MISSING', [
+      `exact feature not ready: ${instrument}/15m/${located.referenceBarRef.closeTime}`,
+      `bounded attempts exhausted: ${featureResult.attempts}`
+    ]);
     const fv = featureRow.feature_values;
 
     const [breakoutCount, breakdownCount] = await Promise.all([

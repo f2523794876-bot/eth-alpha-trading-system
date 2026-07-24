@@ -1,5 +1,112 @@
 # V1_4C_IMPLEMENTATION_REPORT.md — V1.4C 服务器端预测基础设施实施报告
 
+## 0A. 生产验证后永久修复：FeatureGenerator正式生命周期（2026-07-23）
+
+真实生产验证证明：行情采集、人工`features:generate`、24h/72h预测与结果回填各自可用，
+但生产入口只启动collector、ForecastGenerator和OutcomeEvaluator，FeatureEngine仅有
+一次性CLI，导致新15m正式K线之后没有自动特征，预测可能长期
+`FEATURE_RECORD_MISSING`。本轮不改变特征算法或预测规则，只补齐生产生命周期。
+
+### 调度设计
+
+1. 新增独立`FeatureGeneratorService`及独立systemd unit，租约固定为
+   `feature-generator`，具有心跳、过期接管、fencing、AbortSignal、在途事务等待和
+   SIGTERM释放租约。
+2. 启动立即扫描缺失时间键，之后默认每15秒扫描；只选择Binance服务器时间之前已正式
+   收盘、已available/fetched的ETHUSDT 15m K线。每轮默认最多32条，服务重启自动补漏。
+3. `feature_records`既有稳定自然键与事务fencing继续保证幂等；同一时间键不重复写入，
+   单目标失败记录在`feature_generation_runs.blocked_count`，不令collector退出。
+4. ForecastGenerator改为只读取与`referenceBar.closeTime`完全相等且版本匹配的特征。
+   默认2秒×最多4次有界等待；仍缺失则本轮`FEATURE_RECORD_MISSING`，下一轮自动重试。
+   禁止回退到上一根特征，因此不依赖两个5分钟定时器的偶然先后顺序。
+5. collector unit仅`Wants`特征服务而非`Requires`：特征故障不停止行情采集；预测仍
+   fail closed。ForecastGenerator/OutcomeEvaluator保持原独立租约和事务边界。
+
+### 本轮修改/新增
+
+- `server/src/features/generator-service.js`
+- `server/src/features/generator-service-entry.js`
+- `server/src/db/postgres.js`、`server/src/db/memory.js`
+- `server/src/forecast/generator-service.js`
+- `server/src/config.js`、`server/src/index.js`、`server/package.json`
+- `deploy/systemd/eth-alpha-feature-generator.service`
+- `deploy/systemd/eth-alpha-collector.service`
+- `server/tests/features/feature-generator-service.test.js`
+- `server/tests/forecast/feature-readiness.test.js`
+- `server/tests/postgres/v1-4b-feature.integration.test.js`
+- `server/tests/postgres/v1-4c-forecast.integration.test.js`
+- `server/tests/review-regression.test.js`
+- `server/README.md`、`V1_4_ACCEPTANCE_TESTS.md`及本轮两份V1.4C报告
+
+未执行生产数据库写入、未安装/启动systemd、未部署服务器。部署命令仅作为复审通过后的
+操作说明提供。
+
+## 0C. 服务生命周期加固：启动失败回滚 + 优雅停机（本轮，2026-07-24）
+
+Codex 对提交 `41b03b392c59cc97949ff918ddb715ee01ddcee7`（父提交 `21d167c`，即§0A/§0所述FeatureGenerator与P0-1/P1-1/P1-2修复落地后的版本）的独立复审再次判定 **REQUEST CHANGES**，指出三项新的待修复问题：
+
+- **P0-1（启动失败无回滚）**：`server/src/index.js` 的 `bootstrap()` 依次 `await collector.start(); await api.start(); await forecastGenerator.start(...); await outcomeEvaluator.start(...);`——若 `forecastGenerator`/`outcomeEvaluator` 启动失败，此前已经启动的 `collector`/`api` 不会被可靠地停止；顶层 `catch` 只设置 `process.exitCode=1`，未清理已启动组件的定时器/端口监听，可能导致进程虽标记失败退出码但实际残留部分运行的服务。
+- **P1-1（Forecast/Outcome停止不等待在途任务）**：`ForecastGenerator.stop()`/`OutcomeEvaluator.stop()` 原实现只是 `this.running=false; this.clearSchedulers(); this.abortController.abort('shutdown');`——没有等待正在执行的 `runOnce()`（含数据库事务）真正结束，也没有释放自身持有的lease，存在"上层认为已停止，但数据库事务/lease仍在途"的风险；且原`bootstrap()`的`stop()`用`Promise.allSettled([collector.stop(),forecastGenerator.stop(),outcomeEvaluator.stop()])`并行停止，而`collector.stop()`默认`closeRepository=true`会关闭共享连接池，可能与仍在收尾的Forecast/Outcome事务竞态。
+- **P2-1（测试报告数字与实际不一致）**：`V1_4C_TEST_RESULTS.md` 当时仍写 `209/209`，而修复前该基线的离线 `npm test` 实际已是 `214/214/0/0`，文档证据滞后于代码实际状态。
+
+### 修复实现
+
+1. **P0-1**：新增 `server/src/lifecycle.js`，导出与具体业务组件解耦、可注入的编排原语：
+   - `startStagesWithRollback(stages, {onStageStopError})`：按顺序 `await stage.start()`，成功的推入 `started` 数组；任一 `start()` 抛错则对 `started` 逆序逐个 `await stage.stop()`，单个阶段 `stop()` 报错通过 `onStageStopError` 回调记录、不中断其余阶段回滚，最终重新抛出**原始**启动错误（不会被清理阶段的错误替换）。
+   - `stopStagesInOrder(stages, {onStageStopError})`：与上面复用同一套逆序遍历+尽力而为容错逻辑，供**正常关停**路径调用，确保"失败回滚"与"正常关停"使用同一套生命周期顺序。
+   - `createIdempotentCloser(closeFn)`：返回一个幂等包装函数，内部 `closed` 标志保证无论被调用多少次（含并发调用），`closeFn` 只真正执行一次。
+
+   `server/src/index.js` 的 `bootstrap()` 改为把 `collector`/`api`/`forecastGenerator`/`outcomeEvaluator` 表达为 `{name,start,stop}` 四个阶段：`collector` 阶段的 `stop` 显式传入 `{closeRepository:false}`，不再由 `CollectorService` 自行关闭共享连接池；共享的 Postgres 连接池改由 `bootstrap()` 通过 `createIdempotentCloser(()=>pool.end())` 统一管理——启动失败时，`startStagesWithRollback` 完成组件回滚后立即 `closeDatabase()` 再重新抛出原始错误；正常关停时，`stopStagesInOrder` 完成全部组件停止后才 `closeDatabase()`。全程不调用 `process.exit()`，进程失败退出依赖"原始错误被重新抛出→顶层`catch`设`process.exitCode=1`→事件循环因无残留定时器/监听自然清空退出"。
+
+2. **P1-1**：`ForecastGenerator`（`generator-service.js`）与 `OutcomeEvaluator`（`evaluator-service.js`）**各自独立**新增：
+   - 构造函数新增 `this.inflight = new Set()` 与 `this.stopPromise = null`；新增 `track(promise)` 方法（加入`inflight`，`then`时无论成功失败都从`inflight`移除，返回原promise不改变调用方获得的结果）。
+   - `schedule()`/`scheduleHeartbeat()` 内部的定时器 `tick` 函数改为 `() => this.track((async () => {...})())`，对外的 `runOnce(options)` 改为薄包装 `return this.track(this.executeRunOnce(options))`（真正业务逻辑迁移到新增的 `executeRunOnce()`/内部方法，返回值不变，调用方无感知）。
+   - `stop()` 重写为幂等：`if(!this.stopPromise) this.stopPromise=this.performStop(); return this.stopPromise;`——`stopPromise`在首次调用时**同步**赋值（早于任何`await`），保证并发/重复调用天然只触发一次`performStop()`。
+   - `performStop()` 顺序：`running=false` 阻止新任务判断通过 → `clearSchedulers()` 清空定时器（阻止新的调度触发） → `abortController.abort('shutdown')` 中断可取消的等待 → `await Promise.allSettled([...this.inflight])` 等待全部已注册在途任务真正结束 → 若 `this.lease` 存在且 `!this.leaseLost`，调用新增的 `releaseLease(lease)`（`UPDATE collector_leases SET expires_at=clock_timestamp(),heartbeat_at=clock_timestamp() WHERE lease_name=$1 AND holder_id=$2 AND fencing_token=$3`——与`acquireLease()`同表同结构，`WHERE`同时约束三者，只可能影响自己当前持有的那一行，不可能误释放其他owner或旧token对应的行）；释放失败被`logger.warn`记录但不让`stop()`抛出。
+
+   两个类的实现相互独立（各自持有自己的`inflight`/`stopPromise`/`track()`/`releaseLease()`），未共享实例或互相调用；模式上与本仓库既有的 `FeatureGeneratorService`（`server/src/features/generator-service.js`）已验证过的`inflight`/`track()`/幂等`stop()`模式保持一致（独立理解代码后各自重新实现，未复制 Codex 提供的任何修复包）。
+
+3. **P2-1**：`V1_4C_TEST_RESULTS.md`/本报告本节同步更新为本轮修复后**实际执行**得到的真实测试数字，不预先假设固定数值（详见下方"离线测试结果"与`V1_4C_TEST_RESULTS.md` §0B）。
+
+### 本轮修改/新增文件
+
+| 文件 | 变更 |
+|---|---|
+| `server/src/lifecycle.js`（新增） | P0-1通用生命周期编排原语：`startStagesWithRollback`/`stopStagesInOrder`/`createIdempotentCloser` |
+| `server/src/index.js` | `bootstrap()`改为分阶段启动+失败逆序回滚+共享数据库幂等关闭，`collector.stop()`改为显式`{closeRepository:false}` |
+| `server/src/forecast/generator-service.js` | 新增`inflight`/`track()`/幂等`stop()`/`performStop()`/`releaseLease()`；`runOnce()`拆分为薄包装+`executeRunOnce()` |
+| `server/src/outcome/evaluator-service.js` | 同上，独立实现 |
+| `server/tests/lifecycle-rollback.test.js`（新增） | P0-1专项：6项 |
+| `server/tests/forecast/forecast-generator-shutdown.test.js`（新增） | P1-1专项（ForecastGenerator）：6项 |
+| `server/tests/forecast/outcome-evaluator-shutdown.test.js`（新增） | P1-1专项（OutcomeEvaluator）：6项 |
+| `server/tests/helpers/fake-lease-pool.js`（新增） | 测试专用内存版`collector_leases`表，供上述三个测试文件共享（极少量必要测试辅助代码，不含业务逻辑） |
+| `V1_4C_TEST_RESULTS.md` | 新增§0B记录本轮修复与真实测试结果，更新§2/§7/§8陈旧的`209/209`与未重新验证的PostgreSQL数字 |
+| `V1_4C_IMPLEMENTATION_REPORT.md` | 本节 |
+
+未修改交易策略、预测公式/方向判定、`ForecastSnapshot`/`ForecastOutcomeEvent`数据口径、时间契约（`asOfTime`/`dataCutoffTime`语义）、数据库schema（本轮无迁移变更）；未合并`main`、未部署服务器、未连接或修改生产数据库。
+
+### 离线测试结果（本轮实际执行）
+
+```
+$ cd server && npm test
+tests 232
+pass 232
+fail 0
+skip 0
+
+$ npm run check
+（同等范围）exit 0
+
+$ npm run test:features
+tests 44 / pass 44 / fail 0（附加验证，确认FeatureGeneratorService相关代码未受影响）
+```
+
+修复前基线（`41b03b3`）离线`npm test`实际为`214/214/0/0`；本轮新增18项专项测试（`lifecycle-rollback.test.js`6项 + `forecast-generator-shutdown.test.js`6项 + `outcome-evaluator-shutdown.test.js`6项），`214+18=232`，与实际执行结果一致——未预先假设固定的最终数字。
+
+### PostgreSQL集成测试：本轮**未执行**
+
+当前实施环境未配置`TEST_DATABASE_URL`。环境中`127.0.0.1:5432`确有一个可达的PostgreSQL实例，但该实例正是本机生产服务`eth-alpha-collector`（systemd单元、`/opt/eth-alpha/eth-alpha-trading-system`、以`eth-alpha`系统账户运行，当前任务账户`ubuntu`无权限读写该目录，未使用`sudo`访问）实际连接的数据库；按任务边界与"仅在已经配置隔离测试数据库且不会接触生产库时执行"的要求，本轮未新建隔离测试角色/数据库、未设置`TEST_DATABASE_URL`，因此`npm run test:postgres`及其六个子命令**均未执行**。§0A/§6a/§6b/§6c/§8/§9记录的真实PostgreSQL验证证据（62项）均为此前（配置了隔离库的环境下）的历史记录，本轮未重新验证，也未用离线测试结果冒充。本轮改动的4个生产代码文件（`lifecycle.js`/`index.js`/`generator-service.js`/`evaluator-service.js`）中，lease释放（`releaseLease`的真实SQL执行效果）与"回滚时数据库连接池实际不残留"这两点的真实PostgreSQL端到端验证仍待CI或配置了隔离库的环境补充执行；本轮已通过内存态fake pool（`tests/helpers/fake-lease-pool.js`，精确复刻`collector_leases`表的`lease_name`/`holder_id`/`fencing_token`/`expires_at`语义与相关SQL的匹配条件）对该逻辑做了行为级验证，但fake pool不能替代真实PostgreSQL的并发/事务/索引行为验证。
+
 ## 0. 本轮修订说明（Codex 独立复审 REQUEST CHANGES 后的修复）
 
 Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审给出 REQUEST CHANGES，要求修复三项问题：
@@ -17,6 +124,7 @@ Codex 对提交 `1b0343e4eee7f1bded2316f40c1257840250c4db` 的独立复审给出
 - 实施分支：`claude/v1.4c-server-forecast-implementation`（本轮开始前已存在，本地 HEAD 与基线一致、未提交任何内容；worktree 中存有另一会话遗留的、与规范范围完全一致的未提交实施文件——已在获得用户明确指示后接续该 worktree 继续完成）
 - 第一次提交完整哈希：`1b0343e4eee7f1bded2316f40c1257840250c4db`（父提交为基线 `dfa1dc2...`）——已被 Codex 独立复审判定 REQUEST CHANGES
 - 本轮修复提交完整哈希 / 父提交哈希：见本报告末尾"提交与推送结果"一节（commit 在报告生成后执行，父提交为 `1b0343e4eee7f1bded2316f40c1257840250c4db`）
+- **（2026-07-24 追加）** 本次生命周期加固（§0C）的修复基线为 `41b03b392c59cc97949ff918ddb715ee01ddcee7`（父提交 `21d167c`），是上述P0-1/P1-1/P1-2修复与本节§0A FeatureGenerator修复均已落地之后、Codex对该提交再次REQUEST CHANGES指出新一轮P0-1/P1-1/P2-1问题的版本；本次修复提交完整哈希见本报告末尾新增的"提交与推送结果（2026-07-24）"一节
 
 ## 2. 前置检查结论
 

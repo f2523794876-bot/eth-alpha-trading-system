@@ -23,6 +23,12 @@ export function loadConfig() {
     leaseTtlMs: integer('LEASE_TTL_MS', 60_000, 10_000),
     backfillPollMs: integer('BACKFILL_POLL_MS', 15_000, 1_000),
     backfillMaxAttempts: integer('BACKFILL_MAX_ATTEMPTS', 5, 1),
+    featureGeneratorPollMs: integer('FEATURE_GENERATOR_POLL_MS', 15_000, 1_000),
+    featureGeneratorBatchSize: integer('FEATURE_GENERATOR_BATCH_SIZE', 32, 1),
+    forecastPollMs: integer('FORECAST_POLL_MS', 300_000, 1_000),
+    forecastFeatureWaitMs: integer('FORECAST_FEATURE_WAIT_MS', 2_000, 10),
+    forecastFeatureWaitAttempts: integer('FORECAST_FEATURE_WAIT_ATTEMPTS', 4, 1),
+    outcomePollMs: integer('OUTCOME_POLL_MS', 300_000, 1_000),
     healthRetentionDays: integer('HEALTH_RETENTION_DAYS', 90, 1),
     freshnessGraceMultiplier: positiveNumber('FRESHNESS_GRACE_MULTIPLIER',3),
     logLevel: process.env.LOG_LEVEL || 'info'

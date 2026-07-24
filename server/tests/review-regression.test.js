@@ -59,13 +59,34 @@ test('Codex复审P0-1修复：ForecastGenerator/OutcomeEvaluator已接入生产�
   assert.match(indexSource,/import\s*\{\s*OutcomeEvaluator\s*\}\s*from\s*'\.\/outcome\/evaluator-service\.js'/,'index.js必须导入OutcomeEvaluator');
   assert.match(indexSource,/new ForecastGenerator\(/,'index.js必须实例化ForecastGenerator');
   assert.match(indexSource,/new OutcomeEvaluator\(/,'index.js必须实例化OutcomeEvaluator');
-  assert.match(indexSource,/forecastGenerator\.start\(\)/,'bootstrap()必须调用forecastGenerator.start()');
-  assert.match(indexSource,/outcomeEvaluator\.start\(\)/,'bootstrap()必须调用outcomeEvaluator.start()');
+  assert.match(indexSource,/forecastGenerator\.start\(/,'bootstrap()必须调用forecastGenerator.start()');
+  assert.match(indexSource,/outcomeEvaluator\.start\(/,'bootstrap()必须调用outcomeEvaluator.start()');
   assert.match(indexSource,/forecastGenerator\.stop\(\)/,'graceful shutdown必须包含forecastGenerator.stop()');
   assert.match(indexSource,/outcomeEvaluator\.stop\(\)/,'graceful shutdown必须包含outcomeEvaluator.stop()');
   // 两者必须各自持有独立holderId（不得与collector共用同一个collectorId直接作为holderId，避免与primary-collector lease混淆）
   assert.match(indexSource,/forecast-generator/);
   assert.match(indexSource,/outcome-evaluator/);
+});
+
+test('V1.4C生产生命周期接入独立FeatureGenerator并以精确时间键保障特征先于预测',async()=>{
+  const packageJson=JSON.parse(await readFile(new URL('../package.json',import.meta.url),'utf8'));
+  const featureEntry=await readFile(new URL('../src/features/generator-service-entry.js',import.meta.url),'utf8');
+  const featureService=await readFile(new URL('../src/features/generator-service.js',import.meta.url),'utf8');
+  const forecastService=await readFile(new URL('../src/forecast/generator-service.js',import.meta.url),'utf8');
+  const featureUnit=await readFile(new URL('../../deploy/systemd/eth-alpha-feature-generator.service',import.meta.url),'utf8');
+  const collectorUnit=await readFile(new URL('../../deploy/systemd/eth-alpha-collector.service',import.meta.url),'utf8');
+  assert.equal(packageJson.scripts['features:serve'],'node src/features/generator-service-entry.js');
+  assert.match(featureEntry,/new FeatureGeneratorService\(/);
+  assert.match(featureEntry,/process\.once\('SIGTERM'/);
+  assert.match(featureService,/FEATURE_GENERATOR_LEASE\s*=\s*'feature-generator'/);
+  assert.match(featureService,/listPendingFeatureTargets/);
+  assert.match(featureService,/scheduleHeartbeat/);
+  assert.match(forecastService,/waitForExactFeature/);
+  assert.match(forecastService,/target_bar_close_time=to_timestamp\(\$2\/1000\.0\)/);
+  assert.doesNotMatch(forecastService,/target_bar_close_time<=to_timestamp\(\$2\/1000\.0\)/);
+  assert.match(featureUnit,/ExecStart=.*generator-service-entry\.js/);
+  assert.match(collectorUnit,/Wants=.*eth-alpha-feature-generator\.service/);
+  assert.doesNotMatch(collectorUnit,/Requires=.*eth-alpha-feature-generator\.service/);
 });
 
 test('Codex复审P1-1修复：Generator/Evaluator各自实现独立heartbeat续约与graceful shutdown（复用CollectorService心跳模式）',async()=>{

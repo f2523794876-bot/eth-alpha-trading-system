@@ -33,6 +33,17 @@ export class OutcomeEvaluator {
     this.timers = []; this.heartbeatTimer = null; this.running = false; this.leaseLost = false; this.lease = null;
     // 独立abortController（P0-1/P1-1要求）：不与ForecastGenerator或CollectorService共享
     this.abortController = new AbortController();
+    // P1-1修复：独立inflight跟踪集合，理由同forecast/generator-service.js构造函数同名字段注释——
+    // 本类独立实现，不复用ForecastGenerator实例或其track()方法。
+    this.inflight = new Set();
+    // stop()幂等：见forecast/generator-service.js同名字段注释，本类独立持有自己的stopPromise。
+    this.stopPromise = null;
+  }
+
+  track(promise) {
+    this.inflight.add(promise);
+    promise.then(() => this.inflight.delete(promise), () => this.inflight.delete(promise));
+    return promise;
   }
 
   // P0-1修复：正式生产启动入口，与ForecastGenerator完全独立（不同类实例、不同timers、不同running/lease状态、
@@ -50,23 +61,24 @@ export class OutcomeEvaluator {
 
   schedule(intervalMs) {
     this.running = true;
-    const tick = async () => {
+    // P1-1修复：整轮tick经track()注册进inflight，理由同ForecastGenerator.schedule()同名注释。
+    const tick = () => this.track((async () => {
       if (!this.running) return;
       try { await this.runOnce(); } catch { /* 失败已记录于forecast_evaluation_runs/forecast_quality_events */ }
       if (this.running) this.timers.push(setTimeout(tick, intervalMs));
-    };
+    })());
     this.timers.push(setTimeout(tick, intervalMs));
   }
 
   // P1-1修复（Codex复审）：理由同generator-service.js scheduleHeartbeat()头部注释——独立定时器链、
   // 续约失败立即loseLease()自行停止，不依赖也不影响ForecastGenerator的调度/心跳。
   scheduleHeartbeat(intervalMs = Math.floor(this.leaseTtlMs / 3)) {
-    const tick = async () => {
+    const tick = () => this.track((async () => {
       if (!this.running) return;
       try { await this.heartbeat(); }
       catch (error) { this.logger?.error?.('outcome evaluator heartbeat failed', { code: error.code || error.message }); }
       if (this.running) this.heartbeatTimer = setTimeout(tick, intervalMs);
-    };
+    })());
     this.heartbeatTimer = setTimeout(tick, intervalMs);
   }
 
@@ -97,15 +109,38 @@ export class OutcomeEvaluator {
     this.abortController.abort(reason);
   }
 
+  // P1-1修复：graceful shutdown，顺序与实现方式独立于ForecastGenerator但遵循同一契约——见
+  // forecast/generator-service.js stop()/performStop()同名方法注释。
   async stop() {
+    if (!this.stopPromise) this.stopPromise = this.performStop();
+    return this.stopPromise;
+  }
+
+  async performStop() {
     this.running = false;
     this.clearSchedulers();
     this.abortController.abort('shutdown');
+    await Promise.allSettled([...this.inflight]);
+    const lease = this.lease;
+    this.lease = null;
+    if (lease && !this.leaseLost) {
+      try { await this.releaseLease(lease); }
+      catch (error) { this.logger?.warn?.('outcome evaluator lease release failed', { code: error.code || error.message }); }
+    }
+  }
+
+  async releaseLease(lease) {
+    const result = await this.pool.query(
+      `UPDATE collector_leases SET expires_at=clock_timestamp(),heartbeat_at=clock_timestamp() WHERE lease_name=$1 AND holder_id=$2 AND fencing_token=$3
+       RETURNING lease_name AS "leaseName",holder_id AS "holderId",fencing_token::bigint AS "fencingToken",expires_at AS "expiresAt"`,
+      [lease.leaseName, lease.holderId, lease.fencingToken]
+    );
+    return result.rows[0] || null;
   }
 
   status() {
     return {
-      running: this.running, holderId: this.holderId, leaseLost: this.leaseLost,
+      running: this.running, holderId: this.holderId, leaseLost: this.leaseLost, pendingOperations: this.inflight.size,
       lease: this.lease ? { leaseName: this.lease.leaseName, holderId: this.lease.holderId, fencingToken: this.lease.fencingToken, expiresAt: this.lease.expiresAt } : null
     };
   }
@@ -172,7 +207,13 @@ export class OutcomeEvaluator {
     return result.rows;
   }
 
-  async runOnce({ limit = 50 } = {}) {
+  // P1-1修复：runOnce()统一经track()注册进inflight，理由同ForecastGenerator.runOnce()同名注释；
+  // 真正的评估逻辑放在executeRunOnce()中。
+  runOnce(options) {
+    return this.track(this.executeRunOnce(options));
+  }
+
+  async executeRunOnce({ limit = 50 } = {}) {
     if (!this.lease) await this.acquireLease();
     if (!this.lease) return { status: 'BLOCKED', reason: 'LEASE_UNAVAILABLE' };
     const runId = randomUUID();
