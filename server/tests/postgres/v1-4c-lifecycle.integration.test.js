@@ -4,16 +4,68 @@
 // 沿用本仓库既有测试基础设施：TEST_DATABASE_URL隔离库名安全检查、runMigrations(down→up)重置schema、pgtest降级模式、
 // Node内建test/assert。不修改任何生产实现（server/src/lifecycle.js、forecast/generator-service.js、
 // outcome/evaluator-service.js、index.js）以迎合测试；本文件只使用它们已有的公开方法与构造参数。
+//
+// 复审补充（2026-07-25）：PG-4/PG-6最初只用手搭的stages数组直接调用startStagesWithRollback()/
+// stopStagesInOrder()，从未真正调用src/index.js的bootstrap()，因此没有覆盖真实Collector/API装配、
+// bootstrap()自身的catch回滚路径、以及它对共享pg.Pool的实际管理。本轮新增"PG-4-real"/"PG-6-real"两个
+// 测试，直接import并调用真实的bootstrap()——利用它本就支持的config参数注入点（不修改bootstrap本身一行代码）：
+// 把spotBaseUrl/futuresBaseUrl指向一个本机必然拒绝连接的端口（127.0.0.1:1），使Collector的真实HTTP请求
+// 确定性地快速失败并被现有生产代码的容错路径吸收为BLOCKED状态（不抛异常，见collector/service.js runCycle()
+// time.ok===false分支）——不需要另起一个假冒Binance的mock HTTP server，也没有绕开任何真实装配/真实网络层。
+// 原有的"PG-4"/"PG-6"（不带-real后缀）继续保留，但改名为"编排层"专项，明确其覆盖范围仅是
+// startStagesWithRollback()/stopStagesInOrder()这两个通用函数本身的正确性，不再暗示覆盖了bootstrap()装配。
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { createPgPool } from '../../src/db/postgres.js';
 import { runMigrations } from '../../src/db/migrate.js';
 import { ForecastGenerator, LEASE_NAME as GENERATOR_LEASE } from '../../src/forecast/generator-service.js';
 import { OutcomeEvaluator, LEASE_NAME as EVALUATOR_LEASE } from '../../src/outcome/evaluator-service.js';
 import { startStagesWithRollback, stopStagesInOrder, createIdempotentCloser } from '../../src/lifecycle.js';
+import { bootstrap } from '../../src/index.js';
 
 const url = process.env.TEST_DATABASE_URL, enabled = Boolean(url), pgtest = enabled ? test : test.skip;
 let pool;
+const COLLECTOR_LEASE = 'primary-collector';
+
+// bootstrap()支持的config是一个普通参数（默认值才是loadConfig()），本身就是官方的注入点——直接构造一个
+// 测试专用config对象传给bootstrap(config)，不需要也没有修改bootstrap()一行代码。spotBaseUrl/futuresBaseUrl
+// 指向127.0.0.1:1（一个必然无人监听的特权端口，本机连接会被内核立即RST拒绝），让Collector的真实HTTP请求
+// 快速且确定性地失败——不依赖真实Binance可达性（已知在部分GitHub Runner地区会被451阻塞，不确定性来源）。
+// application_name标记本次bootstrap()内部创建的pg.Pool连接，供之后用pg_stat_activity真实核实"连接数归零"。
+function buildBootstrapConfig({ collectorId, port, applicationName }) {
+  const databaseUrl = new URL(url);
+  databaseUrl.searchParams.set('application_name', applicationName);
+  return Object.freeze({
+    env: 'test', host: '127.0.0.1', port,
+    databaseUrl: databaseUrl.toString(), dbSsl: false,
+    collectorId,
+    spotBaseUrl: 'http://127.0.0.1:1', futuresBaseUrl: 'http://127.0.0.1:1',
+    timeoutMs: 2000, maxRetries: 0, backoffBaseMs: 1, backoffCapMs: 1,
+    maxClockOffsetMs: 5000, leaseTtlMs: 60000,
+    backfillPollMs: 200, backfillMaxAttempts: 1,
+    forecastPollMs: 10_000_000, forecastFeatureWaitMs: 10, forecastFeatureWaitAttempts: 1,
+    outcomePollMs: 10_000_000,
+    freshnessGraceMultiplier: 3
+  });
+}
+
+async function probeApiPort(port, { timeoutMs = 1000 } = {}) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/health/live`, { signal: AbortSignal.timeout(timeoutMs) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// bootstrap()回滚/正常关停时其内部创建的pg.Pool对外完全不可见（回滚路径下bootstrap()甚至不会把任何引用
+// 返回给调用方）——用application_name标记那一个pool的全部连接，之后用pg_stat_activity真实计数，
+// 是唯一能从黑盒外部确认"bootstrap()自己持有的那个真实pg.Pool确实被关闭"的手段，而不是猜测或看返回值。
+async function countTaggedConnections(adminPool, applicationName) {
+  const result = await adminPool.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name=$1', [applicationName]);
+  return Number(result.rows[0].n);
+}
 
 const okServerTime = at => async () => ({ ok: true, sourceServerTime: at });
 const NEVER_DUE = 1; // serverTime远早于任何真实referenceBar边界，generateSnapshot/evaluatePending会快速判定为BLOCKED/无待处理项，不依赖任何market数据种子
@@ -233,10 +285,11 @@ pgtest('PG-3 OutcomeEvaluator.stop()在runOnce()真实事务被行锁阻塞期�
 });
 
 // ============================================================
-// C. bootstrap()分阶段启动失败在真实pg.Pool连接下逆序回滚（PG-4），共享池只关闭一次（PG-5）
+// C. 编排层专项：startStagesWithRollback()/createIdempotentCloser()本身在真实pg.Pool下的正确性——
+//    只验证这两个通用函数，不涉及bootstrap()真实装配（真实bootstrap()覆盖见"PG-4-real"）。
 // ============================================================
 
-pgtest('PG-4/PG-5 startStagesWithRollback：真实连接下ForecastGenerator已启动、OutcomeEvaluator启动失败，逆序回滚真实释放Generator的lease，某stage.stop()报错不阻断其余回滚，原始错误被保留，共享池只关闭一次', { timeout: 30_000 }, async () => {
+pgtest('[编排层] startStagesWithRollback：真实连接下ForecastGenerator已启动、OutcomeEvaluator启动失败，逆序回滚真实释放Generator的lease，某stage.stop()报错不阻断其余回滚，原始错误被保留，共享池只关闭一次', { timeout: 30_000 }, async () => {
   // 独立于文件级共享pool的第二个真实pg.Pool——本测试会在末尾真实调用.end()，必须避免影响其他测试共用的pool
   const rollbackPool = await createPgPool({ databaseUrl: url, dbSsl: false });
   try {
@@ -296,10 +349,63 @@ pgtest('PG-4/PG-5 startStagesWithRollback：真实连接下ForecastGenerator已�
 });
 
 // ============================================================
-// D. 正常关停顺序：Forecast/Outcome等待在途真实事务、完成lease收尾，然后才关闭共享pg.Pool（PG-6）
+// C-real. bootstrap()真实装配启动失败回滚（PG-4）：真实Collector/API/ForecastGenerator/OutcomeEvaluator，
+//    通过src/index.js的真实bootstrap()（而非手搭stages）触发一次真实的OutcomeEvaluator启动失败。
 // ============================================================
 
-pgtest('PG-6 正常关停：stopStagesInOrder等待真实在途事务与lease收尾完成后，共享池才会被关闭', { timeout: 30_000 }, async () => {
+pgtest('PG-4-real bootstrap()真实装配：OutcomeEvaluator真实启动失败时，已真实启动的Collector/API/ForecastGenerator被真实逆序清理，其内部共享pg.Pool真实只关闭一次', { timeout: 30_000 }, async () => {
+  await expireLease(pool, COLLECTOR_LEASE);
+  await expireLease(pool, GENERATOR_LEASE);
+  await expireLease(pool, EVALUATOR_LEASE);
+
+  const applicationName = `v14c_bootstrap_rollback_${randomUUID().slice(0, 8)}`;
+  const collectorId = `v14c-bootstrap-rollback-${randomUUID().slice(0, 8)}`;
+  const apiPort = 48173; // GitHub Actions job专属隔离容器内的固定端口，job结束即销毁，无跨job冲突风险
+
+  // 预先让另一个holder持有Outcome的lease（未过期），使bootstrap()内部真实的OutcomeEvaluator.start()真实失败——
+  // 这是唯一预置的条件；Collector/API/ForecastGenerator全部通过真实bootstrap()装配与启动，未做任何模拟替身。
+  const competitor = new OutcomeEvaluator({ pool, holderId: 'v14c-bootstrap-rollback-competitor', serverTimeProvider: okServerTime(NEVER_DUE), leaseTtlMs: 60000 });
+  await competitor.acquireLease();
+
+  const config = buildBootstrapConfig({ collectorId, port: apiPort, applicationName });
+
+  await assert.rejects(
+    bootstrap(config),
+    error => error.code === 'OUTCOME_EVALUATOR_LEASE_HELD',
+    'bootstrap()必须重新抛出真实的OutcomeEvaluator启动失败错误，而不是被回滚清理过程中的任何错误替换'
+  );
+
+  // 真实DB验证：Collector与ForecastGenerator这两个真实启动过的组件，其lease必须已在bootstrap()真实回滚中被释放
+  const collectorRow = await readLeaseRow(pool, COLLECTOR_LEASE);
+  assert.ok(collectorRow.expiresAt.getTime() <= Date.now(), 'bootstrap()真实回滚必须释放真实Collector持有的primary-collector lease');
+  const genRow = await readLeaseRow(pool, GENERATOR_LEASE);
+  assert.ok(genRow.expiresAt.getTime() <= Date.now(), 'bootstrap()真实回滚必须释放真实ForecastGenerator持有的lease');
+
+  // Outcome从未真实启动成功——其lease行必须仍由competitor持有，未被回滚误触碰
+  const competitorRow = await readLeaseRow(pool, EVALUATOR_LEASE);
+  assert.equal(competitorRow.holderId, 'v14c-bootstrap-rollback-competitor', '回滚不得触碰从未真实启动成功的OutcomeEvaluator对应lease行的持有者');
+
+  // 真实端口验证：bootstrap()内部真实创建并启动过的API server，必须已被真实关闭，不再监听
+  assert.equal(await probeApiPort(apiPort), false, 'bootstrap()真实回滚后，真实API端口不得继续监听');
+
+  // 真实连接数验证：bootstrap()内部持有的那一个pg.Pool（application_name标记）的全部真实连接都必须已关闭，
+  // 而不是仅仅"看起来"关闭——这是从外部黑盒确认"该pool被真实关闭"的唯一可靠手段
+  assert.equal(await countTaggedConnections(pool, applicationName), 0, 'bootstrap()回滚后其内部真实共享pg.Pool的全部连接都必须已真实关闭');
+
+  // 真实DB活动证明Collector的真实定时器确已被清空：等待远超缩短后的backfillPollMs(200ms)，
+  // 不得再出现任何新的collection_runs行——若定时器未被真实clearInterval，此处会检测到持续增长
+  const runsAfterRollback = Number((await pool.query('SELECT count(*)::int AS n FROM collection_runs WHERE collector_id=$1', [collectorId])).rows[0].n);
+  await new Promise(resolve => setTimeout(resolve, 800));
+  const runsAfterWait = Number((await pool.query('SELECT count(*)::int AS n FROM collection_runs WHERE collector_id=$1', [collectorId])).rows[0].n);
+  assert.equal(runsAfterWait, runsAfterRollback, 'Collector的真实定时器必须已被真实清空，回滚后不得再产生任何新的collection_runs活动');
+});
+
+// ============================================================
+// D. 编排层专项：stopStagesInOrder()本身在真实pg.Pool下的正确性——只验证该通用函数，
+//    不涉及bootstrap()真实装配（真实bootstrap()完整四阶段覆盖见"PG-6-real"）。
+// ============================================================
+
+pgtest('[编排层] 正常关停：stopStagesInOrder等待真实在途事务与lease收尾完成后，共享池才会被关闭', { timeout: 30_000 }, async () => {
   const shutdownPool = await createPgPool({ databaseUrl: url, dbSsl: false });
   let barrier, runPromise;
   try {
@@ -341,4 +447,69 @@ pgtest('PG-6 正常关停：stopStagesInOrder等待真实在途事务与lease收
     if (runPromise) await runPromise.catch(() => {});
     await safeEndPool(shutdownPool);
   }
+});
+
+// ============================================================
+// D-real. bootstrap()真实装配正常关停（PG-6）：真实Collector/API/ForecastGenerator/OutcomeEvaluator全部
+//    真实启动成功后，调用bootstrap()真实返回的stop()，验证严格逆序（Outcome→Forecast→API→Collector→池）——
+//    stopStagesInOrder()对stages数组是严格串行for循环（见src/lifecycle.js），阻塞其中排在最前的Outcome，
+//    足以确定性证明后面全部三个阶段与最终关池都必须等它先完成才能开始，无需sleep猜测。
+// ============================================================
+
+pgtest('PG-6-real bootstrap()真实装配：正常关停严格按Outcome→Forecast→API→Collector逆序执行，Outcome真实事务未结束前，API仍在监听、Collector的lease仍有效、共享池仍未关闭；结束后四个组件与共享池全部真实收尾', { timeout: 30_000 }, async () => {
+  await expireLease(pool, COLLECTOR_LEASE);
+  await expireLease(pool, GENERATOR_LEASE);
+  await expireLease(pool, EVALUATOR_LEASE);
+
+  const applicationName = `v14c_bootstrap_shutdown_${randomUUID().slice(0, 8)}`;
+  const collectorId = `v14c-bootstrap-shutdown-${randomUUID().slice(0, 8)}`;
+  const config = buildBootstrapConfig({ collectorId, port: 0, applicationName }); // port:0由OS真实分配，bootstrap()成功后从返回值读取真实端口
+
+  const app = await bootstrap(config);
+  const apiPort = app.api.server.address().port;
+  assert.equal(await probeApiPort(apiPort), true, 'bootstrap()真实成功后，真实API端口必须处于监听状态');
+  assert.ok(await countTaggedConnections(pool, applicationName) > 0, 'bootstrap()真实成功后，其内部真实pg.Pool必须持有至少一个真实连接');
+
+  const barrier = await acquireRowLockBarrier(pool, EVALUATOR_LEASE);
+  let outcomeRunPromise;
+  try {
+    // 用app.outcomeEvaluator（bootstrap()真实构造并真实start()过的那一个实例，不是另起的替身）触发一次真实runOnce()
+    outcomeRunPromise = app.outcomeEvaluator.runOnce();
+    const blocked = await waitForBlockedLockRequest(pool, { timeoutMs: 5000 });
+    assert.ok(blocked, '真实OutcomeEvaluator.runOnce()必须真实被行锁阻塞');
+
+    // app.stop()是bootstrap()真实返回的那个关停闭包，内部真实调用stopStagesInOrder(真实4个stages)+真实closeDatabase()
+    const stopFlag = await settledFlag(app.stop('TEST'));
+    await tick(); await tick();
+    assert.equal(stopFlag.settled, false, '正常关停不得在Outcome的真实事务仍被阻塞时提前完成');
+
+    // stopStagesInOrder对stages数组严格串行执行（for...of + await），Outcome排在逆序的第一位；
+    // 只要它还没完成，后面的forecastGenerator/api/collector三个stage必然连"开始执行stop()"都还没轮到——
+    // 用三项独立、可观测的真实信号分别验证"确实还没轮到"：
+    assert.equal(await probeApiPort(apiPort), true, 'Outcome仍被真实事务阻塞时，API必须仍在真实监听（严格逆序：outcome必须先于api完成停止）');
+    const collectorRowDuring = await readLeaseRow(pool, COLLECTOR_LEASE);
+    assert.ok(collectorRowDuring.expiresAt.getTime() > Date.now(), 'Outcome仍被真实事务阻塞时，Collector的真实lease必须仍然有效（尚未轮到collector.stop()）');
+    assert.ok(await countTaggedConnections(pool, applicationName) > 0, 'Outcome仍被真实事务阻塞时，共享pg.Pool必须仍未被真实关闭');
+
+    await barrier.release(); // 唯一的解锁动作，来自测试显式控制
+    await outcomeRunPromise.catch(() => {});
+    const deadline = Date.now() + 8000;
+    while (!stopFlag.settled && Date.now() < deadline) await tick();
+    assert.equal(stopFlag.settled, true, 'Outcome真实事务结束后，正常关停必须能够完整走完剩余三个阶段并完成');
+    assert.equal(stopFlag.error, undefined, 'app.stop()不应因等待真实事务而抛出异常');
+  } finally {
+    await barrier.release().catch(() => {});
+    if (outcomeRunPromise) await outcomeRunPromise.catch(() => {});
+  }
+
+  // 关停完成后：真实Collector/ForecastGenerator/OutcomeEvaluator三者的lease均已真实释放，
+  // 真实API端口已真实关闭，bootstrap()内部真实pg.Pool的全部连接已真实归零——四阶段+关池全部到位
+  assert.equal(await probeApiPort(apiPort), false, '关停完成后，真实API端口必须已真实关闭');
+  const collectorRowAfter = await readLeaseRow(pool, COLLECTOR_LEASE);
+  assert.ok(collectorRowAfter.expiresAt.getTime() <= Date.now(), '关停完成后Collector的真实lease必须已释放');
+  const genRowAfter = await readLeaseRow(pool, GENERATOR_LEASE);
+  assert.ok(genRowAfter.expiresAt.getTime() <= Date.now(), '关停完成后ForecastGenerator的真实lease必须已释放');
+  const evalRowAfter = await readLeaseRow(pool, EVALUATOR_LEASE);
+  assert.ok(evalRowAfter.expiresAt.getTime() <= Date.now(), '关停完成后OutcomeEvaluator的真实lease必须已释放');
+  assert.equal(await countTaggedConnections(pool, applicationName), 0, '关停完成后bootstrap()内部真实pg.Pool的全部连接都必须已真实关闭');
 });
