@@ -375,9 +375,12 @@ pgtest('PG-4-real bootstrap()真实装配：OutcomeEvaluator真实启动失败�
     'bootstrap()必须重新抛出真实的OutcomeEvaluator启动失败错误，而不是被回滚清理过程中的任何错误替换'
   );
 
-  // 真实DB验证：Collector与ForecastGenerator这两个真实启动过的组件，其lease必须已在bootstrap()真实回滚中被释放
-  const collectorRow = await readLeaseRow(pool, COLLECTOR_LEASE);
-  assert.ok(collectorRow.expiresAt.getTime() <= Date.now(), 'bootstrap()真实回滚必须释放真实Collector持有的primary-collector lease');
+  // 真实DB验证：ForecastGenerator真实启动过，其lease必须已在bootstrap()真实回滚中被释放。
+  // 注意：CollectorService.stop()（既有V1.4A实现，本轮及上一轮均未修改、也不在本轮允许修改范围）本就不会释放
+  // 自己的primary-collector lease——它复用与Forecast/Outcome相同的"ON CONFLICT...WHERE expires_at<=now()
+  // OR holder_id=EXCLUDED.holder_id"重入语义，同一进程用同一个collectorId重启时无需显式释放即可原地续用。
+  // 这不是本轮要修复的缺口，因此Collector是否真正被清空改用下方"回滚后不再产生新的collection_runs活动"这一
+  // DB可观测代理来验证（真正需要验证的是"定时器被clearInterval"，而不是"lease被释放"这件对Collector不适用的事）。
   const genRow = await readLeaseRow(pool, GENERATOR_LEASE);
   assert.ok(genRow.expiresAt.getTime() <= Date.now(), 'bootstrap()真实回滚必须释放真实ForecastGenerator持有的lease');
 
@@ -485,10 +488,11 @@ pgtest('PG-6-real bootstrap()真实装配：正常关停严格按Outcome→Forec
 
     // stopStagesInOrder对stages数组严格串行执行（for...of + await），Outcome排在逆序的第一位；
     // 只要它还没完成，后面的forecastGenerator/api/collector三个stage必然连"开始执行stop()"都还没轮到——
-    // 用三项独立、可观测的真实信号分别验证"确实还没轮到"：
+    // 用三项独立、可观测的真实信号分别验证"确实还没轮到"。Collector.running直接读取bootstrap()真实返回的
+    // app.collector实例（本测试是成功路径，持有真实引用，不像PG-4-real的失败路径完全拿不到内部引用）——
+    // 不用lease行判断Collector，因为CollectorService.stop()本就不释放自己的lease（见PG-4-real同名注释）。
     assert.equal(await probeApiPort(apiPort), true, 'Outcome仍被真实事务阻塞时，API必须仍在真实监听（严格逆序：outcome必须先于api完成停止）');
-    const collectorRowDuring = await readLeaseRow(pool, COLLECTOR_LEASE);
-    assert.ok(collectorRowDuring.expiresAt.getTime() > Date.now(), 'Outcome仍被真实事务阻塞时，Collector的真实lease必须仍然有效（尚未轮到collector.stop()）');
+    assert.equal(app.collector.running, true, 'Outcome仍被真实事务阻塞时，Collector必须仍处于running状态（尚未轮到collector.stop()）');
     assert.ok(await countTaggedConnections(pool, applicationName) > 0, 'Outcome仍被真实事务阻塞时，共享pg.Pool必须仍未被真实关闭');
 
     await barrier.release(); // 唯一的解锁动作，来自测试显式控制
@@ -502,11 +506,11 @@ pgtest('PG-6-real bootstrap()真实装配：正常关停严格按Outcome→Forec
     if (outcomeRunPromise) await outcomeRunPromise.catch(() => {});
   }
 
-  // 关停完成后：真实Collector/ForecastGenerator/OutcomeEvaluator三者的lease均已真实释放，
+  // 关停完成后：真实Collector确已停止运行且定时器清空，ForecastGenerator/OutcomeEvaluator的lease均已真实释放，
   // 真实API端口已真实关闭，bootstrap()内部真实pg.Pool的全部连接已真实归零——四阶段+关池全部到位
   assert.equal(await probeApiPort(apiPort), false, '关停完成后，真实API端口必须已真实关闭');
-  const collectorRowAfter = await readLeaseRow(pool, COLLECTOR_LEASE);
-  assert.ok(collectorRowAfter.expiresAt.getTime() <= Date.now(), '关停完成后Collector的真实lease必须已释放');
+  assert.equal(app.collector.running, false, '关停完成后Collector必须已真实停止运行');
+  assert.equal(app.collector.timers.length, 0, '关停完成后Collector的真实定时器必须已被清空');
   const genRowAfter = await readLeaseRow(pool, GENERATOR_LEASE);
   assert.ok(genRowAfter.expiresAt.getTime() <= Date.now(), '关停完成后ForecastGenerator的真实lease必须已释放');
   const evalRowAfter = await readLeaseRow(pool, EVALUATOR_LEASE);
