@@ -1,0 +1,84 @@
+name: V1.4C PostgreSQL 16 lifecycle validation (forward-looking, non-blocking gate)
+
+# 本workflow是PostgreSQL 16下的专项向前验证，用于真实覆盖V1.4C服务生命周期加固（lease释放owner/token/fencing
+# 隔离、stop()等待真实在途事务、bootstrap()启动失败逆序回滚、共享pg.Pool只关闭一次、正常关停顺序）。
+# 不替换、不降低 .github/workflows/v1-4a-postgres-integration.yml 现有的PostgreSQL 14强制门禁——那是唯一的
+# 生产集成强制门禁，本workflow只是针对新增生命周期测试的补充向前验证。
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'server/src/lifecycle.js'
+      - 'server/src/index.js'
+      - 'server/src/forecast/generator-service.js'
+      - 'server/src/outcome/evaluator-service.js'
+      - 'server/tests/postgres/v1-4c-lifecycle.integration.test.js'
+      - '.github/workflows/v1-4c-postgres16-lifecycle-validation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  postgres16-lifecycle-validation:
+    name: PostgreSQL 16生命周期专项验证（非阻断性向前验证）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: eth_alpha_test
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: eth_alpha_v14c_lifecycle_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eth_alpha_test -d eth_alpha_v14c_lifecycle_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: server
+    env:
+      # 仅指向本job专属的临时service container（Runner内部127.0.0.1，job结束即销毁），不读取任何仓库secrets，
+      # 不连接任何生产或外部数据库。库名含"test"，满足仓库既有的隔离库名安全校验正则(/test|ci|v14/i)。
+      TEST_DATABASE_URL: postgresql://eth_alpha_test:test-only-password@127.0.0.1:5432/eth_alpha_v14c_lifecycle_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: 等待PostgreSQL 16 service container健康检查通过
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -p 5432 -U eth_alpha_test -d eth_alpha_v14c_lifecycle_test && break
+            echo "等待PostgreSQL就绪... ($i/30)"
+            sleep 2
+          done
+          pg_isready -h 127.0.0.1 -p 5432 -U eth_alpha_test -d eth_alpha_v14c_lifecycle_test
+
+      - name: 安装锁定依赖
+        run: npm ci
+
+      - name: 运行新增V1.4C生命周期真实PostgreSQL集成测试
+        run: node --test tests/postgres/v1-4c-lifecycle.integration.test.js
+        timeout-minutes: 5
+
+      - name: 运行既有test:postgres组合（六组真实PostgreSQL套件，向前验证于PostgreSQL 16）
+        run: npm run test:postgres
+        timeout-minutes: 8
+
+      - name: 运行离线单元/结构性测试套件
+        run: npm test
+        timeout-minutes: 5
+
+      - name: 运行语法与离线检查
+        run: npm run check
+        timeout-minutes: 5
