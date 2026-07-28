@@ -66,8 +66,26 @@ export async function verifyDatasetManifest({ pool, datasetVersion, marketType =
     };
   }
 
-  // 第4步：独立比对record_count/per_interval_record_count/data_from/data_to/backfill_batch_ids，
-  // 即使第3步哈希已隐含这些信息，仍单独比对以产生更具体的错误信息（而非只报"哈希不一致"）。
+  // 第4步：独立比对record_count/per_interval_record_count/data_from/data_to/backfill_batch_ids。
+  //
+  // P2-1可达性说明（独立复审，不得伪称四项字段级错误码都已被独立、等概率覆盖）：
+  // - DATASET_TIME_RANGE_MISMATCH 在当前调用路径下【结构性不可达】——本函数第36-44行用于recompute的
+  //   `from`/`to` 本身就是 `toEpochMs(manifest.data_from)`/`toEpochMs(manifest.data_to)`（见上方赋值），
+  //   即此处比较的是同一来源算出来的两个值，永远相等，这不是"哈希先一步拦截"，而是此分支根本没有独立输入
+  //   来源可以产生分歧，是纯粹的死代码。保留该分支只作为未来若recompute改为传入独立`from`/`to`时的
+  //   防御性占位，不代表当前存在任何可触发它的真实场景（见本文件对应集成测试的显式反例断言）。
+  // - DATASET_RECORD_COUNT_MISMATCH 在当前调用路径下【被第3步哈希比对天然先行拦截，实际不可达】——
+  //   recompute使用的`from`/`to`固定等于manifest自身存储的区间（同上），而`recordCount`/
+  //   `perIntervalRecordCount`都是§2.9冻结哈希内容对象的一部分（canonical-manifest-content.js），
+  //   market_bars在该固定区间内的任何增减都会同时改变recordCount与recomputedContentHash，
+  //   第3步的DATASET_CONTENT_HASH_MISMATCH必然先于此处触发，此分支目前只是纵深防御（哈希算法/
+  //   哈希内容清单未来若有疏漏导致recordCount脱离哈希覆盖范围时的兜底），不代表已被独立验证覆盖。
+  // - DATASET_BATCH_SET_MISMATCH 与前两者不同——是【真正独立可达】的检查：下方
+  //   `findOverlappingBackfillBatchIds`对`historical_validation.backfill_batches`发起全新查询，
+  //   不依赖manifest存储的`backfillBatchIds`（那是recompute哈希时使用的输入，即"信任manifest自称的
+  //   批次集合"），而是从数据库当前实际状态重新推导"此刻与该区间重叠的批次"——manifest冻结后新增覆盖
+  //   同一区间的批次这一场景下，content_hash不变（backfillBatchIds作为哈希输入仍是manifest原始存储值），
+  //   但本步比对会独立发现漂移，产生真正独立于哈希比对结果的DATASET_BATCH_SET_MISMATCH（见对应集成测试）。
   if (recomputed.recordCount !== manifest.record_count) {
     return { ok: false, errorCode: 'DATASET_RECORD_COUNT_MISMATCH', datasetVersion, manifestRecordCount: manifest.record_count, recomputedRecordCount: recomputed.recordCount };
   }

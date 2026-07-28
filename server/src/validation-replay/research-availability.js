@@ -17,6 +17,21 @@ export const RESEARCH_AVAILABILITY_RULE_VERSION = 'v1.4d-research-availability-1
 // （显式<=asOfTime，或经调用方保证<=asOfTime的精确相等查询）隐含满足，故丢弃是等价变换，不是放宽判据。
 const AVAILABLE_AT_FETCHED_AT_PATTERN = /available_at<=to_timestamp\(\$(\d+)\/1000\.0\)\s+AND\s+fetched_at<=to_timestamp\(\$\1\/1000\.0\)/;
 
+// P1-2修复（独立复审）：exact-match查询（`close_time=to_timestamp($M/1000.0)`，用于
+// locateReferenceBarAndPath/locatePathForEvaluation按精确closeTime定位referenceBar）不像range查询那样
+// 自带`close_time<=asOfTime`这一SQL层面的天然约束——range查询（queryRecentContiguousBars的
+// `close_time<=to_timestamp($N/1000.0)`、path范围查询的`close_time<=to_timestamp($N/1000.0)`）本身已经
+// 由SQL的`<=`保证closeTime不超过asOfTime，无需本模块额外校验；但exact-match查询的$M（被查询的具体closeTime）
+// 与asOfTime是两个独立参数，SQL文本本身不表达"$M<=asOfTime"这一关系——该关系此前完全依赖调用方
+// （bar-path-locator.js里的computeAlignedReferenceCloseTime，或locatePathForEvaluation的调用方传入的
+// referenceBarRef.closeTime）自行保证，这正是本次独立复审指出的问题："不得只依赖调用者保证exact-match查询中
+// 的closeTime<=asOfTime"。bar-path-locator.js是冻结复用模块（§4.7），不得修改，因此在本模块（回放查询层）
+// 内部对exact-match查询新增一道独立的、无法被调用方绕过的强制校验：解析出被精确匹配的closeTime参数值，
+// 与asOfTime参数值比较，closeTime>asOfTime时fail closed，在查询下发给数据库之前就拒绝（不给恶意构造的
+// "未来"available_at/closeTime数据任何被读取的机会）。closeTime===asOfTime允许（右闭区间语义，与range查询
+// 的`<=`一致）。
+const EXACT_MATCH_CLOSE_TIME_PATTERN = /close_time=to_timestamp\(\$(\d+)\/1000\.0\)/;
+
 // 包装一个"queryable"对象（duck-types同pg Pool/Client的.query(sql, params)接口），供直接传给
 // bar-path-locator.js 的 computeFourHourAtr14/computeConsecutiveBreakoutBars/locateReferenceBarAndPath/
 // locatePathForEvaluation 使用——这四个函数本身不做任何修改（§4.7冻结要求，不改签名不改已有生产查询）。
@@ -43,6 +58,21 @@ export function createResearchAvailabilityQueryable(pool, { replayNowMs }) {
       // 保留此注释防止未来重构不小心又引入同样的空洞）。修复：把available_at子句替换为一个仍然引用$N的
       // 永真式（$N对应的asOfTime数值本身不受影响），fetched_at改绑定到紧随其后、连续递增的新末位参数。
       const originalAsOfParamIndex = match[1];
+      const asOfTimeValue = params[Number(originalAsOfParamIndex) - 1];
+
+      // exact-match query shape：模块边界内强制 closeTime<=asOfTime，不依赖调用者保证（P1-2修复）。
+      const exactMatch = EXACT_MATCH_CLOSE_TIME_PATTERN.exec(sql);
+      if (exactMatch) {
+        const closeTimeParamIndex = Number(exactMatch[1]);
+        const closeTimeValue = params[closeTimeParamIndex - 1];
+        if (!(Number.isFinite(closeTimeValue) && Number.isFinite(asOfTimeValue) && closeTimeValue <= asOfTimeValue)) {
+          throw Object.assign(
+            new Error(`research-availability queryable: exact-match close_time (${closeTimeValue}) exceeds asOfTime (${asOfTimeValue}); refusing to read data that would not yet be available at the simulated historical clock (fail closed)`),
+            { code: 'EXACT_MATCH_CLOSE_TIME_AFTER_AS_OF_TIME', closeTimeValue, asOfTimeValue }
+          );
+        }
+      }
+
       const newParamIndex = params.length + 1;
       const rewrittenSql = sql.replace(
         AVAILABLE_AT_FETCHED_AT_PATTERN,

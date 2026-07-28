@@ -24,13 +24,22 @@ const SHAPE_C_PATH_RANGE = `SELECT open_time, close_time FROM market_bars
        AND close_time<=to_timestamp($4/1000.0) AND available_at<=to_timestamp($4/1000.0) AND fetched_at<=to_timestamp($4/1000.0)
      ORDER BY open_time ASC, revision_number DESC`;
 
+// locatePathForEvaluation()（bar-path-locator.js，评估期专用）的路径范围查询——WHERE子句形状与SHAPE_C相同，
+// 但SELECT列不同（多selects high/low/close），是独立的第4种真实调用点文本，与locateReferenceBarAndPath的
+// SHAPE_B/SHAPE_C（生成期专用）合计构成P1-2要求覆盖的"4种query shape"。
+const SHAPE_D_EVALUATION_PATH_RANGE = `SELECT open_time, close_time, high::text, low::text, close::text FROM market_bars
+     WHERE instrument=$1 AND market_type='spot' AND interval_name='15m'
+       AND open_time>=to_timestamp($2/1000.0) AND open_time<=to_timestamp($3/1000.0)
+       AND close_time<=to_timestamp($4/1000.0) AND available_at<=to_timestamp($4/1000.0) AND fetched_at<=to_timestamp($4/1000.0)
+     ORDER BY open_time ASC, revision_number DESC`;
+
 function makeCapturingPool() {
   const calls = [];
   return { calls, query: async (sql, params) => { calls.push({ sql, params }); return { rows: [] }; } };
 }
 
-test('三种真实query形状均能被识别并改写：available_at子句被丢弃，fetched_at改绑定新参数(replayNowMs)', async () => {
-  for (const shape of [SHAPE_A_RECENT_CONTIGUOUS, SHAPE_B_EXACT_REFERENCE, SHAPE_C_PATH_RANGE]) {
+test('四种真实query形状均能被识别并改写：available_at子句被丢弃，fetched_at改绑定新参数(replayNowMs)', async () => {
+  for (const shape of [SHAPE_A_RECENT_CONTIGUOUS, SHAPE_B_EXACT_REFERENCE, SHAPE_C_PATH_RANGE, SHAPE_D_EVALUATION_PATH_RANGE]) {
     const capturing = makeCapturingPool();
     const replayNowMs = 1_800_000_000_000;
     const queryable = createResearchAvailabilityQueryable(capturing, { replayNowMs });
@@ -63,6 +72,49 @@ test('未识别的查询形状fail closed，拒绝盲目转发生产available_at
 test('replayNowMs非安全整数时立即fail closed（不得静默使用历史asOfTime代替）', () => {
   assert.throws(() => createResearchAvailabilityQueryable({}, { replayNowMs: undefined }), (err) => err.code === 'INVALID_REPLAY_NOW');
   assert.throws(() => createResearchAvailabilityQueryable({}, { replayNowMs: NaN }), (err) => err.code === 'INVALID_REPLAY_NOW');
+});
+
+// P1-2修复（独立复审）：exact-match查询（SHAPE_B/SHAPE_D的姊妹exact-match形状，用真实的SHAPE_B文本，
+// 因为SHAPE_B与locatePathForEvaluation()的引用查询文本逐字符相同——见research-availability.js顶部注释）
+// 不得只依赖调用者（bar-path-locator.js，冻结复用模块，不可修改）保证closeTime<=asOfTime，
+// 必须在本模块内部对该关系做fail-closed强制校验。
+test('P1-2：exact-match查询中closeTime<asOfTime——允许，正常转发', async () => {
+  const capturing = makeCapturingPool();
+  const queryable = createResearchAvailabilityQueryable(capturing, { replayNowMs: 1_800_000_000_000 });
+  // SHAPE_B: params = [instrument, closeTime($2), asOfTime($3)]
+  await queryable.query(SHAPE_B_EXACT_REFERENCE, ['ETHUSDT', 1000, 2000]);
+  assert.equal(capturing.calls.length, 1, 'closeTime<asOfTime时必须正常执行查询');
+});
+
+test('P1-2：exact-match查询中closeTime=asOfTime——允许（右闭区间语义），正常转发', async () => {
+  const capturing = makeCapturingPool();
+  const queryable = createResearchAvailabilityQueryable(capturing, { replayNowMs: 1_800_000_000_000 });
+  await queryable.query(SHAPE_B_EXACT_REFERENCE, ['ETHUSDT', 2000, 2000]);
+  assert.equal(capturing.calls.length, 1, 'closeTime=asOfTime时必须正常执行查询（与range查询的<=语义一致）');
+});
+
+test('P1-2红线：exact-match查询中closeTime>asOfTime——立即fail closed，拒绝发生在查询下发给数据库之前', async () => {
+  const capturing = makeCapturingPool();
+  const queryable = createResearchAvailabilityQueryable(capturing, { replayNowMs: 1_800_000_000_000 });
+  // closeTime($2)=3000 > asOfTime($3)=2000：模拟恶意构造/上游bug产出的"未来"closeTime。
+  await assert.rejects(
+    queryable.query(SHAPE_B_EXACT_REFERENCE, ['ETHUSDT', 3000, 2000]),
+    (err) => err.code === 'EXACT_MATCH_CLOSE_TIME_AFTER_AS_OF_TIME'
+  );
+  assert.equal(capturing.calls.length, 0, 'fail closed时不得把查询转发给底层pool——恶意构造的未来closeTime数据不能有任何机会被读取');
+});
+
+test('P1-2：拒绝仅针对exact-match形状生效，range形状（SHAPE_A/C/D）的close_time<=asOfTime本身已由SQL保证，不受此项额外校验影响', async () => {
+  for (const [shape, params] of [
+    [SHAPE_A_RECENT_CONTIGUOUS, ['ETHUSDT', '4h', 1000, 45]],
+    [SHAPE_C_PATH_RANGE, ['ETHUSDT', 3000, 4000, 5000]],
+    [SHAPE_D_EVALUATION_PATH_RANGE, ['ETHUSDT', 3000, 4000, 5000]]
+  ]) {
+    const capturing = makeCapturingPool();
+    const queryable = createResearchAvailabilityQueryable(capturing, { replayNowMs: 1_800_000_000_000 });
+    await queryable.query(shape, params);
+    assert.equal(capturing.calls.length, 1, `range形状(${shape.slice(0, 20)}...)不应被exact-match校验误拦截`);
+  }
 });
 
 test('buildResearchDataVintage：产出包含规则版本/asOfTime/消费的bar列表/批次列表/明确声明文本', async () => {

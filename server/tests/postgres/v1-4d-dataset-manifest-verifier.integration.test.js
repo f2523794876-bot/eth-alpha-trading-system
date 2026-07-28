@@ -104,6 +104,30 @@ test('第3步：manifest冻结后market_bars内容变化（新增一个revision�
   });
 });
 
+// P2-1（独立复审）：审查第4步字段级错误码的可达性——DATASET_RECORD_COUNT_MISMATCH/DATASET_TIME_RANGE_MISMATCH
+// 在当前实现下被第3步的哈希比对天然先行拦截（或结构性不可达），与DATASET_BATCH_SET_MISMATCH的独立可达性
+// （见上面/下面的DATASET_BATCH_SET_MISMATCH测试）形成对照——本测试显式证明这一点，而不是伪称四项字段级
+// 错误码都已被独立覆盖：任何会改变recordCount的market_bars增减，产生的是DATASET_CONTENT_HASH_MISMATCH，
+// 不是DATASET_RECORD_COUNT_MISMATCH（因为recomputed的from/to固定复用manifest自身存储区间，
+// recordCount本身又是§2.9冻结哈希内容对象的一部分，两者必然同步变化，哈希比对必然先触发）。
+test('P2-1：market_bars记录数在manifest冻结后减少——实际触发的是DATASET_CONTENT_HASH_MISMATCH而非DATASET_RECORD_COUNT_MISMATCH（验证字段级错误码在此路径下不可达，见dataset-manifest-verifier.js对应注释）', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const base = Date.UTC(2026, 3, 6, 0, 0, 0);
+    const { bar0Open, bar1Open, bar2Close } = await seedThreeBars(client, base);
+    const built = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(built.status, 'SUCCEEDED');
+    assert.equal(built.recordCount, 3);
+
+    // manifest冻结后删除区间内一条bar（recordCount从3变为2）——data_from/data_to（manifest自身存储值）不变。
+    await client.query(`DELETE FROM market_bars WHERE instrument='ETHUSDT' AND open_time=to_timestamp($1/1000.0)`, [bar1Open]);
+
+    const verified = await verifyDatasetManifest({ pool: client, datasetVersion: built.datasetVersion });
+    assert.equal(verified.ok, false);
+    assert.equal(verified.errorCode, 'DATASET_CONTENT_HASH_MISMATCH', 'recordCount变化必然伴随content_hash变化，第3步必然先于第4步的record-count专属分支触发');
+    assert.notEqual(verified.errorCode, 'DATASET_RECORD_COUNT_MISMATCH');
+  });
+});
+
 test('第4步：manifest冻结后新增覆盖同一区间的backfill批次导致DATASET_BATCH_SET_MISMATCH（不依赖哈希是否变化）', { skip }, async () => {
   await withTxClient(async (client) => {
     const base = Date.UTC(2026, 3, 3, 0, 0, 0);

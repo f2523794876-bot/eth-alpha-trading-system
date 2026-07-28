@@ -249,6 +249,78 @@ test('INSERTED：完整生成流程——predictionId格式/source_origin/calibr
   });
 });
 
+// R25.2：research_availability_rule_version升级后，同一prediction_id的旧/新规则版本记录必须并存
+// （UNIQUE(prediction_id, research_availability_rule_version)复合唯一约束生效），旧版本不被覆盖或删除。
+// generateReplaySnapshot()本身总是写入代码内置的当前RESEARCH_AVAILABILITY_RULE_VERSION，没有公开的
+// "指定旧规则版本"入口——直接通过SQL克隆一行、把research_availability_rule_version改写成旧版本号，
+// 模拟"这条记录是在规则升级之前、用旧规则版本生成的"这一历史状态，与dataset-manifest-verifier.js
+// 测试文件里"直接操纵行"模拟场景的做法一致。
+test('R25.2：research_availability_rule_version升级后，同一prediction_id的新旧规则版本记录并存，旧记录不被覆盖', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const validationRunId = randomUUID();
+    const dayStart = Date.UTC(2026, 4, 6, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const referenceOpenTime = referenceCloseTime - FIFTEEN_MIN_MS + 1;
+    await seedValidationRun(client, { validationRunId, from: referenceCloseTime - DAY_MS, to: referenceCloseTime + DAY_MS });
+    const replayNowMs = Date.now();
+    await seedReferenceBar(client, { symbol: 'ETHUSDT', openTime: referenceOpenTime, closeTime: referenceCloseTime, replayNowMs, closeStr: '1000.00' });
+    await seedFourHourAtrBars(client, { symbol: 'ETHUSDT', referenceCloseTime, count: 15, replayNowMs });
+    await seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTime: referenceCloseTime });
+
+    const current = await generateReplaySnapshot({
+      pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
+      datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
+    });
+    assert.equal(current.status, 'INSERTED');
+    const predictionId = current.record.predictionId;
+    const oldRuleVersion = 'v1.4d-research-availability-0-legacy';
+
+    // 克隆当前行，只把research_availability_rule_version改成一个"旧"值——模拟该prediction_id在规则
+    // 升级前已存在一条旧规则版本记录。
+    await client.query(
+      `INSERT INTO historical_validation.replay_snapshots(
+         prediction_id,generation_run_id,backfill_batch_id,dataset_version,instrument,horizon,generated_at,data_cutoff_time,
+         target_start_time,target_end_time,reference_price,reference_bar_ref,target_bar_ref,expected_bar_count,expected_direction,
+         direction_threshold,raw_threshold,threshold_floor,threshold_ceiling,threshold_formula_version,atr14_four_hour_at_generation,
+         target_state_at_generation,proxy_state_at_generation,fusion_state_at_generation,candidate_trajectories,
+         scenario_weight_baseline,scenario_weight_upside,scenario_weight_downside,probability_status,calibrated_probabilities,
+         expected_price_zones,trigger_conditions,invalidation_conditions,algorithm_version,weight_version,rule_version,
+         data_vintage_refs,feature_values_used,feature_record_ids,feature_engine_version,content_hash,auxiliary_evidence,
+         historical_as_of_time,research_data_vintage,research_availability_rule_version,source_origin
+       )
+       SELECT prediction_id,generation_run_id,backfill_batch_id,dataset_version,instrument,horizon,generated_at,data_cutoff_time,
+         target_start_time,target_end_time,reference_price,reference_bar_ref,target_bar_ref,expected_bar_count,expected_direction,
+         direction_threshold,raw_threshold,threshold_floor,threshold_ceiling,threshold_formula_version,atr14_four_hour_at_generation,
+         target_state_at_generation,proxy_state_at_generation,fusion_state_at_generation,candidate_trajectories,
+         scenario_weight_baseline,scenario_weight_upside,scenario_weight_downside,probability_status,calibrated_probabilities,
+         expected_price_zones,trigger_conditions,invalidation_conditions,algorithm_version,weight_version,rule_version,
+         data_vintage_refs,feature_values_used,feature_record_ids,feature_engine_version,content_hash,auxiliary_evidence,
+         historical_as_of_time,research_data_vintage,$2,source_origin
+       FROM historical_validation.replay_snapshots WHERE prediction_id=$1 AND research_availability_rule_version=$3`,
+      [predictionId, oldRuleVersion, RESEARCH_AVAILABILITY_RULE_VERSION]
+    );
+
+    const rows = (await client.query(
+      `SELECT research_availability_rule_version FROM historical_validation.replay_snapshots WHERE prediction_id=$1 ORDER BY research_availability_rule_version`,
+      [predictionId]
+    )).rows;
+    assert.equal(rows.length, 2, '同一prediction_id下新旧两条research_availability_rule_version记录必须都存在（复合唯一约束允许并存）');
+    assert.deepEqual(rows.map(r => r.research_availability_rule_version).sort(), [oldRuleVersion, RESEARCH_AVAILABILITY_RULE_VERSION].sort());
+
+    // 旧记录内容必须逐字节未被覆盖或删除（只有research_availability_rule_version不同，其余字段应与克隆源一致）。
+    const oldRow = (await client.query(
+      `SELECT reference_price::text FROM historical_validation.replay_snapshots WHERE prediction_id=$1 AND research_availability_rule_version=$2`,
+      [predictionId, oldRuleVersion]
+    )).rows[0];
+    const newRow = (await client.query(
+      `SELECT reference_price::text FROM historical_validation.replay_snapshots WHERE prediction_id=$1 AND research_availability_rule_version=$2`,
+      [predictionId, RESEARCH_AVAILABILITY_RULE_VERSION]
+    )).rows[0];
+    assert.equal(oldRow.reference_price, newRow.reference_price);
+  });
+});
+
 test('R10.1/R10.2：prediction_id 100%以GMKG-REPLAY-开头，与生产GMKG-SRV-互斥', { skip }, async () => {
   await withTxClient(async (client) => {
     const validationRunId = randomUUID();

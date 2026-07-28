@@ -29,8 +29,17 @@ export function computeRowContentHash({ open, high, low, close, volume, quoteVol
 
 // §2.9.2：intervals 无专门排序规则条款，但为保证"同一内容不同调用顺序产生相同dataset_version"这一冻结性质（§2.9.7），
 // 采用与规范全文示例一致的固定顺序（按周期长度升序）去重排序，不依赖调用方传入顺序。
+// P2-2修复（独立复审）：INTERVAL_RANK只定义了15m/1h/4h三个冻结interval——此前对未知interval用
+// `?? Number.MAX_SAFE_INTEGER`兜底，会把任何拼写错误/非法interval静默排到末尾，仍然参与哈希计算，
+// 产出一个"看起来正常"但语义上无意义的dataset_version（其manifest_members实际引用了一个从未被
+// 冻结定义过的interval的数据）。改为fail closed：遇到不在INTERVAL_RANK中的interval立即拒绝，不静默纳入。
 function sortIntervals(intervals) {
-  return [...new Set(intervals)].sort((a, b) => (INTERVAL_RANK[a] ?? Number.MAX_SAFE_INTEGER) - (INTERVAL_RANK[b] ?? Number.MAX_SAFE_INTEGER));
+  for (const interval of intervals) {
+    if (!Object.hasOwn(INTERVAL_RANK, interval)) {
+      throw Object.assign(new Error(`Unknown interval: ${interval} (only 15m/1h/4h are frozen)`), { code: 'UNKNOWN_INTERVAL', interval });
+    }
+  }
+  return [...new Set(intervals)].sort((a, b) => INTERVAL_RANK[a] - INTERVAL_RANK[b]);
 }
 
 // §2.9.2 backfillBatchIds排序规则：先去重，再按UUID标准文本表示严格字典序升序。

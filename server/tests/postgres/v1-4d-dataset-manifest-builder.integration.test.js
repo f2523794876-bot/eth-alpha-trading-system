@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
-import { buildDatasetManifest } from '../../src/validation-replay/dataset-manifest-builder.js';
+import { buildDatasetManifest, computeManifestContentForRange } from '../../src/validation-replay/dataset-manifest-builder.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = !TEST_DATABASE_URL;
@@ -105,6 +105,138 @@ test('同一内容范围重复构建幂等：dataset_version相同，不产生�
 
     const count = (await client.query(`SELECT count(*)::int AS n FROM historical_validation.dataset_manifests WHERE dataset_version=$1`, [first.datasetVersion])).rows[0].n;
     assert.equal(count, 1);
+  });
+});
+
+// R26.2：不同系统时钟（不同真实执行时刻）构建同一批market_bars数据的manifest，content_hash/dataset_version
+// 必须完全一致——created_at等执行时间不进入哈希内容（§2.9"禁止纳入哈希内容的字段"）。
+// buildCanonicalManifestContent()本身不接受任何时钟/now参数，§2.9冻结字段清单里也没有created_at，
+// 用真实延迟（跨越可观察的wall-clock时间差）+ 一次真实DB往返构建两次，证明这一点在真实执行路径下成立，
+// 而不仅是"函数签名里没有now参数"这一静态观察。
+test('R26.2：不同系统时钟（真实延迟后）重新构建同一批数据的manifest，content_hash/dataset_version完全一致', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const base = Date.UTC(2026, 2, 6, 0, 0, 0);
+    const { bar0Open, bar2Close } = await seedThreeBars(client, base);
+
+    const first = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(first.status, 'SUCCEEDED');
+
+    await new Promise(resolve => setTimeout(resolve, 50)); // 真实跨越一段wall-clock时间差
+
+    const second = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(second.status, 'SUCCEEDED');
+    assert.equal(second.datasetVersion, first.datasetVersion, '不同真实执行时刻构建同一批数据，dataset_version必须完全一致');
+
+    const rows = (await client.query(`SELECT created_at FROM historical_validation.dataset_manifests WHERE dataset_version=$1`, [first.datasetVersion])).rows;
+    assert.equal(rows.length, 1, 'ON CONFLICT DO NOTHING天然幂等——不因第二次调用产生第二行');
+  });
+});
+
+// R26.3：manifest冻结后market_bars某一行的close值发生变化（测试环境构造，模拟内容篡改），
+// 用相同(symbol,intervals,from,to)重新构建manifest，content_hash必须不同——rowContentHash覆盖OHLCV六字段。
+test('R26.3：market_bars某一行close值变化后重新构建manifest，content_hash必须不同', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const base = Date.UTC(2026, 2, 7, 0, 0, 0);
+    const { bar0Open, bar2Close } = await seedThreeBars(client, base);
+    const first = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(first.status, 'SUCCEEDED');
+
+    // 直接篡改一行的close值（测试环境构造——market_bars本身在生产路径下是只追加的，此处只为验证
+    // buildCanonicalManifestContent()对内容变化的敏感性，不代表生产会发生这种写入）。
+    // 值必须仍满足market_bars_check（high>=close>=low，kline()固定high='1001.00'/low='998.00'），
+    // 否则会被CHECK约束拒绝而非本测试想验证的"内容变化反映到哈希"场景。
+    await client.query(`UPDATE market_bars SET close='999.50' WHERE instrument='ETHUSDT' AND open_time=to_timestamp($1/1000.0)`, [bar0Open]);
+
+    const second = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(second.status, 'SUCCEEDED');
+    assert.notEqual(second.datasetVersion, first.datasetVersion, 'close值变化必须反映为不同的dataset_version');
+  });
+});
+
+// R26.4：同一bar存在revision_number=1的新版本（测试环境构造），重新计算manifest内容，content_hash必须
+// 不同——manifest_members包含revisionNumber字段。用computeManifestContentForRange()（构建/校验共用的
+// 底层内容计算函数，只读查询+哈希，不做完整性判定）而非buildDatasetManifest()直接验证：因为
+// loadIntervalRows()对同一open_time的多个revision【不去重】（与checkIntegrity()为gap/顺序检测而
+// dedupe到最高revision是两回事——那是完整性判定口径，不是manifest内容哈希口径），新增一行revision=1后
+// 会被同时计入manifest_members(4条而非3条)，hash因此必然不同；而buildDatasetManifest()在此之上还叠加了
+// 一层独立的完整性gate（checkIntegrity()发现同一open_time出现两个revision会记为duplicateCount>0并
+// REJECTED——这是构建流程本身的既有fail-closed设计，不是本测试要验证的对象，故此处绕开该gate）。
+test('R26.4：同一bar存在revision_number=1新版本后，manifest内容(computeManifestContentForRange)的content_hash必须不同', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const base = Date.UTC(2026, 2, 8, 0, 0, 0);
+    const { bar0Open, bar2Close } = await seedThreeBars(client, base);
+    const from = bar0Open, to = bar2Close + 1;
+    const first = await computeManifestContentForRange({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from, to, backfillBatchIds: [] });
+    assert.equal(first.recordCount, 3);
+
+    const bar0 = (await client.query(`SELECT * FROM market_bars WHERE instrument='ETHUSDT' AND open_time=to_timestamp($1/1000.0)`, [bar0Open])).rows[0];
+    await client.query(
+      `INSERT INTO market_bars(
+         source_id, endpoint_id, instrument, market_type, interval_name, open_time, close_time,
+         open, high, low, close, volume, quote_volume, trade_count, taker_buy_base_volume, taker_buy_quote_volume,
+         observation_start, observation_end, published_at, available_at, first_available_at, fetched_at,
+         revision_number, vintage_id, raw_payload_id, request_id, schema_version, normalizer_version, quality_state, content_hash
+       )
+       SELECT source_id, endpoint_id, instrument, market_type, interval_name, open_time, close_time,
+              open, high, low, close, volume, quote_volume, trade_count, taker_buy_base_volume, taker_buy_quote_volume,
+              observation_start, observation_end, published_at, available_at, first_available_at, fetched_at,
+              1, vintage_id || '-rev1', raw_payload_id, request_id, schema_version, normalizer_version, quality_state, content_hash
+       FROM market_bars WHERE market_bar_id=$1`,
+      [bar0.market_bar_id]
+    );
+
+    const second = await computeManifestContentForRange({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from, to, backfillBatchIds: [] });
+    assert.equal(second.recordCount, 4, '新版本行也会被loadIntervalRows()查询命中（不按revision去重），recordCount必须增加');
+    assert.notEqual(second.datasetVersion, first.datasetVersion, '新增revision_number=1版本必须反映为不同的dataset_version（manifest_members包含revisionNumber字段）');
+  });
+});
+
+// R26.5：追加一次覆盖同一时间范围的新backfill批次（backfill_batch_id=C），即使未引入新K线，
+// 重新构建manifest时backfillBatchIds集合本身变化，必须反映为不同的content_hash/dataset_version
+// （§2.9绑定字段清单：backfillBatchIds是被哈希字段之一）。
+test('R26.5：追加覆盖同一区间的新backfill_batch后重新构建manifest，backfillBatchIds集合变化必须反映为不同的dataset_version', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const base = Date.UTC(2026, 2, 9, 0, 0, 0);
+    const { bar0Open, bar2Close } = await seedThreeBars(client, base);
+    const first = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(first.status, 'SUCCEEDED');
+    const firstBatchIds = (await client.query(`SELECT backfill_batch_ids FROM historical_validation.dataset_manifests WHERE dataset_version=$1`, [first.datasetVersion])).rows[0].backfill_batch_ids;
+
+    await client.query(
+      `INSERT INTO historical_validation.backfill_batches(backfill_batch_id, symbol, interval_name, requested_start_utc, requested_end_utc, status, started_at, finished_at)
+       VALUES ($1,'ETHUSDT','15m',to_timestamp($2/1000.0),to_timestamp($3/1000.0),'SUCCEEDED',now(),now())`,
+      [randomUUID(), bar0Open, bar2Close + 1]
+    );
+
+    const second = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(second.status, 'SUCCEEDED');
+    const secondBatchIds = (await client.query(`SELECT backfill_batch_ids FROM historical_validation.dataset_manifests WHERE dataset_version=$1`, [second.datasetVersion])).rows[0].backfill_batch_ids;
+    assert.notDeepEqual(secondBatchIds.sort(), firstBatchIds.sort(), 'backfillBatchIds集合本身必须确实发生变化（这是本测试成立的前提）');
+    assert.notEqual(second.datasetVersion, first.datasetVersion, 'backfillBatchIds集合变化必须反映为不同的dataset_version');
+  });
+});
+
+// R26.11：旧validation_run绑定的dataset_version=X（对应一段范围的冻结manifest）。之后执行一次新的回填，
+// 把market_bars覆盖范围扩展到更大区间（不覆盖已有范围内任何一行，纯增量），重新对dataset_version=X执行
+// 校验——必须仍然通过（content_hash不变），因为manifest范围内的数据本身未被触碰，增量数据在manifest
+// 覆盖范围之外。用户任务二："后续补数...不得悄悄改变旧validation_run绑定的数据集"。
+test('R26.11：manifest冻结范围之外的增量回填（不覆盖已有范围内任何行）不影响旧dataset_version的校验结果', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const base = Date.UTC(2026, 2, 10, 0, 0, 0);
+    const { bar0Open, bar2Close } = await seedThreeBars(client, base);
+    const first = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(first.status, 'SUCCEEDED');
+
+    // 增量回填：紧接manifest范围之后再补3根bar（完全在[bar0Open, bar2Close+1)范围之外）。
+    const extraOpen = bar2Close + 1, extraClose = extraOpen + 900000 - 1;
+    const nowMs = extraClose + 60000;
+    const adapter = makeMockAdapter({ pages: [[kline(extraOpen, extraClose)]], serverTimeMs: nowMs });
+    await backfillInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: extraOpen, endTime: extraOpen, now: () => nowMs });
+
+    const recomputed = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.equal(recomputed.status, 'SUCCEEDED');
+    assert.equal(recomputed.datasetVersion, first.datasetVersion, 'manifest范围之外的纯增量回填不得改变原范围内容的dataset_version');
+    assert.equal(recomputed.inserted, false, 'ON CONFLICT DO NOTHING——同一dataset_version不产生第二行');
   });
 });
 

@@ -113,7 +113,21 @@ export async function backfillInterval({
     onProgress?.({ cursor, lastCompletedOpenTime, rowsInserted, rowsDeduped, rowsRejected });
 
     if (rows.length < PAGE_LIMIT) break; // 最后一页
-    cursor = lastCompletedOpenTime + INTERVAL_MS[interval];
+    // P2-3修复（独立复审）：正常分页下lastCompletedOpenTime(本页最后一根bar的openTime)必须
+    // >= 本次请求的cursor(向adapter请求的startTime)，故nextCursor必然严格大于cursor。若adapter
+    // 返回了不符合请求区间的陈旧/重复页（异常实现、mock配置错误、或恶意/损坏响应），nextCursor可能
+    // <=cursor（游标不推进）——不fail closed的话会造成对同一（或更早）区间的无限重复请求。
+    // 显式守卫：一旦检测到游标未真正前进，立即fail closed并返回稳定、可诊断的错误，不静默截断
+    // （NaN等异常值下`cursor<=endTime`可能巧合为false从而"安静地"提前结束，那样会产生未被发现的
+    // 数据缺口，比抛错更危险，故此处不依赖while条件本身的副作用，主动显式校验）。
+    const nextCursor = lastCompletedOpenTime + INTERVAL_MS[interval];
+    if (!(nextCursor > cursor)) {
+      throw Object.assign(
+        new Error(`Backfill pagination cursor failed to advance (cursor=${cursor}, lastCompletedOpenTime=${lastCompletedOpenTime}, nextCursor=${nextCursor}) — refusing to loop indefinitely`),
+        { code: 'BACKFILL_CURSOR_NOT_ADVANCING', cursor, lastCompletedOpenTime, nextCursor }
+      );
+    }
+    cursor = nextCursor;
   }
 
   return { status: 'SUCCEEDED', rowsInserted, rowsDeduped, rowsRejected, lastCompletedOpenTime };

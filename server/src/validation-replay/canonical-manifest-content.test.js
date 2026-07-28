@@ -102,3 +102,15 @@ test('intervals去重且按周期长度固定顺序排序，与输入顺序无�
   const a = buildCanonicalManifestContent(baseArgs({ intervals: ['4h', '15m', '1h', '15m'], perIntervalRecordCount: { '15m': 2, '1h': 0, '4h': 0 } }));
   assert.deepEqual(a.intervals, ['15m', '1h', '4h']);
 });
+
+// P2-2修复（独立复审）：未知interval必须fail closed，不得静默排到末尾后仍参与哈希计算。
+test('P2-2红线：intervals含未知/拼写错误的interval（不在15m/1h/4h集合内）时fail closed（UNKNOWN_INTERVAL），不静默纳入哈希', () => {
+  assert.throws(
+    () => buildCanonicalManifestContent(baseArgs({ intervals: ['15m', '1d'] })),
+    (err) => err.code === 'UNKNOWN_INTERVAL' && err.interval === '1d'
+  );
+  assert.throws(
+    () => buildCanonicalManifestContent(baseArgs({ intervals: ['5m'] })),
+    (err) => err.code === 'UNKNOWN_INTERVAL' && err.interval === '5m'
+  );
+});

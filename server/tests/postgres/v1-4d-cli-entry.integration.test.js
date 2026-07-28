@@ -106,6 +106,52 @@ test('§4.1a：dataset_version未经校验(不存在)时，runWalkForward在任�
   });
 });
 
+// R26.12：--dry-run执行且人为构造manifest哈希不一致的场景——必须fail closed，且五张业务表+validation_runs
+// 全部零写入（与R9.1"dry-run零写入"叠加验证：dry-run既要在校验失败时零写入，本来在校验成功时也是零写入，
+// 二者结果一致，但触发路径不同——本测试专门验证"校验失败"这条路径，不是靠碰巧共享同一份零写入结果）。
+test('R26.12：--dry-run且manifest哈希不一致——fail closed，五张业务表与validation_runs全部零写入', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const dayStart = Date.UTC(2026, 3, 27, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
+    const from = referenceCloseTime - DAY_MS;
+    const to = referenceCloseTime + DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(client, { from, to });
+
+    // manifest冻结后market_bars内容漂移（同R26.10/R26.13手法：人为插入一条revision_number=1的行）。
+    const anyBar = (await client.query(`SELECT * FROM market_bars WHERE instrument='ETHUSDT' LIMIT 1`)).rows[0];
+    await client.query(
+      `INSERT INTO market_bars(
+         source_id, endpoint_id, instrument, market_type, interval_name, open_time, close_time,
+         open, high, low, close, volume, quote_volume, trade_count, taker_buy_base_volume, taker_buy_quote_volume,
+         observation_start, observation_end, published_at, available_at, first_available_at, fetched_at,
+         revision_number, vintage_id, raw_payload_id, request_id, schema_version, normalizer_version, quality_state, content_hash
+       )
+       SELECT source_id, endpoint_id, instrument, market_type, interval_name, open_time, close_time,
+              '999.10','1001.00','998.00','999.60', volume, quote_volume, trade_count, taker_buy_base_volume, taker_buy_quote_volume,
+              observation_start, observation_end, published_at, available_at, first_available_at, fetched_at,
+              1, vintage_id || '-rev1', raw_payload_id, request_id, schema_version, normalizer_version, quality_state, 'deadbeef'
+       FROM market_bars WHERE market_bar_id=$1`,
+      [anyBar.market_bar_id]
+    );
+
+    await assert.rejects(
+      runWalkForward({
+        pool: client, symbol: 'ETHUSDT', from, to, horizons: ['24h'],
+        algorithmVersion: ALGORITHM_VERSION, datasetVersion, ruleVersion: RULE_VERSION,
+        weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: true, nowMs: Date.now()
+      }),
+      (err) => err.code === 'DATASET_CONTENT_HASH_MISMATCH'
+    );
+
+    for (const table of ['replay_snapshots', 'replay_generation_runs', 'replay_outcome_events', 'replay_evaluation_runs', 'validation_reports', 'validation_runs']) {
+      const n = (await client.query(`SELECT count(*)::int AS n FROM historical_validation.${table}`)).rows[0].n;
+      assert.equal(n, 0, `${table}必须零写入（新任务模式下manifest gate先于validation_runs INSERT，失败时连validation_runs本身也不会有行）`);
+    }
+  });
+});
+
 test('R9.1：--dry-run对五张业务表零写入，validation_runs仅新增1行(dry_run=true)', { skip }, async () => {
   await withTxClient(async (client) => {
     const dayStart = Date.UTC(2026, 3, 21, 0, 0, 0);
@@ -170,6 +216,45 @@ test('完整非dry-run执行：单个24h节奏点产出replay_snapshots/replay_g
 
     const reportCount = (await client.query('SELECT count(*)::int AS n FROM historical_validation.validation_reports WHERE validation_run_id=$1', [plan.validationRunId])).rows[0].n;
     assert.ok(reportCount > 0, 'runWalkForward必须调用report-builder产出报告');
+  });
+});
+
+// R21.2：连接显式设置search_path='historical_validation,public'后完整执行一次回放，结果必须与默认
+// search_path下完全一致——因为代码从不依赖search_path隐式解析（`historical_validation.*`全限定名，
+// `market_bars`/`feature_records`等public schema表虽未加前缀，但只要'public'仍在search_path内就能
+// 正确解析，不要求'public'排在第一位）。
+test('R21.2：显式设置search_path=\'historical_validation,public\'后完整回放仍正确执行（不依赖search_path隐式解析）', { skip }, async () => {
+  await withTxClient(async (client) => {
+    await client.query(`SET search_path TO historical_validation, public`);
+
+    const dayStart = Date.UTC(2026, 3, 25, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
+
+    const from = referenceCloseTime - DAY_MS;
+    const to = referenceCloseTime + DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(client, { from, to });
+
+    const plan = await runWalkForward({
+      pool: client, symbol: 'ETHUSDT', from, to, horizons: ['24h'],
+      algorithmVersion: ALGORITHM_VERSION, datasetVersion, ruleVersion: RULE_VERSION,
+      weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: false,
+      nowMs: Date.now(), replayNowMs
+    });
+
+    const runRow = (await client.query('SELECT status FROM historical_validation.validation_runs WHERE validation_run_id=$1', [plan.validationRunId])).rows[0];
+    assert.equal(runRow.status, 'SUCCEEDED', '在非默认search_path下完整回放必须仍能成功执行到底');
+
+    const snapshotCount = (await client.query(
+      `SELECT count(*)::int AS n FROM historical_validation.replay_snapshots s
+       JOIN historical_validation.replay_generation_runs g ON g.generation_run_id=s.generation_run_id
+       WHERE g.validation_run_id=$1`, [plan.validationRunId]
+    )).rows[0].n;
+    assert.equal(snapshotCount, 1, '结果必须与默认search_path下完全一致（恰好一条snapshot）');
+
+    const reportCount = (await client.query('SELECT count(*)::int AS n FROM historical_validation.validation_reports WHERE validation_run_id=$1', [plan.validationRunId])).rows[0].n;
+    assert.ok(reportCount > 0);
   });
 });
 

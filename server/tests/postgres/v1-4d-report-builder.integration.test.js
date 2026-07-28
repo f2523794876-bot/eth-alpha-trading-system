@@ -5,6 +5,7 @@ import { Pool } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { generateReplaySnapshot } from '../../src/validation-replay/replay-generator.js';
+import { evaluateReplayOutcomes } from '../../src/validation-replay/replay-evaluator.js';
 import { buildValidationReports } from '../../src/validation-replay/report-builder.js';
 import { RESEARCH_AVAILABILITY_RULE_VERSION } from '../../src/validation-replay/research-availability.js';
 import { FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION } from '../../src/features/feature-version.js';
@@ -107,10 +108,23 @@ async function seedGeneratedSnapshot(client, { validationRunId, dayOffset }) {
     historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
     datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
   });
-  return { predictionId: result.record.predictionId, targetStartTime: referenceCloseTime, targetEndTime: referenceCloseTime + 96 * FIFTEEN_MIN_MS };
+  return { predictionId: result.record.predictionId, targetStartTime: referenceCloseTime, targetEndTime: referenceCloseTime + 96 * FIFTEEN_MIN_MS, status: result.status, validationRunId };
 }
 
-async function insertOutcomeEvent(client, { predictionId, directionCorrect, actualDirection = 'RANGE', endpointDataComplete = true, pathDataComplete = true, mfe = 0.01, mae = 0.01 }) {
+// 与cleanup-single-run.js集成测试的seedFullPath同构：为referenceCloseTime之后的24h horizon路径补齐96根15m bar，
+// 使evaluateReplayOutcomes能产出真实的path_eligible_for_statistics=true outcome（而不仅仅是direction）。
+async function seedFullPath(client, { referenceCloseTime, replayNowMs }) {
+  const pathStart = referenceCloseTime + 1;
+  const bars = [];
+  for (let i = 0; i < 96; i++) { const o = pathStart + i * FIFTEEN_MIN_MS; bars.push(kline(o, o + FIFTEEN_MIN_MS - 1, '1000.00')); }
+  const adapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
+  await backfillInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
+}
+
+async function insertOutcomeEvent(client, {
+  predictionId, directionCorrect, actualDirection = 'RANGE', endpointDataComplete = true, pathDataComplete = true,
+  directionEligible = true, pathEligible = true, mfe = 0.01, mae = 0.01
+}) {
   const evaluationRunId = randomUUID();
   await client.query(
     `INSERT INTO historical_validation.replay_evaluation_runs(evaluation_run_id, validation_run_id, historical_as_of_time, status, started_at)
@@ -119,16 +133,31 @@ async function insertOutcomeEvent(client, { predictionId, directionCorrect, actu
      WHERE s.prediction_id=$2 LIMIT 1`,
     [evaluationRunId, predictionId]
   );
+  // CHECK红线：direction_eligible_for_statistics=false时方向字段必须NULL；path_eligible_for_statistics=false
+  // 时路径字段必须NULL（与生产outcome-engine.js同构的两条CHECK，见migrations/005）。
+  const actualReturn = directionEligible ? 0 : null;
+  const actualDirectionValue = directionEligible ? actualDirection : null;
+  const directionCorrectValue = directionEligible ? directionCorrect : null;
+  const actualHigh = pathEligible ? 1010 : null;
+  const actualLow = pathEligible ? 990 : null;
+  const mfeValue = pathEligible ? mfe : null;
+  const maeValue = pathEligible ? mae : null;
+  const rangeMetrics = pathEligible
+    ? '{"realizedRangeInsideExpectedEnvelope":true,"expectedEnvelopeTouched":true,"upperExcursion":0.01,"lowerExcursion":0.01,"maxAbsoluteExcursion":0.01,"rangeBreachExcursion":0}'
+    : null;
   await client.query(
     `INSERT INTO historical_validation.replay_outcome_events(
        prediction_id, evaluation_version, evaluation_run_id, research_availability_rule_version, evaluated_at,
        historical_as_of_time, as_of_time, endpoint_data_complete, path_data_complete, direction_eligible_for_statistics,
        path_eligible_for_statistics, actual_return, actual_direction, direction_correct, actual_high, actual_low, mfe, mae,
        range_specific_metrics, missing_bar_refs, research_data_vintage, source_origin, content_hash
-     ) VALUES($1,$2,$3,$4,now(),now(),now(),$5,$6,true,true,0,$7,$8,1010,990,$9,$10,
-       '{"realizedRangeInsideExpectedEnvelope":true,"expectedEnvelopeTouched":true,"upperExcursion":0.01,"lowerExcursion":0.01,"maxAbsoluteExcursion":0.01,"rangeBreachExcursion":0}'::jsonb,
-       '[]'::jsonb,'{}'::jsonb,'HISTORICAL_REPLAY',$11)`,
-    [predictionId, EVALUATION_VERSION, evaluationRunId, RESEARCH_AVAILABILITY_RULE_VERSION, endpointDataComplete, pathDataComplete, actualDirection, directionCorrect, mfe, mae, sha256({ predictionId, mfe, mae })]
+     ) VALUES($1,$2,$3,$4,now(),now(),now(),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16::jsonb,
+       '[]'::jsonb,'{}'::jsonb,'HISTORICAL_REPLAY',$17)`,
+    [
+      predictionId, EVALUATION_VERSION, evaluationRunId, RESEARCH_AVAILABILITY_RULE_VERSION, endpointDataComplete, pathDataComplete,
+      directionEligible, pathEligible, actualReturn, actualDirectionValue, directionCorrectValue, actualHigh, actualLow, mfeValue, maeValue,
+      rangeMetrics, sha256({ predictionId, mfe, mae })
+    ]
   );
 }
 
@@ -207,6 +236,126 @@ test('report-builder：TRAIN/VALIDATION/TEST三段切分与purgedStraddlingCount
 
     const rows = await client.query(`SELECT report_scope FROM historical_validation.validation_reports WHERE validation_run_id=$1 AND horizon='24h'`, [validationRunId]);
     assert.deepEqual(rows.rows.map(r => r.report_scope).sort(), ['ALL', 'TEST', 'TRAIN', 'VALIDATION']);
+  });
+});
+
+// P2-4（独立复审）：purged_straddling_count计算口径核实——direction/path是两个独立的eligibility集合，
+// 各自的"跨边界被剔除"样本集合原则上可以不同。构造一个样本A(direction-eligible但path-ineligible，
+// 跨越trainEnd)与另一个样本B(path-eligible但direction-ineligible，不跨越任何边界)：direction的purge
+// 集合只含A(=1)，path的purge集合只含B(不跨界，=0)——二者确实不相等，验证report-builder.js持久化的
+// 是direction口径（见该文件对应新增注释），而不是二者恰好偶然相等时才"看似"正确。
+test('P2-4：direction与path的purgedStraddlingCount可以互不相等——report写入的是direction口径，不静默假装二者恒等', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const validationRunId = randomUUID();
+    const from = Date.UTC(2026, 5, 1) - DAY_MS;
+    const to = Date.UTC(2026, 5, 20);
+    await seedValidationRun(client, { validationRunId, from, to });
+
+    // A: dayOffset=1 -> targetStartTime≈2026-06-01末尾, targetEndTime≈2026-06-02末尾（24h horizon）。
+    const sA = await seedGeneratedSnapshot(client, { validationRunId, dayOffset: 1 });
+    // B: dayOffset=8 -> targetStartTime≈2026-06-08末尾, targetEndTime≈2026-06-09末尾，与A的窗口不重叠。
+    const sB = await seedGeneratedSnapshot(client, { validationRunId, dayOffset: 8 });
+
+    // trainEnd落在A的[targetStartTime,targetEndTime)内部——A跨越trainEnd。
+    const trainEnd = Date.UTC(2026, 5, 2, 12, 0, 0);
+    // validationEnd选在B窗口结束之后（B不跨越任何边界，完整落入VALIDATION段）。
+    const validationEnd = Date.UTC(2026, 5, 10, 0, 0, 0);
+
+    await insertOutcomeEvent(client, { predictionId: sA.predictionId, directionCorrect: true, directionEligible: true, pathEligible: false });
+    await insertOutcomeEvent(client, { predictionId: sB.predictionId, directionCorrect: true, directionEligible: false, pathEligible: true });
+
+    const reports = await buildValidationReports({
+      pool: client, validationRunId, datasetVersion: DATASET_VERSION, algorithmVersion: ALGORITHM_VERSION,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION,
+      trainEnd, validationEnd
+    });
+
+    const train = reports.find(r => r.horizon === '24h' && r.reportScope === 'TRAIN');
+    assert.ok(train);
+    // direction侧：selected集合只含A(direction-eligible)，A跨trainEnd -> purgedStraddlingCount=1。
+    // path侧（若被独立持久化）：selected集合只含B(path-eligible)，B不跨界 -> 应为0，与direction侧不同。
+    assert.equal(train.purgedStraddlingCount, 1, 'report写入的purgedStraddlingCount必须是direction口径(=1)，不是被静默替换成path口径或二者的某种混合');
+
+    const row = (await client.query(
+      `SELECT purged_straddling_count FROM historical_validation.validation_reports WHERE validation_run_id=$1 AND horizon='24h' AND report_scope='TRAIN'`,
+      [validationRunId]
+    )).rows[0];
+    assert.equal(row.purged_straddling_count, 1);
+  });
+});
+
+// P2-5（独立复审）：跨run去重导致report-builder样本少计——runB对同一逻辑预测重复尝试生成，命中runA已插入
+// 的快照（DEDUPED，snapshot本身的generation_run_id仍归属runA），但runB确实有自己的replay_generation_runs
+// 行（status=SUCCEEDED, deduped_count=1）与自己的evaluation_run/outcome_event。修复前：report-builder对
+// runB的查询用`g.generation_run_id=s.generation_run_id`判定归属，永远查不到这个样本（因为snapshot的
+// generation_run_id指向runA），runB的报告统计比它真实处理过的样本数少计1个。修复后：报告必须反映runB
+// 实际引用/处理过的样本，不能只根据snapshot最初的generation_run_id归属推断。
+test('P2-5：runB对runA已生成的快照DEDUPED后，runB的报告必须包含该样本（此前因generation_run_id归属判定被漏计）', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const runA = randomUUID();
+    const runB = randomUUID();
+    const from = Date.UTC(2026, 5, 1) - DAY_MS;
+    const to = Date.UTC(2026, 5, 10);
+    await seedValidationRun(client, { validationRunId: runA, from, to });
+    // runB复用同一个已存在的dataset_manifests/dataset_version行（seedValidationRun对dataset_manifests
+    // 用ON CONFLICT DO NOTHING，第二次调用是安全的幂等操作），只新增一条独立的validation_runs行。
+    await client.query(
+      `INSERT INTO historical_validation.validation_runs(
+         validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at
+       ) VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [runB, DATASET_VERSION, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+
+    const dayStart = Date.UTC(2026, 5, 6, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const referenceOpenTime = referenceCloseTime - FIFTEEN_MIN_MS + 1;
+    const replayNowMs = Date.now();
+    await seedReferenceBar(client, { openTime: referenceOpenTime, closeTime: referenceCloseTime, replayNowMs });
+    await seedFourHourAtrBars(client, { referenceCloseTime, count: 15, replayNowMs });
+    await seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTime: referenceCloseTime });
+
+    const genA = await generateReplaySnapshot({
+      pool: client, validationRunId: runA, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
+      datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
+    });
+    assert.equal(genA.status, 'INSERTED');
+    const genB = await generateReplaySnapshot({
+      pool: client, validationRunId: runB, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
+      datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
+    });
+    assert.equal(genB.status, 'DEDUPED', 'runB必须命中runA已插入的同一条快照(DEDUPED)才是本测试要验证的场景');
+    assert.equal(genB.record.prediction_id, genA.record.predictionId);
+
+    await seedFullPath(client, { referenceCloseTime, replayNowMs });
+    const evalAsOfTime = referenceCloseTime + 96 * FIFTEEN_MIN_MS + 3600000;
+    const evalB = await evaluateReplayOutcomes({ pool: client, validationRunId: runB, evaluationVersion: EVALUATION_VERSION, historicalAsOfTime: evalAsOfTime, replayNowMs });
+    assert.equal(evalB.evaluated, 1, 'runB自己的evaluation sweep必须真实评估了这条(它deduped命中的)快照');
+
+    const reportsB = await buildValidationReports({
+      pool: client, validationRunId: runB, datasetVersion: DATASET_VERSION, algorithmVersion: ALGORITHM_VERSION,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION
+    });
+    const allB = reportsB.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
+    assert.equal(allB.directionRawSampleCount, 1, 'runB的报告必须包含它实际deduped命中并评估过的样本，不得因snapshot归属runA而漏计为0');
+    assert.equal(allB.directionEffectiveSampleCount, 1);
+    assert.equal(allB.pathRawSampleCount, 1);
+    assert.equal(allB.pathEffectiveSampleCount, 1);
+
+    // runA自己的报告也必须能看到这条它自己插入的快照（回归——不应被本次修复破坏）。outcome_events的唯一约束
+    // 是UNIQUE(prediction_id, evaluation_version, research_availability_rule_version)，不含validation_run_id
+    // ——即同一条快照的评估结果是全局唯一、可安全跨run复用的单一canonical结果（§一冻结设计），不是"每个
+    // run各自私有一份"；runA虽然自己没调用evaluateReplayOutcomes，但runB评估产出的这条outcome_event
+    // 本就是该prediction_id在此evaluationVersion下唯一、双方共享的权威结果，runA的报告同样能看到它，
+    // 这是设计意图而非本次P2-5修复引入的新泄漏——P2-5要修复的是"snapshot本身是否被算作runB处理过的样本"
+    // （generation侧的判定），不是outcome_events本身的可见范围（那从一开始就是全局去重、天然共享的）。
+    const reportsA = await buildValidationReports({
+      pool: client, validationRunId: runA, datasetVersion: DATASET_VERSION, algorithmVersion: ALGORITHM_VERSION,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION
+    });
+    const allA = reportsA.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
+    assert.equal(allA.directionRawSampleCount, 1, 'runA生成的快照必须出现在自己的报告中（回归：不应被本次EXISTS改写破坏）');
   });
 });
 

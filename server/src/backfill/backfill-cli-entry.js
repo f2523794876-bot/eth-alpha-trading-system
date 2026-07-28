@@ -36,6 +36,29 @@ export function parseUtc(value, label) {
   return ms;
 }
 
+// P1-6修复（独立复审）：resume batch的symbol/interval_name必须与当前请求一致，请求区间也必须一致——
+// 一个backfill_batch_id按§2.11绑定唯一的(symbol, interval_name, requested_start_utc, requested_end_utc)
+// 幂等单位，跨symbol/interval/区间"借用"一个resume ID在语义上没有意义（last_completed_open_time游标
+// 是针对原(symbol,interval,range)算出来的，套到不同symbol/interval/range上会产生错误的续跑起点）。
+// 拒绝必须发生在任何market_bars写入（backfillInterval调用）之前——本函数在此处提前return/throw，
+// 不会走到下面的backfillInterval()。
+function assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTime, backfillBatchId }) {
+  if (batch.symbol !== symbol || batch.interval_name !== interval) {
+    throw Object.assign(
+      new Error(`--resume batch ${backfillBatchId} was recorded for (symbol=${batch.symbol}, interval=${batch.interval_name}), not (symbol=${symbol}, interval=${interval}); refusing to resume across a mismatched symbol/interval`),
+      { code: 'BACKFILL_RESUME_SYMBOL_INTERVAL_MISMATCH', expectedSymbol: batch.symbol, expectedInterval: batch.interval_name, actualSymbol: symbol, actualInterval: interval }
+    );
+  }
+  const batchStartMs = new Date(batch.requested_start_utc).getTime();
+  const batchEndMs = new Date(batch.requested_end_utc).getTime();
+  if (batchStartMs !== startTime || batchEndMs !== endTime) {
+    throw Object.assign(
+      new Error(`--resume batch ${backfillBatchId} was recorded for range [${batch.requested_start_utc}, ${batch.requested_end_utc}), not [${new Date(startTime).toISOString()}, ${new Date(endTime).toISOString()}); refusing to resume with an incompatible range`),
+      { code: 'BACKFILL_RESUME_RANGE_MISMATCH' }
+    );
+  }
+}
+
 // §2.12：回填前基线记录 + 回填后完整性校验；任一失败则整批标记 ATTENTION_REQUIRED，不自动重试覆盖。
 export async function runBackfillForInterval({ pool, adapter, symbol, interval, startTime, endTime, resumeBatchId, now = Date.now }) {
   let backfillBatchId = resumeBatchId;
@@ -45,6 +68,7 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
     const existing = await pool.query('SELECT * FROM historical_validation.backfill_batches WHERE backfill_batch_id=$1', [backfillBatchId]);
     if (!existing.rowCount) throw Object.assign(new Error(`Unknown backfill_batch_id: ${backfillBatchId}`), { code: 'BACKFILL_BATCH_NOT_FOUND' });
     const batch = existing.rows[0];
+    assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTime, backfillBatchId });
     if (batch.last_completed_open_time) resumeFrom = new Date(batch.last_completed_open_time).getTime() + 1;
     await pool.query(`UPDATE historical_validation.backfill_batches SET status='RUNNING' WHERE backfill_batch_id=$1`, [backfillBatchId]);
   } else {
@@ -88,6 +112,19 @@ export async function main(argv = process.argv.slice(2)) {
   const startTime = parseUtc(args.from, '--from');
   const endTime = parseUtc(args.to, '--to');
   if (!symbol || !intervals.length) throw Object.assign(new Error('--symbol and --intervals are required'), { code: 'MISSING_REQUIRED_ARG' });
+
+  // P1-6修复（独立复审）：V1_4D_DATA_BACKFILL_SPEC.md§2.11只定义了"单个--resume续跑同一(symbol,interval)"
+  // 的语义（回填任务按(interval_name,时间分页游标)为幂等单位），未定义"一个--resume ID分别套用到多个
+  // --intervals"的合法语法。此前的实现把同一个args.resume原样传给下面循环里的每一次
+  // runBackfillForInterval调用——若--intervals传了多个值，第一个interval校验通过后，同一个resume ID
+  // 会被静默套用到其余完全不相关的interval上。冻结规范未批准这种"一份resume覆盖多interval"的用法，
+  // 因此在此明确拒绝，不自行发明新语法。
+  if (args.resume && intervals.length > 1) {
+    throw Object.assign(
+      new Error('--resume can only be combined with a single --intervals value — one backfill_batch_id maps to exactly one (symbol, interval_name); pass --resume separately per interval'),
+      { code: 'RESUME_INTERVALS_CONFLICT' }
+    );
+  }
 
   const config = loadConfig();
   const pool = await createPgPool(config);

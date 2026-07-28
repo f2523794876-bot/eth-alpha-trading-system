@@ -52,6 +52,19 @@ export function buildErrorAttributionSummary(pairs) {
   };
 }
 
+// P2-5修复（独立复审）：此前用 `g.generation_run_id = s.generation_run_id` 判定"这个snapshot属于本run"——
+// 但replay_snapshots的generation_run_id只记录【第一个】INSERT它的run（§一冻结规则3：同一(instrument,horizon,
+// referenceCloseTime,algorithmVersion,datasetVersion)组合无论被哪个validation_run触发都收敛到同一条
+// prediction_id，天然幂等复用）。若runB对同一逻辑预测重复尝试生成（结果是DEDUPED，命中runA已插入的快照），
+// runB自己的replay_generation_runs行确实存在（status=SUCCEEDED, deduped_count=1），但该快照的
+// generation_run_id仍然指向runA——旧查询的JOIN条件因此漏掉了"runB实际引用/处理过、但并非runB自己插入"
+// 的快照，导致runB的报告统计比它真实处理过的样本数少计。
+// 改为EXISTS语义（而非JOIN g）：只要本validationRunId在该(instrument,horizon,historicalAsOfTime)节奏点上
+// 存在一条status=SUCCEEDED的生成尝试（无论最终是INSERTED还是DEDUPED），就认为该样本被本run"实际引用/处理"，
+// 与snapshot本身归属哪个run的generation_run_id无关。用EXISTS而非JOIN，是因为resume场景下同一run可能对
+// 同一节奏点产生【多条】generation_run行（每次调用generateReplaySnapshot都会生成全新generation_run_id，
+// resume时对已处理过的节奏点重新调用一次是正常行为，见cli-entry.js），JOIN会因命中多行而重复计数同一个
+// 样本，EXISTS则保证每个snapshot至多被选中一次。
 async function loadSamplesForHorizon(pool, { validationRunId, horizon, evaluationVersion }) {
   const result = await pool.query(
     `SELECT s.prediction_id AS "predictionId", s.horizon, s.target_start_time AS "targetStartTimeRaw",
@@ -65,11 +78,19 @@ async function loadSamplesForHorizon(pool, { validationRunId, horizon, evaluatio
             (e.range_specific_metrics->>'realizedRangeInsideExpectedEnvelope')::boolean AS "realizedRangeInsideExpectedEnvelope",
             (e.range_specific_metrics->>'expectedEnvelopeTouched')::boolean AS "expectedEnvelopeTouched"
      FROM historical_validation.replay_snapshots s
-     JOIN historical_validation.replay_generation_runs g ON g.generation_run_id = s.generation_run_id
      LEFT JOIN historical_validation.replay_outcome_events e
        ON e.prediction_id = s.prediction_id AND e.research_availability_rule_version = s.research_availability_rule_version
           AND e.evaluation_version = $3
-     WHERE g.validation_run_id = $1 AND s.horizon = $2`,
+     WHERE s.horizon = $2
+       AND EXISTS (
+         -- 不比较instrument：replay_generation_runs.instrument存的是解析后的instrument（如'ETHUSDT'），
+         -- replay_snapshots.instrument存的是原始symbol参数（如'ETH'）——两张表对该概念的既有命名不一致
+         -- （既存实现细节，非本次修复范围），单个validationRunId内symbol/instrument本身就是单一固定值，
+         -- 用(validation_run_id, horizon, historical_as_of_time)三元组已足以唯一定位节奏点，不依赖instrument比较。
+         SELECT 1 FROM historical_validation.replay_generation_runs g
+         WHERE g.validation_run_id = $1 AND g.horizon = s.horizon
+           AND g.historical_as_of_time = s.target_start_time AND g.status = 'SUCCEEDED'
+       )`,
     [validationRunId, horizon, evaluationVersion]
   );
   return result.rows.map(row => ({
@@ -125,6 +146,17 @@ export async function buildValidationReports({ pool, validationRunId, datasetVer
     const direction = computeSplitEffectiveSamples(samples, { eligibilityField: 'directionEligibleForStatistics', trainEnd, validationEnd });
     const path = computeSplitEffectiveSamples(samples, { eligibilityField: 'pathEligibleForStatistics', trainEnd, validationEnd });
 
+    // P2-4（独立复审）：purged_straddling_count计算口径。§2.7冻结schema（migrations/005）里
+    // purged_straddling_count是单个integer列，不像raw/effective_sample_count那样拆成direction/path各一份。
+    // direction与path是各自独立的eligibility集合（computeEffectiveSampleCount对每个集合分别做贪心去重叠），
+    // 二者的"跨trainEnd/validationEnd边界被剔除"样本集合原则上可以不同（例如：某样本direction-eligible但
+    // path-ineligible，恰好跨界，只会被direction的purge计数捕获，不会出现在path的purge计数里；反之亦然）——
+    // 见对应集成测试"P2-4"用例构造出二者确实不相等的真实场景。schema只有一列，本实现选择持久化
+    // direction口径的purgedStraddlingCount（不是静默丢弃另一侧、假装二者恒等）：因为sampleSufficient/
+    // upDownRangeBreakdown等本报告的其余分段统计口径同样以direction eligibility为准（direction是
+    // report_scope机制里唯一同时驱动"样本是否充分"判定的维度），purged_straddling_count采用同一维度的
+    // 口径可保持"同一份报告内、同一个report_scope下的所有统计数字互相可解释"这一自洽性；path侧的
+    // purgedStraddlingCount(path.purgedStraddlingCount)本身仍在下方计算出来，只是不写入这个单值列。
     const scopes = trainEnd != null && validationEnd != null
       ? [['ALL', direction.all, path.all, 0], ['TRAIN', direction.training, path.training, direction.purgedStraddlingCount], ['VALIDATION', direction.validation, path.validation, direction.purgedStraddlingCount], ['TEST', direction.test, path.test, direction.purgedStraddlingCount]]
       : [['ALL', direction.all, path.all, 0]];
