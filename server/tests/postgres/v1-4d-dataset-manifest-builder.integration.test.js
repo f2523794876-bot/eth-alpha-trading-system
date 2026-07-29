@@ -87,8 +87,17 @@ test('区间内存在缺口时拒绝生成manifest（fail closed），不写入�
     assert.equal(result.errorCode, 'INTEGRITY_CHECK_FAILED');
     assert.equal(result.integrity.gapCount, 1);
 
-    const count = (await client.query(`SELECT count(*)::int AS n FROM historical_validation.dataset_manifests`)).rows[0].n;
-    assert.equal(count, 0, 'integrity检查失败时不得写入任何dataset_manifests行');
+    // P2-g（独立复审第二轮）：dataset_manifests是内容寻址且不可UPDATE/DELETE的表，其他测试文件
+    // （乃至同一进程内先前运行过的测试）会在其中永久累积真实manifest行——用全表count(*)==0断言
+    // 在完整套件连续跑多次/多文件共享同一隔离测试库时必然产生假失败（并非真的检测出了本测试要
+    // 验证的目标）。这里改为按本测试自己唯一的symbol+data_from+data_to范围精确scoping，
+    // 不依赖也不断言整张表的全局状态。
+    const count = (await client.query(
+      `SELECT count(*)::int AS n FROM historical_validation.dataset_manifests
+       WHERE symbol='ETHUSDT' AND data_from=to_timestamp($1/1000.0) AND data_to=to_timestamp($2/1000.0)`,
+      [bar0Open, bar2Close + 1]
+    )).rows[0].n;
+    assert.equal(count, 0, 'integrity检查失败时不得为本测试的目标区间写入任何dataset_manifests行');
   });
 });
 

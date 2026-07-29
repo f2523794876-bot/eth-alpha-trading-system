@@ -68,18 +68,31 @@ export async function verifyDatasetManifest({ pool, datasetVersion, marketType =
 
   // 第4步：独立比对record_count/per_interval_record_count/data_from/data_to/backfill_batch_ids。
   //
-  // P2-1可达性说明（独立复审，不得伪称四项字段级错误码都已被独立、等概率覆盖）：
+  // P1-B可达性说明（独立复审第二轮，修正第一轮遗留的不准确表述——不得笼统伪称
+  // DATASET_RECORD_COUNT_MISMATCH"结构性/实际不可达"，需按构造路径分别说明）：
   // - DATASET_TIME_RANGE_MISMATCH 在当前调用路径下【结构性不可达】——本函数第36-44行用于recompute的
   //   `from`/`to` 本身就是 `toEpochMs(manifest.data_from)`/`toEpochMs(manifest.data_to)`（见上方赋值），
   //   即此处比较的是同一来源算出来的两个值，永远相等，这不是"哈希先一步拦截"，而是此分支根本没有独立输入
-  //   来源可以产生分歧，是纯粹的死代码。保留该分支只作为未来若recompute改为传入独立`from`/`to`时的
+  //   来源可以产生分歧，是纯粹的死代码。verifyDatasetManifest()对外唯一输入是`datasetVersion`
+  //   （见本文件函数签名及cli-entry.js全部调用点），不接受独立的`from`/`to`参数，故没有任何调用方式
+  //   能让第95-97行的两侧比较值不同。保留该分支只作为未来若recompute改为传入独立`from`/`to`时的
   //   防御性占位，不代表当前存在任何可触发它的真实场景（见本文件对应集成测试的显式反例断言）。
-  // - DATASET_RECORD_COUNT_MISMATCH 在当前调用路径下【被第3步哈希比对天然先行拦截，实际不可达】——
-  //   recompute使用的`from`/`to`固定等于manifest自身存储的区间（同上），而`recordCount`/
-  //   `perIntervalRecordCount`都是§2.9冻结哈希内容对象的一部分（canonical-manifest-content.js），
-  //   market_bars在该固定区间内的任何增减都会同时改变recordCount与recomputedContentHash，
-  //   第3步的DATASET_CONTENT_HASH_MISMATCH必然先于此处触发，此分支目前只是纵深防御（哈希算法/
-  //   哈希内容清单未来若有疏漏导致recordCount脱离哈希覆盖范围时的兜底），不代表已被独立验证覆盖。
+  // - DATASET_RECORD_COUNT_MISMATCH 是【条件可达】，按构造路径区分，不是笼统的"不可达"：
+  //   (a) 若通过"manifest冻结后market_bars内容漂移"这条路径构造（即先用buildDatasetManifest()
+  //       正常建立一份内部自洽的manifest，之后再增删该区间内的market_bars行）——recompute使用的
+  //       `from`/`to`固定等于manifest自身存储的区间，而`recordCount`/`perIntervalRecordCount`都是
+  //       §2.9冻结哈希内容对象的一部分（canonical-manifest-content.js），市场数据的任何增减都会
+  //       同时改变recordCount与recomputedContentHash，第3步的DATASET_CONTENT_HASH_MISMATCH必然
+  //       先于此处触发——这条路径下确实不可达（见对应集成测试的P2-1用例）。
+  //   (b) 但若manifest行自身在写入时就【内在不一致】——content_hash（即dataset_version）与真实
+  //       market_bars内容一致（第3步recompute能通过），但该行的record_count列本身被错误写入
+  //       （数据损坏，或manifest-builder实现有bug、绕过了buildDatasetManifest()的正常写入路径）——
+  //       此时第3步哈希比对会通过（两侧content_hash相同，因为content_hash从未依赖过record_count
+  //       这个独立存储列，而是依赖直接从market_bars重新查询计算出的内容），此处的record_count列
+  //       比对就是唯一能检出这类"行内自相矛盾"的防线，是真实、独立可达的检查——见对应集成测试的
+  //       R26.6用例（直接构造一条record_count列错误但content_hash正确的manifest行，证明
+  //       DATASET_RECORD_COUNT_MISMATCH确实会被触发，而不是被DATASET_CONTENT_HASH_MISMATCH
+  //       抢先拦截或被静默放行）。
   // - DATASET_BATCH_SET_MISMATCH 与前两者不同——是【真正独立可达】的检查：下方
   //   `findOverlappingBackfillBatchIds`对`historical_validation.backfill_batches`发起全新查询，
   //   不依赖manifest存储的`backfillBatchIds`（那是recompute哈希时使用的输入，即"信任manifest自称的

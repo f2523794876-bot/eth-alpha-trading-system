@@ -65,18 +65,25 @@ async function seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTim
     distanceToSupportAtr: 5, distanceToResistanceAtr: 5, falseBreakoutRisk: 'NONE',
     btcTrendState: 'flat', ethBtcRollingCorrelation: 0, logReturn1: 0
   };
+  // ON CONFLICT DO NOTHING：P0-1新增测试需要两个不同validation_run在同一referenceCloseTime各自调用
+  // seedGeneratedSnapshot（构造"共享同一historicalAsOfTime"的场景），第二次调用对同一
+  // (symbol,target_interval,target_bar_close_time)的feature_records行是良性重复，幂等跳过即可，
+  // 不代表任何真实数据冲突（同一历史时刻的市场特征本就应该是同一份内容）。
   await client.query(
     `INSERT INTO feature_records(
        feature_id, symbol, target_interval, target_bar_open_time, target_bar_close_time, as_of_time, generated_at,
        feature_set_version, algorithm_version, source_dataset_version, completeness, quality_state, feature_values, availability, content_hash
-     ) VALUES($1,'ETHUSDT','15m',to_timestamp($2/1000.0),to_timestamp($3/1000.0),to_timestamp($4/1000.0),to_timestamp($5/1000.0),$6,$7,$8,1,'HEALTHY',$9::jsonb,'{}'::jsonb,$10)`,
+     ) VALUES($1,'ETHUSDT','15m',to_timestamp($2/1000.0),to_timestamp($3/1000.0),to_timestamp($4/1000.0),to_timestamp($5/1000.0),$6,$7,$8,1,'HEALTHY',$9::jsonb,'{}'::jsonb,$10)
+     ON CONFLICT DO NOTHING`,
     [
       `feature-${referenceCloseTime}`, referenceCloseTime - FIFTEEN_MIN_MS + 1, referenceCloseTime, historicalAsOfTime, historicalAsOfTime,
       FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION, JSON.stringify(featureValues), sha256(featureValues)
     ]
   );
 }
-async function seedValidationRun(client, { validationRunId, from, to }) {
+// algorithmVersion/datasetVersion可覆盖——P0-1新增测试需要构造"不同algorithm_version"或"不同dataset_version"
+// 的run，默认值保持向后兼容既有测试。
+async function seedValidationRun(client, { validationRunId, from, to, algorithmVersion = ALGORITHM_VERSION, datasetVersion = DATASET_VERSION }) {
   await client.query(
     `INSERT INTO historical_validation.dataset_manifests(
        dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals, data_from, data_to,
@@ -85,17 +92,17 @@ async function seedValidationRun(client, { validationRunId, from, to }) {
      ) VALUES($1,'v1.4d-manifest-schema-1','v1.4d-manifest-hash-1','ETHUSDT','["15m","4h"]'::jsonb,to_timestamp($2/1000.0),to_timestamp($3/1000.0),
        '[]'::jsonb,'market_bars:formal:spot',$4,0,'{}'::jsonb,'{"gapCount":0,"duplicateCount":0,"outOfOrderCount":0}'::jsonb,'[]'::jsonb)
      ON CONFLICT(dataset_version) DO NOTHING`,
-    [DATASET_VERSION, from, to, RESEARCH_AVAILABILITY_RULE_VERSION]
+    [datasetVersion, from, to, RESEARCH_AVAILABILITY_RULE_VERSION]
   );
   await client.query(
     `INSERT INTO historical_validation.validation_runs(
        validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at
      ) VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
-    [validationRunId, DATASET_VERSION, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    [validationRunId, datasetVersion, from, to, algorithmVersion, RULE_VERSION]
   );
 }
 
-async function seedGeneratedSnapshot(client, { validationRunId, dayOffset }) {
+async function seedGeneratedSnapshot(client, { validationRunId, dayOffset, algorithmVersion = ALGORITHM_VERSION, datasetVersion = DATASET_VERSION }) {
   const dayStart = Date.UTC(2026, 5, 1 + dayOffset, 0, 0, 0);
   const referenceCloseTime = dayStart - 1;
   const referenceOpenTime = referenceCloseTime - FIFTEEN_MIN_MS + 1;
@@ -105,8 +112,8 @@ async function seedGeneratedSnapshot(client, { validationRunId, dayOffset }) {
   await seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTime: referenceCloseTime });
   const result = await generateReplaySnapshot({
     pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
-    historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
-    datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
+    historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion, weightVersion: WEIGHT_VERSION,
+    datasetVersion, ruleVersion: RULE_VERSION
   });
   return { predictionId: result.record.predictionId, targetStartTime: referenceCloseTime, targetEndTime: referenceCloseTime + 96 * FIFTEEN_MIN_MS, status: result.status, validationRunId };
 }
@@ -356,6 +363,138 @@ test('P2-5：runB对runA已生成的快照DEDUPED后，runB的报告必须包含
     });
     const allA = reportsA.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
     assert.equal(allA.directionRawSampleCount, 1, 'runA生成的快照必须出现在自己的报告中（回归：不应被本次EXISTS改写破坏）');
+  });
+});
+
+// P0-1修复（独立复审第二轮）：report-builder跨run/跨算法版本数据污染。第一轮的EXISTS(validation_run_id,
+// horizon, historical_as_of_time, status='SUCCEEDED')判据不足以唯一定位"这次生成尝试对应的确切
+// prediction_id"——两个完全无关的run（不同algorithm_version或不同dataset_version）只要恰好在同一horizon+
+// historicalAsOfTime各自生成过快照，runA的报告就会错误地把runB的快照也纳入统计。以下A/B两组测试直接复现
+// 该场景并验证已被修复；C对应"algorithm/dataset相同、第二个run DEDUPED仍需正确包含共享快照"——与下方保留的
+// 原P2-5测试（标记为E）场景完全一致，不重复新增，只在此处显式说明C由E覆盖；D验证同一snapshot存在多条
+// generation记录时不重复计数。
+test('P0-1-A：两个run使用不同algorithm_version、相同horizon和historical_as_of_time——runA报告不得包含runB的快照', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const runA = randomUUID();
+    const runB = randomUUID();
+    const from = Date.UTC(2026, 5, 1) - DAY_MS;
+    const to = Date.UTC(2026, 5, 10);
+    const algorithmVersionB = 'v1.4c-server-po-rule-DIFFERENT';
+    await seedValidationRun(client, { validationRunId: runA, from, to, algorithmVersion: ALGORITHM_VERSION });
+    await seedValidationRun(client, { validationRunId: runB, from, to, algorithmVersion: algorithmVersionB });
+
+    // runA与runB在完全相同的dayOffset（=相同historicalAsOfTime/horizon）各自生成快照——因algorithm_version
+    // 不同，prediction_id不同，二者都是INSERTED（不去重），且各自都有status=SUCCEEDED的generation_run行。
+    const sA = await seedGeneratedSnapshot(client, { validationRunId: runA, dayOffset: 1, algorithmVersion: ALGORITHM_VERSION });
+    const sB = await seedGeneratedSnapshot(client, { validationRunId: runB, dayOffset: 1, algorithmVersion: algorithmVersionB });
+    assert.equal(sA.status, 'INSERTED');
+    assert.equal(sB.status, 'INSERTED');
+    assert.notEqual(sA.predictionId, sB.predictionId, 'algorithm_version不同必须产生不同prediction_id');
+
+    await insertOutcomeEvent(client, { predictionId: sA.predictionId, directionCorrect: true });
+    await insertOutcomeEvent(client, { predictionId: sB.predictionId, directionCorrect: true });
+
+    const reportsA = await buildValidationReports({
+      pool: client, validationRunId: runA, datasetVersion: DATASET_VERSION, algorithmVersion: ALGORITHM_VERSION,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION
+    });
+    const allA = reportsA.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
+    assert.equal(allA.directionRawSampleCount, 1, 'runA的报告只能包含自己的1个样本，不得因runB恰好共享同一historicalAsOfTime而被污染成2个');
+
+    const reportsB = await buildValidationReports({
+      pool: client, validationRunId: runB, datasetVersion: DATASET_VERSION, algorithmVersion: algorithmVersionB,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION
+    });
+    const allB = reportsB.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
+    assert.equal(allB.directionRawSampleCount, 1, 'runB的报告同样只能包含自己的1个样本，不得反向污染');
+  });
+});
+
+test('P0-1-B：两个run使用不同dataset_version、相同horizon和historical_as_of_time——runA报告不得包含runB的快照', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const runA = randomUUID();
+    const runB = randomUUID();
+    const from = Date.UTC(2026, 5, 1) - DAY_MS;
+    const to = Date.UTC(2026, 5, 10);
+    const datasetVersionA = DATASET_VERSION;
+    const datasetVersionB = 'v1.4d-sha256-' + '77'.repeat(32);
+    await seedValidationRun(client, { validationRunId: runA, from, to, datasetVersion: datasetVersionA });
+    await seedValidationRun(client, { validationRunId: runB, from, to, datasetVersion: datasetVersionB });
+
+    const sA = await seedGeneratedSnapshot(client, { validationRunId: runA, dayOffset: 1, datasetVersion: datasetVersionA });
+    const sB = await seedGeneratedSnapshot(client, { validationRunId: runB, dayOffset: 1, datasetVersion: datasetVersionB });
+    assert.equal(sA.status, 'INSERTED');
+    assert.equal(sB.status, 'INSERTED');
+    assert.notEqual(sA.predictionId, sB.predictionId, 'dataset_version不同必须产生不同prediction_id');
+
+    await insertOutcomeEvent(client, { predictionId: sA.predictionId, directionCorrect: true });
+    await insertOutcomeEvent(client, { predictionId: sB.predictionId, directionCorrect: true });
+
+    const reportsA = await buildValidationReports({
+      pool: client, validationRunId: runA, datasetVersion: datasetVersionA, algorithmVersion: ALGORITHM_VERSION,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION
+    });
+    const allA = reportsA.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
+    assert.equal(allA.directionRawSampleCount, 1, 'runA的报告只能包含自己的1个样本，不得因runB使用不同dataset_version却共享同一historicalAsOfTime而被污染');
+
+    const reportsB = await buildValidationReports({
+      pool: client, validationRunId: runB, datasetVersion: datasetVersionB, algorithmVersion: ALGORITHM_VERSION,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION
+    });
+    const allB = reportsB.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
+    assert.equal(allB.directionRawSampleCount, 1, 'runB的报告同样只能包含自己的1个样本');
+  });
+});
+
+test('P0-1-D：同一snapshot存在多条generation记录（resume重新处理同一节奏点）时，报告不得重复计数', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const validationRunId = randomUUID();
+    const from = Date.UTC(2026, 5, 1) - DAY_MS;
+    const to = Date.UTC(2026, 5, 10);
+    await seedValidationRun(client, { validationRunId, from, to });
+
+    const dayStart = Date.UTC(2026, 5, 6, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const referenceOpenTime = referenceCloseTime - FIFTEEN_MIN_MS + 1;
+    const replayNowMs = Date.now();
+    await seedReferenceBar(client, { openTime: referenceOpenTime, closeTime: referenceCloseTime, replayNowMs });
+    await seedFourHourAtrBars(client, { referenceCloseTime, count: 15, replayNowMs });
+    await seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTime: referenceCloseTime });
+
+    // 同一validationRunId对同一节奏点调用两次generateReplaySnapshot——模拟resume时cli-entry.js重新
+    // 枚举并再次尝试已处理过的节奏点（真实行为，见cli-entry.js runWalkForward()注释）：第一次INSERTED，
+    // 第二次命中自己的快照DEDUPED，各自产生一条独立的replay_generation_runs行（同一validation_run_id、
+    // 同一horizon、同一historical_as_of_time，两条不同的generation_run_id）。
+    const first = await generateReplaySnapshot({
+      pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
+      datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
+    });
+    const second = await generateReplaySnapshot({
+      pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
+      datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
+    });
+    assert.equal(first.status, 'INSERTED');
+    assert.equal(second.status, 'DEDUPED');
+    assert.equal(first.record.predictionId, second.record.prediction_id);
+    assert.notEqual(first.generationRunId, second.generationRunId, '两次调用必须产生两条独立的generation_run行，这正是本测试要验证"不因此重复计数"的前提');
+
+    const generationRunCount = (await client.query(
+      `SELECT count(*)::int AS n FROM historical_validation.replay_generation_runs WHERE validation_run_id=$1 AND historical_as_of_time=to_timestamp($2/1000.0)`,
+      [validationRunId, referenceCloseTime]
+    )).rows[0].n;
+    assert.equal(generationRunCount, 2, '前提确认：同一节奏点确实存在两条generation_run记录');
+
+    await insertOutcomeEvent(client, { predictionId: first.record.predictionId, directionCorrect: true });
+
+    const reports = await buildValidationReports({
+      pool: client, validationRunId, datasetVersion: DATASET_VERSION, algorithmVersion: ALGORITHM_VERSION,
+      ruleVersion: RULE_VERSION, researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: EVALUATION_VERSION
+    });
+    const all = reports.find(r => r.horizon === '24h' && r.reportScope === 'ALL');
+    assert.equal(all.directionRawSampleCount, 1, '同一prediction_id即使存在两条generation_run记录，也只能计数一次，不得因EXISTS/JOIN放大');
+    assert.equal(all.directionEffectiveSampleCount, 1);
   });
 });
 

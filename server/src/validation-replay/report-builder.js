@@ -52,19 +52,36 @@ export function buildErrorAttributionSummary(pairs) {
   };
 }
 
-// P2-5修复（独立复审）：此前用 `g.generation_run_id = s.generation_run_id` 判定"这个snapshot属于本run"——
+// P2-5修复（独立复审第一轮）：此前用 `g.generation_run_id = s.generation_run_id` 判定"这个snapshot属于本run"——
 // 但replay_snapshots的generation_run_id只记录【第一个】INSERT它的run（§一冻结规则3：同一(instrument,horizon,
 // referenceCloseTime,algorithmVersion,datasetVersion)组合无论被哪个validation_run触发都收敛到同一条
 // prediction_id，天然幂等复用）。若runB对同一逻辑预测重复尝试生成（结果是DEDUPED，命中runA已插入的快照），
 // runB自己的replay_generation_runs行确实存在（status=SUCCEEDED, deduped_count=1），但该快照的
 // generation_run_id仍然指向runA——旧查询的JOIN条件因此漏掉了"runB实际引用/处理过、但并非runB自己插入"
-// 的快照，导致runB的报告统计比它真实处理过的样本数少计。
-// 改为EXISTS语义（而非JOIN g）：只要本validationRunId在该(instrument,horizon,historicalAsOfTime)节奏点上
-// 存在一条status=SUCCEEDED的生成尝试（无论最终是INSERTED还是DEDUPED），就认为该样本被本run"实际引用/处理"，
-// 与snapshot本身归属哪个run的generation_run_id无关。用EXISTS而非JOIN，是因为resume场景下同一run可能对
-// 同一节奏点产生【多条】generation_run行（每次调用generateReplaySnapshot都会生成全新generation_run_id，
-// resume时对已处理过的节奏点重新调用一次是正常行为，见cli-entry.js），JOIN会因命中多行而重复计数同一个
-// 样本，EXISTS则保证每个snapshot至多被选中一次。
+// 的快照，导致runB的报告统计比它真实处理过的样本数少计。第一轮改为EXISTS语义（而非JOIN g），解决了少计问题。
+//
+// P0-1修复（独立复审第二轮，本轮）：第一轮的EXISTS(validation_run_id, horizon, historical_as_of_time,
+// status='SUCCEEDED')这一判据本身不足以唯一定位"这次生成尝试对应的确切prediction_id"——
+// replay_generation_runs只有聚合计数(generated_count/deduped_count)，不记录它对应哪一个具体prediction_id。
+// 因此若另一个完全无关的validation_run（不同algorithm_version或不同dataset_version）**恰好**在同一
+// horizon+historical_as_of_time也生成过快照（节奏点本身是historicalAsOfTime的确定性函数，覆盖同一段历史
+// 时间的不同run天然会共享大量节奏点——对比不同algorithm_version在同一段历史上的表现正是§三.1认可的正常
+// 场景），第一轮的EXISTS条件会把这个完全无关的快照也判定为"本run处理过"而错误纳入统计，造成跨run/跨算法
+// 版本的数据污染（复现证据：construct runA(alg=v1)与runC(alg=v2)在同一historicalAsOfTime各自生成快照，
+// runA的EXISTS查询会同时匹配到两条prediction_id）。
+// 本轮修复：额外要求snapshot自身的algorithm_version/dataset_version与"本次validationRunId在
+// validation_runs表中登记的algorithm_version/dataset_version"完全一致——按§一冻结规则，
+// prediction_id（进而"这个snapshot到底是不是本run该拥有的那一个"）由
+// (instrument,horizon,referenceCloseTime,algorithmVersion,datasetVersion)唯一确定，补上这一条件后：
+//   - DEDUPED场景仍正确纳入：runB对同一逻辑预测DEDUPED，意味着runB传给generateReplaySnapshot的
+//     algorithmVersion/datasetVersion与runA完全相同（否则prediction_id根本不会碰撞、也不会DEDUPED），
+//     即s.algorithm_version/s.dataset_version与runB自己的validation_runs行天然一致，不受本条件影响；
+//   - 跨run/跨算法版本污染被排除：runC的算法/数据集版本与runA的validation_runs行不一致，被本条件过滤掉。
+// JOIN historical_validation.validation_runs vr ON vr.validation_run_id=$1——$1是常量，vr恒定匹配
+// 该run自己的唯一一行（PK），不会导致s被放大成多行；EXISTS本身也不放大行数（布尔语义）；
+// LEFT JOIN outcome_events同样受(prediction_id, evaluation_version, research_availability_rule_version)
+// 复合唯一约束限制，对固定的evaluationVersion($3)至多命中一行——三者叠加，整条查询对每个
+// prediction_id仍然至多返回一行，不会因JOIN/EXISTS产生任何重复计数。
 async function loadSamplesForHorizon(pool, { validationRunId, horizon, evaluationVersion }) {
   const result = await pool.query(
     `SELECT s.prediction_id AS "predictionId", s.horizon, s.target_start_time AS "targetStartTimeRaw",
@@ -78,6 +95,8 @@ async function loadSamplesForHorizon(pool, { validationRunId, horizon, evaluatio
             (e.range_specific_metrics->>'realizedRangeInsideExpectedEnvelope')::boolean AS "realizedRangeInsideExpectedEnvelope",
             (e.range_specific_metrics->>'expectedEnvelopeTouched')::boolean AS "expectedEnvelopeTouched"
      FROM historical_validation.replay_snapshots s
+     JOIN historical_validation.validation_runs vr
+       ON vr.validation_run_id = $1 AND vr.algorithm_version = s.algorithm_version AND vr.dataset_version = s.dataset_version
      LEFT JOIN historical_validation.replay_outcome_events e
        ON e.prediction_id = s.prediction_id AND e.research_availability_rule_version = s.research_availability_rule_version
           AND e.evaluation_version = $3

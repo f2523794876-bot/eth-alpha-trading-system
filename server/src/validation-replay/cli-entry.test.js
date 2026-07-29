@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   parseArgs, parseSplitRatio, computeSplitBoundaries, validateSplitOrder, validateReplayRange,
   checkResumeParamConsistency, enumerateRhythmPoints, STARTUP_BANNER,
-  validateEffectiveOptions, validateCliArgsBeforeDbAccess
+  validateEffectiveOptions, validateCliArgsBeforeDbAccess, main
 } from './cli-entry.js';
 
 const DAY_MS = 86400000;
@@ -213,6 +213,21 @@ test('validateCliArgsBeforeDbAccess（P1-3）：resume模式下weight-version/ev
 test('validateCliArgsBeforeDbAccess（P1-3）：--resume提供空值/非法值（无跟随值）时INVALID_RESUME_ID，区别于"未提供--resume"', () => {
   assert.throws(() => validateCliArgsBeforeDbAccess({ args: { resume: true }, resumeId: true }), (e) => e.code === 'INVALID_RESUME_ID');
   assert.throws(() => validateCliArgsBeforeDbAccess({ args: { resume: '' }, resumeId: '' }), (e) => e.code === 'INVALID_RESUME_ID');
+});
+
+// P2-d（独立复审第二轮）：上面两条测试只验证了内部辅助函数validateCliArgsBeforeDbAccess本身——这里额外
+// 补一条经由main()真实入口（完整argv）的端到端断言，证明--resume不带值时CLI真实对外表现确实是清晰的
+// INVALID_RESUME_ID错误码，而不仅仅是内部函数的行为。该校验先于loadConfig()/createPgPool()执行
+// （见main()内注释），因此本测试不需要连接任何数据库、不需要TEST_DATABASE_URL。
+test('main()（P2-d）：--resume后面紧跟另一个flag（即--resume未带值）——INVALID_RESUME_ID，且不触达数据库连接阶段', async () => {
+  await assert.rejects(
+    main(['--resume', '--symbol', 'ETHUSDT']),
+    (e) => e.code === 'INVALID_RESUME_ID'
+  );
+  await assert.rejects(
+    main(['--resume']),
+    (e) => e.code === 'INVALID_RESUME_ID'
+  );
 });
 
 test('validateCliArgsBeforeDbAccess：完全省略--resume（resumeId为null）时视为new-task模式，走完整必填校验', () => {

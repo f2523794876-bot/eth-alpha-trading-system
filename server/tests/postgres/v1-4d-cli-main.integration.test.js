@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { main } from '../../src/validation-replay/cli-entry.js';
+import { generateReplaySnapshot } from '../../src/validation-replay/replay-generator.js';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { buildDatasetManifest } from '../../src/validation-replay/dataset-manifest-builder.js';
 import { RESEARCH_AVAILABILITY_RULE_VERSION } from '../../src/validation-replay/research-availability.js';
@@ -327,6 +328,16 @@ test('main()：--dry-run对五张业务表零写入，validation_runs仅新增1�
     }
     const runRow = (await pool.query('SELECT dry_run, status FROM historical_validation.validation_runs WHERE validation_run_id=$1', [validationRunId])).rows[0];
     assert.equal(runRow.dry_run, true);
+
+    // P2-h（独立复审第二轮）：§4.2冻结要求dry-run必须输出一份"执行计划"（预计推进的节奏点数量、
+    // 预计涉及的backfill_batch_id范围、预计的purge边界），此前从未真正实现/输出过——这里验证
+    // plan.executionPlan（main()真实调用runWalkForward()后拿到的返回值，不是重新计算的期望值）
+    // 三项内容都真实存在且与本次真实输入吻合。
+    assert.ok(plan.executionPlan, 'dry-run必须产出executionPlan');
+    assert.equal(plan.executionPlan.rhythmPointCount, plan.generationAttempts, 'rhythmPointCount必须等于实际枚举的节奏点数量');
+    assert.ok(plan.executionPlan.rhythmPointCount > 0);
+    assert.ok(Array.isArray(plan.executionPlan.backfillBatchIds), 'backfillBatchIds必须是真实manifest记录的批次集合（数组）');
+    assert.deepEqual(plan.executionPlan.purgeBoundary, { trainEnd: plan.effectiveOptions.trainEnd, validationEnd: plan.effectiveOptions.validationEnd });
   } finally {
     await purgeRun(pool, validationRunId);
     await purgeMarketData(pool, { fromMs: Date.UTC(2026, 1, 18), toMs: Date.UTC(2026, 1, 23) });
@@ -511,6 +522,322 @@ test('main()：不同--resume run_id与--dataset-version混用——拒绝（不
     );
   } finally {
     await purgeRun(pool, validationRunId);
+    await pool.end();
+  }
+});
+
+// P1-A（独立复审第二轮）：resume时weight_version/evaluation_version必须与本run已有snapshot/outcome
+// 实际记录的版本一致，不一致fail closed；无历史数据时允许本次显式提供的版本；历史数据本身已混有多个
+// 版本时同样拒绝。A-G对应任务书原始编号。
+async function generationRunCountFor(pool, validationRunId) {
+  return (await pool.query('SELECT count(*)::int AS n FROM historical_validation.replay_generation_runs WHERE validation_run_id=$1', [validationRunId])).rows[0].n;
+}
+
+test('P1-A-A：首次run使用weight V1，resume使用V2——拒绝(RESUME_WEIGHT_VERSION_MISMATCH)，零新增业务写入', { skip }, async () => {
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL });
+  let validationRunId;
+  try {
+    const dayStart = Date.UTC(2026, 2, 1, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
+    const from = referenceCloseTime - DAY_MS;
+    const to = referenceCloseTime + DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(pool, { from, to });
+
+    const plan1 = await withMainEnv(() => main([
+      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
+      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
+      '--rule-version', RULE_VERSION, '--weight-version', 'v1.4c-server-weight-V1', '--evaluation-version', EVALUATION_VERSION
+    ]));
+    validationRunId = plan1.validationRunId;
+    const before = await generationRunCountFor(pool, validationRunId);
+    // 首次run会枚举整个[from,to)窗口内的全部24h节奏点（本测试窗口为2天，产生12条
+    // generation_run记录，其中仅seedRhythmPoint覆盖的那个点会SUCCEEDED，其余因缺少数据
+    // 而BLOCKED——但BLOCKED点同样会写入generation_run行）。这里不硬编码具体数值，只确认
+    // 确实已有生成记录，真正要验证的不变量是resume拒绝后的after===before。
+    assert.ok(before > 0, '前提确认：首次run必须已经产生至少一条generation_run记录');
+
+    await assert.rejects(
+      withMainEnv(() => main([
+        '--resume', validationRunId, '--weight-version', 'v1.4c-server-weight-V2-DIFFERENT', '--evaluation-version', EVALUATION_VERSION
+      ])),
+      (e) => e.code === 'RESUME_WEIGHT_VERSION_MISMATCH' && e.original === 'v1.4c-server-weight-V1' && e.explicit === 'v1.4c-server-weight-V2-DIFFERENT'
+    );
+
+    const after = await generationRunCountFor(pool, validationRunId);
+    assert.equal(after, before, '拒绝必须发生在任何生成尝试之前——replay_generation_runs行数不得增加');
+  } finally {
+    await purgeRun(pool, validationRunId);
+    // seedRhythmPoint的4h ATR回溯窗口达60h（2.5天），purge下界必须覆盖到referenceCloseTime-2.5天
+    // 以前，否则会有残留bar泄漏到相邻测试（如"--split 50/25/25"用例，其[Feb25,Mar5)区间假定
+    // 区间内不存在任何market_bars）——此前fromMs=Feb27仅覆盖了2天，少覆盖了约12小时，是P2-g
+    // 相关的测试间数据泄漏根因之一，这里改为Feb25以留出安全余量。
+    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 1, 25), toMs: Date.UTC(2026, 2, 4) });
+    await pool.end();
+  }
+});
+
+test('P1-A-B：首次run与resume均使用weight V1——允许', { skip }, async () => {
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL });
+  let validationRunId;
+  try {
+    const dayStart = Date.UTC(2026, 2, 6, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
+    const from = referenceCloseTime - DAY_MS;
+    const to = referenceCloseTime + DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(pool, { from, to });
+
+    const plan1 = await withMainEnv(() => main([
+      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
+      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
+      '--rule-version', RULE_VERSION, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
+    ]));
+    validationRunId = plan1.validationRunId;
+
+    const plan2 = await withMainEnv(() => main([
+      '--resume', validationRunId, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
+    ]));
+    assert.equal(plan2.validationRunId, validationRunId);
+    const runRow = (await pool.query('SELECT status FROM historical_validation.validation_runs WHERE validation_run_id=$1', [validationRunId])).rows[0];
+    assert.equal(runRow.status, 'SUCCEEDED', '相同weight_version的resume必须被允许并正常完成');
+  } finally {
+    await purgeRun(pool, validationRunId);
+    // 同上（P1-A-A处的说明）：referenceCloseTime=Mar5 23:59:59.999时，ATR回溯最早触及Mar3
+    // 中午左右，原fromMs=Mar4仍会漏掉约12小时残留，同样落入"--split 50/25/25"用例假定为空的
+    // [Feb25,Mar5)区间——这里前移到Mar2留出安全余量。
+    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 2, 2), toMs: Date.UTC(2026, 2, 9) });
+    await pool.end();
+  }
+});
+
+test('P1-A-C：已有outcome使用evaluation V1，resume使用V2——拒绝(RESUME_EVALUATION_VERSION_MISMATCH)，零新增业务写入', { skip }, async () => {
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL });
+  let validationRunId;
+  try {
+    const dayStart = Date.UTC(2026, 2, 10, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
+    // 补齐24h完整路径，使evaluateReplayOutcomes真实产出outcome（评估阶段在historicalAsOfTime到达
+    // targetEndTime后才会实际评估，from~to必须覆盖到该时刻，故整体窗口设置得更宽）。
+    const pathStart = referenceCloseTime + 1;
+    const bars = [];
+    for (let i = 0; i < 96; i++) { const o = pathStart + i * FIFTEEN_MIN_MS; bars.push(kline(o, o + FIFTEEN_MIN_MS - 1, '1000.00')); }
+    const pathAdapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
+    await backfillInterval({ pool, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
+
+    const from = referenceCloseTime - DAY_MS;
+    const to = referenceCloseTime + 2 * DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(pool, { from, to });
+
+    const plan1 = await withMainEnv(() => main([
+      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
+      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
+      '--rule-version', RULE_VERSION, '--weight-version', WEIGHT_VERSION, '--evaluation-version', 'v1.4c-outcome-evaluation-V1'
+    ]));
+    validationRunId = plan1.validationRunId;
+    const outcomeCount = (await pool.query(
+      `SELECT count(*)::int AS n FROM historical_validation.replay_outcome_events e
+       JOIN historical_validation.replay_evaluation_runs er ON er.evaluation_run_id=e.evaluation_run_id
+       WHERE er.validation_run_id=$1`, [validationRunId]
+    )).rows[0].n;
+    assert.ok(outcomeCount > 0, '前提确认：首次run必须真实产出至少一条outcome，否则本测试没有验证到目标场景');
+
+    const before = await generationRunCountFor(pool, validationRunId);
+    await assert.rejects(
+      withMainEnv(() => main([
+        '--resume', validationRunId, '--weight-version', WEIGHT_VERSION, '--evaluation-version', 'v1.4c-outcome-evaluation-V2-DIFFERENT'
+      ])),
+      (e) => e.code === 'RESUME_EVALUATION_VERSION_MISMATCH' && e.original === 'v1.4c-outcome-evaluation-V1' && e.explicit === 'v1.4c-outcome-evaluation-V2-DIFFERENT'
+    );
+    const after = await generationRunCountFor(pool, validationRunId);
+    assert.equal(after, before, '拒绝必须发生在任何生成/评估尝试之前');
+  } finally {
+    await purgeRun(pool, validationRunId);
+    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 2, 8), toMs: Date.UTC(2026, 2, 14) });
+    await pool.end();
+  }
+});
+
+test('P1-A-D：首次run与resume均使用相同evaluation版本——允许', { skip }, async () => {
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL });
+  let validationRunId;
+  try {
+    const dayStart = Date.UTC(2026, 2, 16, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
+    const pathStart = referenceCloseTime + 1;
+    const bars = [];
+    for (let i = 0; i < 96; i++) { const o = pathStart + i * FIFTEEN_MIN_MS; bars.push(kline(o, o + FIFTEEN_MIN_MS - 1, '1000.00')); }
+    const pathAdapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
+    await backfillInterval({ pool, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
+
+    const from = referenceCloseTime - DAY_MS;
+    const to = referenceCloseTime + 2 * DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(pool, { from, to });
+
+    const plan1 = await withMainEnv(() => main([
+      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
+      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
+      '--rule-version', RULE_VERSION, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
+    ]));
+    validationRunId = plan1.validationRunId;
+
+    const plan2 = await withMainEnv(() => main([
+      '--resume', validationRunId, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
+    ]));
+    assert.equal(plan2.validationRunId, validationRunId);
+    const runRow = (await pool.query('SELECT status FROM historical_validation.validation_runs WHERE validation_run_id=$1', [validationRunId])).rows[0];
+    assert.equal(runRow.status, 'SUCCEEDED');
+  } finally {
+    await purgeRun(pool, validationRunId);
+    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 2, 14), toMs: Date.UTC(2026, 2, 20) });
+    await pool.end();
+  }
+});
+
+test('P1-A-E：run尚无任何snapshot/outcome时，本次显式提供的weight/evaluation版本可以使用', { skip }, async () => {
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL });
+  let validationRunId;
+  try {
+    const from = Date.UTC(2026, 2, 21) - DAY_MS;
+    const to = Date.UTC(2026, 2, 21);
+    const datasetVersion = await buildVerifiedManifest(pool, { from, to });
+
+    // 直接INSERT一条尚未产生任何snapshot/outcome的validation_runs行（模拟"首次尝试刚创建行就被中断"）。
+    validationRunId = randomUUID();
+    await pool.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+    const snapshotCountBefore = (await pool.query(
+      `SELECT count(*)::int AS n FROM historical_validation.replay_generation_runs WHERE validation_run_id=$1`, [validationRunId]
+    )).rows[0].n;
+    assert.equal(snapshotCountBefore, 0, '前提确认：该run确实尚无任何生成记录');
+
+    // 无历史数据可比对——任意weight/evaluation版本都必须被接受（不会误判为"缺失版本"或"混合版本"）。
+    const plan = await withMainEnv(() => main([
+      '--resume', validationRunId, '--weight-version', 'v1.4c-server-weight-FIRST-TIME', '--evaluation-version', 'v1.4c-outcome-evaluation-FIRST-TIME'
+    ]));
+    assert.equal(plan.validationRunId, validationRunId);
+  } finally {
+    await purgeRun(pool, validationRunId);
+    await pool.end();
+  }
+});
+
+test('P1-A-F：历史数据已经混有多个weight_version（模拟本轮修复生效前遗留的混合数据）——resume必须fail closed(RESUME_MIXED_WEIGHT_VERSIONS)', { skip }, async () => {
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL });
+  let validationRunId;
+  try {
+    const dayStart = Date.UTC(2026, 2, 23, 0, 0, 0);
+    const referenceCloseTime1 = dayStart - 1;
+    const referenceCloseTime2 = dayStart + FOUR_HOUR_MS - 1; // 下一个4h节奏点
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(pool, { referenceCloseTime: referenceCloseTime1, replayNowMs });
+    await seedRhythmPoint(pool, { referenceCloseTime: referenceCloseTime2, replayNowMs });
+    // seedRhythmPoint只各自插入一根15m参考bar（分别落在referenceCloseTime1和referenceCloseTime2，
+    // 两者相隔4h），中间留有15根15m bar的空档——manifest的gap检测会将其判定为一个缺口区域并REJECTED。
+    // 这里补齐两点之间的15m bar，使其连续，让manifest真实构建成功；这不影响本测试要验证的目标
+    // （resume时对"历史数据本身已混合多个weight_version"的fail-closed处理）。
+    const gapStart = referenceCloseTime1 + 1;
+    const gapBars = [];
+    for (let t = gapStart; t < referenceCloseTime2 - FIFTEEN_MIN_MS + 1; t += FIFTEEN_MIN_MS) {
+      gapBars.push(kline(t, t + FIFTEEN_MIN_MS - 1, '1000.00'));
+    }
+    const gapAdapter = makeMockAdapter({ pages: [gapBars], serverTimeMs: replayNowMs });
+    await backfillInterval({ pool, adapter: gapAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: gapStart, endTime: referenceCloseTime2 - FIFTEEN_MIN_MS, now: () => replayNowMs });
+    const from = referenceCloseTime1 - DAY_MS;
+    const to = referenceCloseTime2 + DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(pool, { from, to });
+
+    validationRunId = randomUUID();
+    await pool.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+
+    // 直接用generateReplaySnapshot在同一validationRunId下产出两条使用不同weight_version的快照——
+    // 模拟"本轮修复生效前，历史上已经通过某种途径（如round-1的原始bug）混入了两个weight_version"这一
+    // 遗留场景，而不是通过CLI制造（CLI本身现在已经会在第一次resume时就拦截，见P1-A-A/B/C/D），
+    // 用来验证checkResumeVersionConsistency对"历史数据本身已经混合"这一分支的处理。
+    const gen1 = await generateReplaySnapshot({
+      pool, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime1, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: 'v1.4c-server-weight-MIXED-1',
+      datasetVersion, ruleVersion: RULE_VERSION
+    });
+    const gen2 = await generateReplaySnapshot({
+      pool, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime2, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: 'v1.4c-server-weight-MIXED-2',
+      datasetVersion, ruleVersion: RULE_VERSION
+    });
+    assert.equal(gen1.status, 'INSERTED');
+    assert.equal(gen2.status, 'INSERTED');
+
+    await assert.rejects(
+      withMainEnv(() => main([
+        '--resume', validationRunId, '--weight-version', 'v1.4c-server-weight-MIXED-1', '--evaluation-version', EVALUATION_VERSION
+      ])),
+      (e) => e.code === 'RESUME_MIXED_WEIGHT_VERSIONS' && e.priorWeightVersions.length === 2
+    );
+  } finally {
+    await purgeRun(pool, validationRunId);
+    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 2, 21), toMs: Date.UTC(2026, 2, 26) });
+    await pool.end();
+  }
+});
+
+test('P1-A-G：resume继承其他允许继承参数后，main()输出的effective_options反映真实生效值（含weight_version/evaluation_version）', { skip }, async () => {
+  const pool = new Pool({ connectionString: TEST_DATABASE_URL });
+  let validationRunId;
+  try {
+    const dayStart = Date.UTC(2026, 2, 28, 0, 0, 0);
+    const referenceCloseTime = dayStart - 1;
+    const replayNowMs = Date.now();
+    await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
+    const from = referenceCloseTime - DAY_MS;
+    const to = referenceCloseTime + DAY_MS;
+    const datasetVersion = await buildVerifiedManifest(pool, { from, to });
+
+    validationRunId = randomUUID();
+    await pool.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+
+    const capture = captureConsole();
+    let plan;
+    try {
+      plan = await withMainEnv(() => main([
+        '--resume', validationRunId, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
+      ]));
+    } finally {
+      capture.restore();
+    }
+
+    const effectiveLine = capture.info.find(line => line.startsWith('effective_options'));
+    assert.ok(effectiveLine, 'main()必须真实输出effective_options这一行');
+    const printed = JSON.parse(effectiveLine.slice('effective_options '.length));
+    assert.equal(printed.validationRunId, validationRunId);
+    assert.equal(printed.symbol, 'ETHUSDT', 'effective_options必须反映继承自原run的symbol，而非CLI原始空值');
+    assert.equal(printed.datasetVersion, datasetVersion, '必须反映继承自原run的dataset_version');
+    assert.equal(printed.algorithmVersion, ALGORITHM_VERSION);
+    assert.equal(printed.ruleVersion, RULE_VERSION);
+    assert.equal(printed.weightVersion, WEIGHT_VERSION, '必须反映本次实际生效的weight_version');
+    assert.equal(printed.evaluationVersion, EVALUATION_VERSION, '必须反映本次实际生效的evaluation_version');
+    assert.equal(printed.from, from);
+    assert.equal(printed.to, to);
+    assert.equal(plan.validationRunId, validationRunId);
+  } finally {
+    await purgeRun(pool, validationRunId);
+    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 2, 26), toMs: Date.UTC(2026, 3, 1) });
     await pool.end();
   }
 });

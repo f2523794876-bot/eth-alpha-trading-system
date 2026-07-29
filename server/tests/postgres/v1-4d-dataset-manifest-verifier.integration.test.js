@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
-import { buildDatasetManifest } from '../../src/validation-replay/dataset-manifest-builder.js';
+import { buildDatasetManifest, computeManifestContentForRange } from '../../src/validation-replay/dataset-manifest-builder.js';
 import { verifyDatasetManifest } from '../../src/validation-replay/dataset-manifest-verifier.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -104,13 +104,13 @@ test('第3步：manifest冻结后market_bars内容变化（新增一个revision�
   });
 });
 
-// P2-1（独立复审）：审查第4步字段级错误码的可达性——DATASET_RECORD_COUNT_MISMATCH/DATASET_TIME_RANGE_MISMATCH
-// 在当前实现下被第3步的哈希比对天然先行拦截（或结构性不可达），与DATASET_BATCH_SET_MISMATCH的独立可达性
-// （见上面/下面的DATASET_BATCH_SET_MISMATCH测试）形成对照——本测试显式证明这一点，而不是伪称四项字段级
-// 错误码都已被独立覆盖：任何会改变recordCount的market_bars增减，产生的是DATASET_CONTENT_HASH_MISMATCH，
-// 不是DATASET_RECORD_COUNT_MISMATCH（因为recomputed的from/to固定复用manifest自身存储区间，
-// recordCount本身又是§2.9冻结哈希内容对象的一部分，两者必然同步变化，哈希比对必然先触发）。
-test('P2-1：market_bars记录数在manifest冻结后减少——实际触发的是DATASET_CONTENT_HASH_MISMATCH而非DATASET_RECORD_COUNT_MISMATCH（验证字段级错误码在此路径下不可达，见dataset-manifest-verifier.js对应注释）', { skip }, async () => {
+// P2-1（独立复审第一轮）：审查"manifest冻结后market_bars内容漂移"这一条构造路径下，
+// DATASET_RECORD_COUNT_MISMATCH是否可达——结论：在【这一条路径】下不可达，被第3步哈希比对天然先行拦截
+// （recomputed的from/to固定复用manifest自身存储区间，recordCount又是§2.9冻结哈希内容对象的一部分，
+// 两者必然同步变化）。注意：这不代表DATASET_RECORD_COUNT_MISMATCH整体不可达——见下方R26.6测试，
+// 通过另一条独立路径（manifest行自身的record_count列与其content_hash内在不一致）证明该错误码确实
+// 可以被独立触发，两个测试互为对照，而非矛盾。
+test('P2-1：market_bars记录数在manifest冻结后减少——实际触发的是DATASET_CONTENT_HASH_MISMATCH而非DATASET_RECORD_COUNT_MISMATCH（验证字段级错误码在"内容漂移"这一条路径下不可达，另见下方R26.6）', { skip }, async () => {
   await withTxClient(async (client) => {
     const base = Date.UTC(2026, 3, 6, 0, 0, 0);
     const { bar0Open, bar1Open, bar2Close } = await seedThreeBars(client, base);
@@ -125,6 +125,68 @@ test('P2-1：market_bars记录数在manifest冻结后减少——实际触发的
     assert.equal(verified.ok, false);
     assert.equal(verified.errorCode, 'DATASET_CONTENT_HASH_MISMATCH', 'recordCount变化必然伴随content_hash变化，第3步必然先于第4步的record-count专属分支触发');
     assert.notEqual(verified.errorCode, 'DATASET_RECORD_COUNT_MISMATCH');
+  });
+});
+
+// R26.6（独立复审第二轮P1-B）：DATASET_RECORD_COUNT_MISMATCH的真实独立可达路径——不是通过"冻结后
+// market_bars内容漂移"（那条路径见上方P2-1，被第3步哈希比对先行拦截），而是manifest行自身在写入时
+// record_count列与其content_hash（即dataset_version）内在不一致：content_hash对应真实market_bars
+// 内容（第3步recompute会得到与dataset_version相同的哈希，不触发DATASET_CONTENT_HASH_MISMATCH），
+// 但该行的record_count列被独立写入了一个错误值（模拟数据损坏或manifest-builder实现bug——
+// dataset_manifests行不可UPDATE/DELETE，故这里用绕过buildDatasetManifest()的直接INSERT模拟
+// "写入时就已内在不一致"这一构造性前提，对应V1_4D_ACCEPTANCE_TESTS.md R26.6原始用例的
+// "人为在record_count列写入N+1"）。
+test('R26.6：manifest行record_count列与其自身content_hash内在不一致（dataset_version/哈希本身正确）——独立触发DATASET_RECORD_COUNT_MISMATCH，不经过DATASET_CONTENT_HASH_MISMATCH，且不产生任何业务写入', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const base = Date.UTC(2026, 3, 7, 0, 0, 0);
+    const { bar0Open, bar2Close } = await seedThreeBars(client, base);
+    const from = bar0Open, to = bar2Close + 1;
+
+    // 独立于buildDatasetManifest()重新计算一次内容——用真实market_bars内容得到"正确"的
+    // dataset_version/recordCount，证明这是从真实数据推导出的、哈希自洽的值。
+    const computed = await computeManifestContentForRange({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from, to });
+    assert.equal(computed.recordCount, 3, '前提确认：真实内容确实是3条记录');
+    const correctDatasetVersion = computed.datasetVersion;
+    const wrongRecordCount = computed.recordCount + 1;
+
+    // 直接INSERT（不经过buildDatasetManifest()），dataset_version/content_hash对应字段全部使用
+    // 真实、正确、自洽的计算结果，唯独record_count列故意写入错误值——这正是R26.6要求的构造方式。
+    await client.query(
+      `INSERT INTO historical_validation.dataset_manifests(
+         dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals,
+         data_from, data_to, backfill_batch_ids, source_formal_semantics, research_availability_rule_version,
+         record_count, per_interval_record_count, integrity_check_result, manifest_members
+       ) VALUES ($1,$2,$3,$4,$5::jsonb,to_timestamp($6/1000.0),to_timestamp($7/1000.0),$8::jsonb,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb)`,
+      [
+        correctDatasetVersion,
+        computed.contentObject.manifestSchemaVersion,
+        computed.contentObject.manifestHashAlgorithmVersion,
+        'ETHUSDT',
+        JSON.stringify(computed.intervals),
+        from,
+        to,
+        JSON.stringify(computed.backfillBatchIds),
+        computed.contentObject.sourceFormalSemantics,
+        computed.contentObject.researchAvailabilityRuleVersion,
+        wrongRecordCount,
+        JSON.stringify(computed.perIntervalRecordCount),
+        JSON.stringify(computed.contentObject.integrityCheckResult),
+        JSON.stringify(computed.manifestMembers)
+      ]
+    );
+
+    const manifestCountBefore = (await client.query('SELECT count(*)::int AS n FROM historical_validation.dataset_manifests')).rows[0].n;
+
+    const verified = await verifyDatasetManifest({ pool: client, datasetVersion: correctDatasetVersion });
+    assert.equal(verified.ok, false);
+    assert.equal(verified.errorCode, 'DATASET_RECORD_COUNT_MISMATCH', 'record_count列独立于内容哈希被错误写入时，必须能被独立检出，不得被误判为哈希不匹配或被静默放行');
+    assert.notEqual(verified.errorCode, 'DATASET_CONTENT_HASH_MISMATCH', '证明这条路径下第3步哈希比对确实通过（recomputed哈希与dataset_version一致），DATASET_RECORD_COUNT_MISMATCH是独立触发的，不是哈希比对的副产品');
+    assert.equal(verified.manifestRecordCount, wrongRecordCount);
+    assert.equal(verified.recomputedRecordCount, computed.recordCount);
+
+    // verifyDatasetManifest()是纯只读函数——确认没有产生任何新的manifest行或其他副作用。
+    const manifestCountAfter = (await client.query('SELECT count(*)::int AS n FROM historical_validation.dataset_manifests')).rows[0].n;
+    assert.equal(manifestCountAfter, manifestCountBefore, 'verifyDatasetManifest必须是纯只读查询，不得产生任何业务写入');
   });
 });
 

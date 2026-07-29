@@ -240,6 +240,76 @@ async function buildEffectiveOptions({ pool, resumeValidationRunId, explicitPara
   return { effective, originalRun, validationRunId: resumeValidationRunId };
 }
 
+// P1-A修复（独立复审第二轮）：weight_version/evaluation_version不在validation_runs表结构中，也不在
+// 冻结§4.4的resume比对清单内，第一轮因此判定为"每次必须显式提供，不做继承"——但这只解决了"未提供时不会
+// 静默用默认值"的问题，没有解决"resume时提供了一个和本run之前实际使用值不同的版本会被静默接受"这一
+// 更根本的风险（复现证据：round-1复审发现同一validation_run_id下可混入两个weight_version）。
+// 本函数在resume时读取该validation_run【自己名下已产生的snapshot/outcome实际记录的】weight_version/
+// evaluation_version集合，与本次显式提供值比对：
+//   - 集合为空（该run至今尚无任何snapshot/outcome）：允许使用本次显式提供的版本（无历史可比对，见req#5）；
+//   - 集合恰好一个值：必须与本次显式提供值一致，否则fail closed（RESUME_WEIGHT_VERSION_MISMATCH/
+//     RESUME_EVALUATION_VERSION_MISMATCH）；
+//   - 集合本身已有多个不同值（说明此run历史上已经被注入过混合版本——理论上第二轮修复上线后不应再新增此类
+//     数据，但resume一个在本轮修复生效前就已经混入过多版本的历史run仍需拒绝，不得静默选择其中一个）：
+//     fail closed（RESUME_MIXED_WEIGHT_VERSIONS/RESUME_MIXED_EVALUATION_VERSIONS）。
+// 复用与P0-1同一套"这个snapshot是否真的属于本run"的判定口径（algorithm_version/dataset_version与本run
+// 一致 + EXISTS本run在该horizon/historicalAsOfTime的SUCCEEDED生成尝试），不重新发明第二套归属逻辑。
+// weight_version来自replay_snapshots.weight_version（本run名下的快照）；evaluation_version来自
+// 这些快照关联的replay_outcome_events.evaluation_version（不苛求outcome_event本身的evaluation_run_id
+// 归属哪个run——同一prediction_id的评估结果是全局唯一去重的canonical结果，见report-builder.js P2-5注释，
+// 只要该结果依附于"本run拥有的snapshot"，就代表本run的数据已经在这个evaluation_version下被评估过）。
+async function checkResumeVersionConsistency({ pool, validationRunId, weightVersion, evaluationVersion }) {
+  const weightRows = await pool.query(
+    `SELECT DISTINCT s.weight_version FROM historical_validation.replay_snapshots s
+     JOIN historical_validation.validation_runs vr
+       ON vr.validation_run_id=$1 AND vr.algorithm_version=s.algorithm_version AND vr.dataset_version=s.dataset_version
+     WHERE EXISTS (
+       SELECT 1 FROM historical_validation.replay_generation_runs g
+       WHERE g.validation_run_id=$1 AND g.horizon=s.horizon AND g.historical_as_of_time=s.target_start_time AND g.status='SUCCEEDED'
+     )`,
+    [validationRunId]
+  );
+  const priorWeightVersions = weightRows.rows.map(r => r.weight_version);
+  if (priorWeightVersions.length > 1) {
+    throw Object.assign(
+      new Error(`validation_run ${validationRunId} already has snapshots produced under multiple weight_version values: ${JSON.stringify(priorWeightVersions)}; refusing to resume`),
+      { code: 'RESUME_MIXED_WEIGHT_VERSIONS', priorWeightVersions }
+    );
+  }
+  if (priorWeightVersions.length === 1 && priorWeightVersions[0] !== weightVersion) {
+    throw Object.assign(
+      new Error(`--weight-version (${weightVersion}) does not match the weight_version already used by validation_run ${validationRunId} (${priorWeightVersions[0]})`),
+      { code: 'RESUME_WEIGHT_VERSION_MISMATCH', explicit: weightVersion, original: priorWeightVersions[0] }
+    );
+  }
+
+  const evaluationRows = await pool.query(
+    `SELECT DISTINCT e.evaluation_version FROM historical_validation.replay_snapshots s
+     JOIN historical_validation.validation_runs vr
+       ON vr.validation_run_id=$1 AND vr.algorithm_version=s.algorithm_version AND vr.dataset_version=s.dataset_version
+     JOIN historical_validation.replay_outcome_events e
+       ON e.prediction_id=s.prediction_id AND e.research_availability_rule_version=s.research_availability_rule_version
+     WHERE EXISTS (
+       SELECT 1 FROM historical_validation.replay_generation_runs g
+       WHERE g.validation_run_id=$1 AND g.horizon=s.horizon AND g.historical_as_of_time=s.target_start_time AND g.status='SUCCEEDED'
+     )`,
+    [validationRunId]
+  );
+  const priorEvaluationVersions = evaluationRows.rows.map(r => r.evaluation_version);
+  if (priorEvaluationVersions.length > 1) {
+    throw Object.assign(
+      new Error(`validation_run ${validationRunId} already has outcomes produced under multiple evaluation_version values: ${JSON.stringify(priorEvaluationVersions)}; refusing to resume`),
+      { code: 'RESUME_MIXED_EVALUATION_VERSIONS', priorEvaluationVersions }
+    );
+  }
+  if (priorEvaluationVersions.length === 1 && priorEvaluationVersions[0] !== evaluationVersion) {
+    throw Object.assign(
+      new Error(`--evaluation-version (${evaluationVersion}) does not match the evaluation_version already used by validation_run ${validationRunId} (${priorEvaluationVersions[0]})`),
+      { code: 'RESUME_EVALUATION_VERSION_MISMATCH', explicit: evaluationVersion, original: priorEvaluationVersions[0] }
+    );
+  }
+}
+
 export async function runWalkForward(options) {
   const {
     pool, dryRun = false, resumeValidationRunId = null, explicitParams = {}, splitRatio = null,
@@ -266,6 +336,16 @@ export async function runWalkForward(options) {
     pool, resumeValidationRunId, explicitParams: effectiveExplicitParams, splitRatio, weightVersion, evaluationVersion
   });
 
+  // P1-A修复（独立复审第二轮）：resume时weight_version/evaluation_version必须与本run已有snapshot/outcome
+  // 实际记录的版本一致（若尚无历史数据则允许本次显式提供的值）——发生在manifest gate、任何INSERT、
+  // historical_as_of_time推进循环之前，dry-run同样执行（不因dry-run跳过，见下方§4.2循环体本身也统一
+  // 执行到这一步之后才分流dry-run/真实写入）。只读查询本身允许发生（req#12），冲突必须在此处fail closed。
+  if (resumeValidationRunId) {
+    await checkResumeVersionConsistency({
+      pool, validationRunId: resumeValidationRunId, weightVersion: effective.weightVersion, evaluationVersion: effective.evaluationVersion
+    });
+  }
+
   // P1-4修复（独立复审）：resume模式下effective options已完成"加载并合并原run参数"，此处对合并后的
   // 最终值做完整fail-closed校验；new-task模式下effective options即为本次显式传入的原值。
   // 无论哪种模式，本校验都严格发生在§4.1a manifest gate、任何INSERT、historical_as_of_time推进循环之前。
@@ -279,8 +359,9 @@ export async function runWalkForward(options) {
   // 新建场景：validation_runs.dataset_version有外键约束指向dataset_manifests(dataset_version)，若
   // dataset_version根本不存在（DATASET_MANIFEST_NOT_FOUND），物理上不可能插入引用它的行——这是比"插入后
   // 标记FAILED"更强的保证（数据库结构层面直接排除了该情形），故新建场景下manifest gate失败时不创建任何行。
+  let manifestVerification;
   try {
-    await runManifestGate({ pool, datasetVersion: effective.datasetVersion });
+    manifestVerification = await runManifestGate({ pool, datasetVersion: effective.datasetVersion });
   } catch (error) {
     if (resumeValidationRunId) {
       await pool.query(
@@ -315,7 +396,14 @@ export async function runWalkForward(options) {
   }
 
   const instrument = symbol === 'ETH' ? 'ETHUSDT' : symbol;
-  const plan = { validationRunId, dryRun, generationAttempts: 0, evaluationSweeps: 0, results: [] };
+  // req#10/G（P1-A）：main()必须能把resume继承/校验后的effective options（真实生效值，不是原始CLI空值）
+  // 输出给使用者复核——尤其weight_version/evaluation_version这类"不可继承、每次必须显式提供"的字段，
+  // 使用者需要能确认本次实际生效的值确实与自己预期一致。
+  const effectiveOptionsSummary = {
+    validationRunId, symbol, from, to, horizons, algorithmVersion, datasetVersion, ruleVersion,
+    weightVersion: effective.weightVersion, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd, dryRun
+  };
+  const plan = { validationRunId, dryRun, effectiveOptions: effectiveOptionsSummary, generationAttempts: 0, evaluationSweeps: 0, results: [] };
 
   for (const horizon of horizons) {
     const points = enumerateRhythmPoints({ from, to, horizon });
@@ -334,6 +422,27 @@ export async function runWalkForward(options) {
       plan.evaluationSweeps += 1;
       plan.results.push({ horizon, historicalAsOfTime, phase: 'evaluation', evaluated: evaluation.evaluated, deduped: evaluation.deduped });
     }
+  }
+
+  // P2-h（独立复审第二轮）：§4.2冻结要求dry-run必须输出一份"执行计划"，列出预计推进的
+  // historical_as_of_time节奏点数量、预计涉及的backfill_batch_id范围、预计的purge边界——此前
+  // 该要求只在runWalkForward内部算出了plan.generationAttempts，从未真正拼装/输出成一份完整的
+  // 执行计划，main()也从未把它打印到stdout（见main()下方的console.info调用）。这里只补齐"计算+
+  // 输出"这一层，不改变任何写入路径、不改变dryRun分支已有的"零业务写入"行为：
+  // - rhythmPointCount：等于plan.generationAttempts（各horizon节奏点数之和），dry-run与真实执行
+  //   共用同一枚举逻辑（enumerateRhythmPoints），数值上完全对应"预计推进的节奏点数量"。
+  // - backfillBatchIds：manifest gate（§4.1a第2步）验证通过后，manifest自身记录的backfill_batch_ids
+  //   即是"预计涉及"的批次集合——manifest已经在上方runManifestGate()中验证通过，直接复用其结果，
+  //   不重新查询、不引入第二套判定。
+  // - purgeBoundary：trainEnd/validationEnd即是report-builder.js在生成分段报告时用于判定
+  //   purged_straddling_count（跨边界剔除）的边界（V1_4D_DATA_BACKFILL_SPEC.md§1.1purge规则），
+  //   此处只读已经算好的effective.trainEnd/validationEnd，不重新定义、不改变该规则本身。
+  if (dryRun) {
+    plan.executionPlan = {
+      rhythmPointCount: plan.generationAttempts,
+      backfillBatchIds: manifestVerification.manifest.backfill_batch_ids,
+      purgeBoundary: { trainEnd, validationEnd }
+    };
   }
 
   if (!dryRun) {
@@ -417,6 +526,15 @@ export async function main(argv = process.argv.slice(2)) {
       nowMs: Date.now()
     });
     console.info('validation_run_id', plan.validationRunId);
+    // P1-A req#10/G：输出resume继承/校验后真实生效的effective options（而非本次CLI原始传入的空值/占位），
+    // 供使用者复核——尤其weight_version/evaluation_version本次实际生效值。
+    console.info('effective_options', JSON.stringify(plan.effectiveOptions));
+    // P2-h（独立复审第二轮）：§4.2冻结要求dry-run必须把"执行计划"（预计推进的节奏点数量、预计涉及的
+    // backfill_batch_id范围、预计的purge边界）输出到stdout，供使用者在真正写入前复核——此前
+    // runWalkForward()内部虽然算出了这些值，main()却从未把它们打印出来。
+    if (plan.dryRun) {
+      console.info('dry_run_execution_plan', JSON.stringify(plan.executionPlan));
+    }
     return plan;
   } finally {
     await pool.end();

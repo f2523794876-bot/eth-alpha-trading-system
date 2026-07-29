@@ -120,7 +120,16 @@ test('R26.12：--dry-run且manifest哈希不一致——fail closed，五张业�
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
 
     // manifest冻结后market_bars内容漂移（同R26.10/R26.13手法：人为插入一条revision_number=1的行）。
-    const anyBar = (await client.query(`SELECT * FROM market_bars WHERE instrument='ETHUSDT' LIMIT 1`)).rows[0];
+    // P2-g修复（独立复审第二轮）：原查询`LIMIT 1`不带`ORDER BY`，Postgres返回哪一行未定义，可能选中一根
+    // 落在buildVerifiedManifest查询范围[from,to)之外的bar（例如4h ATR预热bar，seedRhythmPoint会往前
+    // seed最多60小时的4h历史，可能早于from）——那样"污染"的行根本不在manifest重新计算哈希时被查询到，
+    // 哈希不会变化，断言的DATASET_CONTENT_HASH_MISMATCH不会触发，导致该测试在同一进程内多次运行时
+    // 因物理行返回顺序不同而随机失败（"完整集成测试连续运行两次结果必须一致"这一要求下暴露的真实缺陷）。
+    // 改为显式限定在[from,to)范围内、按open_time确定性排序取第一行，保证污染的行必然落在manifest范围内。
+    const anyBar = (await client.query(
+      `SELECT * FROM market_bars WHERE instrument='ETHUSDT' AND open_time>=to_timestamp($1/1000.0) AND open_time<to_timestamp($2/1000.0) ORDER BY open_time ASC LIMIT 1`,
+      [from, to]
+    )).rows[0];
     await client.query(
       `INSERT INTO market_bars(
          source_id, endpoint_id, instrument, market_type, interval_name, open_time, close_time,
@@ -302,7 +311,13 @@ test('R26.10/R26.13（resume分支）：resume时若manifest内容漂移，已�
     );
 
     // manifest冻结后market_bars内容漂移（人为插入一条revision_number=1的行，模拟"resume前数据被追加修订"）。
-    const anyBar = (await client.query(`SELECT * FROM market_bars WHERE instrument='ETHUSDT' LIMIT 1`)).rows[0];
+    // P2-g修复（独立复审第二轮）：原查询LIMIT 1不带ORDER BY且不限定[from,to)范围，可能选中manifest范围
+    // 之外的bar（如4h ATR预热bar），导致"污染"对recomputed哈希不可见，测试随机失败——同R26.12处的修复，
+    // 显式限定在manifest实际覆盖的[from,to)范围内、确定性排序。
+    const anyBar = (await client.query(
+      `SELECT * FROM market_bars WHERE instrument='ETHUSDT' AND open_time>=to_timestamp($1/1000.0) AND open_time<to_timestamp($2/1000.0) ORDER BY open_time ASC LIMIT 1`,
+      [from, to]
+    )).rows[0];
     if (anyBar) {
       await client.query(
         `INSERT INTO market_bars(
