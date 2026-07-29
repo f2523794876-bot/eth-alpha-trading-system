@@ -1,5 +1,7 @@
 // V1_4D_HISTORICAL_REPLAY_SPEC.md §一/§2.3/§2.4/§4.7：历史ForecastSnapshot回放生成。
-// 复用生产纯函数（bar-path-locator.js/threshold-formula.js/po-state-engine.js/forecast-contract.js），
+// 复用生产纯函数（threshold-formula.js/po-state-engine.js/forecast-contract.js）；bar/ATR/breakout查询
+// 使用物理独立的 replay-bar-path-queries.js（P0-3修复：不复用/不改写 bar-path-locator.js 的生产SQL，
+// 只共享其中的纯计算函数，见该文件顶部说明），
 // 镜像 server/src/forecast/generator-service.js `generateSnapshot()` 的计算顺序与写入模式，
 // 但不复用其lease/serverTimeProvider/事务包装——本模块只写 historical_validation.replay_snapshots/replay_generation_runs
 // 两张表，全部SQL语句schema-qualified，不获取/续租/释放任何生产collector_leases。
@@ -14,7 +16,9 @@
 // 只允许调用verifier"这一红线约束的是"不得隐式建manifest"，未要求逐快照重复校验）。
 
 import { randomUUID } from 'node:crypto';
-import { computeFourHourAtr14, computeConsecutiveBreakoutBars, locateReferenceBarAndPath } from '../forecast/bar-path-locator.js';
+import {
+  computeFourHourAtr14ForReplay, computeConsecutiveBreakoutBarsForReplay, locateReferenceBarAndPathForReplay
+} from './replay-bar-path-queries.js';
 import { computeDirectionThreshold } from '../forecast/threshold-formula.js';
 import { evaluatePoState } from '../forecast/po-state-engine.js';
 import {
@@ -22,7 +26,7 @@ import {
   computeRawScenarioScore, buildTriggerConditions, buildInvalidationConditions, computeForecastContentHash
 } from '../forecast/forecast-contract.js';
 import { FEATURE_ALGORITHM_VERSION, FEATURE_SET_VERSION } from '../features/feature-version.js';
-import { createResearchAvailabilityQueryable, buildResearchDataVintage, RESEARCH_AVAILABILITY_RULE_VERSION } from './research-availability.js';
+import { buildResearchDataVintage, RESEARCH_AVAILABILITY_RULE_VERSION } from './research-availability.js';
 
 const AUXILIARY_EVIDENCE_FIELDS = ['fundingRate', 'fundingRateZScore', 'openInterest', 'openInterestChange', 'openInterestChangeRatio', 'longShortRatio', 'longShortRatioZScore', 'takerBuySellRatio', 'derivativesAvailability'];
 // generator-service.js 同名常量/函数是模块私有（未导出），本模块独立复制这两个纯辅助——不改变任何判定逻辑，
@@ -88,12 +92,10 @@ export async function generateReplaySnapshot({
     return { status: 'BLOCKED', reason: errorCode, reasons, generationRunId };
   };
 
-  const researchQueryable = createResearchAvailabilityQueryable(pool, { replayNowMs });
-
-  const located = await locateReferenceBarAndPath(researchQueryable, { instrument, horizon, asOfTime: historicalAsOfTime, symbol });
+  const located = await locateReferenceBarAndPathForReplay(pool, { instrument, horizon, asOfTime: historicalAsOfTime, replayNowMs, symbol });
   if (!located.referenceBarRef) return blocked('REFERENCE_BAR_NOT_DUE_OR_MISSING', located.exclusionReasons);
 
-  const atr = await computeFourHourAtr14(researchQueryable, { instrument, asOfTime: historicalAsOfTime });
+  const atr = await computeFourHourAtr14ForReplay(pool, { instrument, asOfTime: historicalAsOfTime, replayNowMs, symbol });
   if (!atr.ok) return blocked('ATR14_4H_INSUFFICIENT', [atr.reason]);
 
   let threshold;
@@ -105,8 +107,8 @@ export async function generateReplaySnapshot({
   const fv = featureRow.feature_values;
 
   const [breakoutCount, breakdownCount] = await Promise.all([
-    computeConsecutiveBreakoutBars(researchQueryable, { instrument, asOfTime: historicalAsOfTime, direction: 'up' }),
-    computeConsecutiveBreakoutBars(researchQueryable, { instrument, asOfTime: historicalAsOfTime, direction: 'down' })
+    computeConsecutiveBreakoutBarsForReplay(pool, { instrument, asOfTime: historicalAsOfTime, replayNowMs, symbol, direction: 'up' }),
+    computeConsecutiveBreakoutBarsForReplay(pool, { instrument, asOfTime: historicalAsOfTime, replayNowMs, symbol, direction: 'down' })
   ]);
 
   const poResult = evaluatePoState({
@@ -154,8 +156,13 @@ export async function generateReplaySnapshot({
     featureEngineVersion: snapshotInput.featureEngineVersion, scenarioWeights: snapshotInput.scenarioWeights
   });
 
-  const consumedBarRefs = [located.referenceBarRef, targetBarRef, ...located.observedBars];
-  const researchDataVintage = buildResearchDataVintage({ barRefs: consumedBarRefs, backfillBatchIds, asOfTime: historicalAsOfTime });
+  // P1-1修复：auditRecords只来自真正被DB查询命中的行（located.auditRecords覆盖referenceBar+15m路径已观测
+  // 的bar，atr/breakoutCount/breakdownCount.auditRecords覆盖4h ATR与连续突破/跌破计算实际消费的4h bar），
+  // targetBarRef若是尚未成熟的占位BarRef（buildProjectedTargetBarRef构造，见上方），不会出现在任何
+  // auditRecords里（它从未被任何SQL查询返回过），buildResearchDataVintage按vintageId去重后天然排除它，
+  // 不会为"未实际消费"的K线错误生成审计行。
+  const auditRecords = [...located.auditRecords, ...atr.auditRecords, ...breakoutCount.auditRecords, ...breakdownCount.auditRecords];
+  const researchDataVintage = buildResearchDataVintage({ auditRecords, backfillBatchIds, asOfTime: historicalAsOfTime });
   const primaryBackfillBatchId = backfillBatchIds[0] ?? null;
 
   if (dryRun) {

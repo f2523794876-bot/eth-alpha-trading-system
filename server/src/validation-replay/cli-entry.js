@@ -155,6 +155,87 @@ export function enumerateRhythmPoints({ from, to, horizon }) {
   return points;
 }
 
+function toEpochMsFromTimestamptz(value) {
+  return value == null ? null : (value instanceof Date ? value.getTime() : new Date(value).getTime());
+}
+
+// P1-3修复（独立复审）：generation/evaluation/report任一阶段出现未处理异常时，把validation_runs从
+// RUNNING转为FAILED，并保存结构化的失败原因（阶段/节奏点/错误信息），供事后诊断与--resume前的人工判断。
+// 只在status仍为'RUNNING'时更新——终态（SUCCEEDED/FAILED）行不可变（分类A，§2.0），本函数不会、
+// 也不应该覆盖一个已经处于终态的行。blocked_reasons是jsonb数组，用`||`追加而不是覆盖，保留完整历史
+// （理论上同一行不应该被追加多次——一旦转为FAILED就是终态——但用追加而非覆盖仍然是更安全的写法，
+// 防止未来任何调用路径变化导致多次调用时静默丢失早期的失败原因）。
+async function markValidationRunFailed({ pool, validationRunId, error, failureContext }) {
+  const reason = {
+    phase: failureContext.phase || 'UNKNOWN',
+    horizon: failureContext.horizon,
+    historicalAsOfTime: failureContext.historicalAsOfTime,
+    message: error.message,
+    code: error.code || null,
+    at: new Date().toISOString()
+  };
+  await pool.query(
+    `UPDATE historical_validation.validation_runs
+     SET status='FAILED', error_code=$2, blocked_reasons=blocked_reasons || $3::jsonb, finished_at=now()
+     WHERE validation_run_id=$1 AND status='RUNNING'`,
+    [validationRunId, error.code || reason.phase || 'UNHANDLED_EXCEPTION', JSON.stringify([reason])]
+  );
+}
+
+// P0-1修复（独立复审）：真正的断点续跑——此前的实现在--resume时会把[from,to)整个区间重新枚举、重新调用
+// generateReplaySnapshot/evaluateReplayOutcomes做完整计算，只靠下游ON CONFLICT DO NOTHING去重免于重复写入，
+// 但既没有"从哪里继续"的持久化游标，也把已完成节奏点的计算重新做了一遍（违反"不重复...重新计算已完成部分"）。
+//
+// 本函数从该(validation_run_id, horizon)已持久化的审计表推导出一个可靠的checkpoint，不新增任何表/列：
+// - 一个节奏点(historicalAsOfTime)被视为"已完成"，要求同时满足：
+//   ① historical_validation.replay_generation_runs 中存在该(validation_run_id, horizon, historical_as_of_time)
+//      的一行，status在('SUCCEEDED','BLOCKED')终态（这两个状态代表"确定性地跑完了一次尝试"，FAILED代表
+//      未处理完的异常，必须重跑，不计入已完成——见P1-3）；
+//   ② historical_validation.replay_evaluation_runs 中存在该(validation_run_id, historical_as_of_time)的一行，
+//      status='SUCCEEDED'（评估sweep不区分horizon，见migration 005 §2.6结构，本函数按具体asOfTime值匹配）。
+// - resumeFromIndex = 从points[0]开始，第一个不满足上述"已完成"条件的下标（即首个未完成节奏点）。
+// - fail-closed一致性核验：resumeFromIndex之后不得再出现任何"已完成"的点——正常的单线程顺序执行不可能
+//   产生这种情况（点是按顺序处理的），一旦出现即代表审计记录不连续/不一致，无法安全判定真正的续跑边界，
+//   必须拒绝续跑而不是猜测性地选一个边界（见本任务书P0-1"如果恢复所需状态不完整或不一致，必须fail closed"）。
+export async function computeResumeCheckpoint({ pool, validationRunId, horizon, points }) {
+  if (!points.length) return { resumeFromIndex: 0, totalPoints: 0 };
+
+  const genRows = await pool.query(
+    `SELECT historical_as_of_time, status FROM historical_validation.replay_generation_runs
+     WHERE validation_run_id=$1 AND horizon=$2`,
+    [validationRunId, horizon]
+  );
+  const genTerminal = new Set();
+  for (const row of genRows.rows) {
+    if (row.status === 'SUCCEEDED' || row.status === 'BLOCKED') genTerminal.add(toEpochMsFromTimestamptz(row.historical_as_of_time));
+  }
+
+  const evalRows = await pool.query(
+    `SELECT historical_as_of_time, status FROM historical_validation.replay_evaluation_runs WHERE validation_run_id=$1`,
+    [validationRunId]
+  );
+  const evalTerminal = new Set();
+  for (const row of evalRows.rows) {
+    if (row.status === 'SUCCEEDED') evalTerminal.add(toEpochMsFromTimestamptz(row.historical_as_of_time));
+  }
+
+  const isDone = point => genTerminal.has(point) && evalTerminal.has(point);
+
+  let resumeFromIndex = 0;
+  while (resumeFromIndex < points.length && isDone(points[resumeFromIndex])) resumeFromIndex += 1;
+
+  for (let i = resumeFromIndex + 1; i < points.length; i++) {
+    if (isDone(points[i])) {
+      throw Object.assign(
+        new Error(`Resume checkpoint inconsistency for horizon ${horizon}: point at index ${i} (historicalAsOfTime=${points[i]}) is already recorded as complete, but an earlier point at index ${resumeFromIndex} (historicalAsOfTime=${points[resumeFromIndex]}) is not — cannot safely determine a contiguous resume boundary`),
+        { code: 'RESUME_CHECKPOINT_INCONSISTENT', horizon, gapIndex: resumeFromIndex, aheadIndex: i }
+      );
+    }
+  }
+
+  return { resumeFromIndex, totalPoints: points.length };
+}
+
 // §4.1a八步强制校验入口——供main()调用，resume/dry-run场景下必须【重新完整执行】，不得跳过（第7/8步）。
 async function runManifestGate({ pool, datasetVersion }) {
   const verification = await verifyDatasetManifest({ pool, datasetVersion, currentResearchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION });
@@ -387,10 +468,16 @@ export async function runWalkForward(options) {
     );
   } else if (!resumeValidationRunId && dryRun) {
     // §4.2：validation_runs本身允许dry-run写入一行审计记录（不是业务数据，是"跑过一次dry-run"的事实）。
+    // P1-3修复（独立复审）：此前这里直接以status='SUCCEEDED'插入——在P0-2修复之前dry-run只是一个立即
+    // 返回的`continue`循环，从不会失败，"插入时即成功"尚可接受；但P0-2修复后dry-run真实执行生成/评估的
+    // 全部只读计算，同样可能抛出未预期异常。若仍然"插入时就标记SUCCEEDED"，一旦下面的循环体在完成前抛出
+    // 异常，这一行会永久错误地显示"SUCCEEDED"（数据与事实不符，违反"不得出现失败后仍标记COMPLETED"红线）。
+    // 改为与真实执行路径同一模式：先插入RUNNING，循环成功完成后才更新为SUCCEEDED，失败则见下方
+    // 统一异常处理器更新为FAILED——dry-run与真实执行共享同一套终态治理，不再有特殊例外。
     await pool.query(
       `INSERT INTO historical_validation.validation_runs(
-         validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, dry_run, status, started_at, finished_at
-       ) VALUES($1,$2,$3,$4::jsonb,to_timestamp($5/1000.0),to_timestamp($6/1000.0),$7,$8,true,'SUCCEEDED',now(),now())`,
+         validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, dry_run, status, started_at
+       ) VALUES($1,$2,$3,$4::jsonb,to_timestamp($5/1000.0),to_timestamp($6/1000.0),$7,$8,true,'RUNNING',now())`,
       [validationRunId, datasetVersion, symbol, JSON.stringify(horizons), from, to, algorithmVersion, ruleVersion]
     );
   }
@@ -403,54 +490,113 @@ export async function runWalkForward(options) {
     validationRunId, symbol, from, to, horizons, algorithmVersion, datasetVersion, ruleVersion,
     weightVersion: effective.weightVersion, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd, dryRun
   };
-  const plan = { validationRunId, dryRun, effectiveOptions: effectiveOptionsSummary, generationAttempts: 0, evaluationSweeps: 0, results: [] };
+  const plan = { validationRunId, dryRun, effectiveOptions: effectiveOptionsSummary, generationAttempts: 0, evaluationSweeps: 0, results: [], resumeCheckpoints: {} };
 
-  for (const horizon of horizons) {
-    const points = enumerateRhythmPoints({ from, to, horizon });
-    plan.generationAttempts += points.length;
-    if (dryRun) continue; // §4.2：dry-run只输出执行计划(节奏点数量)，不实际调用生成/评估逻辑对业务表产生任何写入意图
+  // P0-1/P0-2修复（独立复审）：
+  // ①真正的断点续跑——resume时先算出每个horizon各自的checkpoint（见computeResumeCheckpoint），
+  //   循环从resumeFromIndex开始，不重新处理已完成的节奏点（不重复计算，不只依赖下游ON CONFLICT去重）；
+  //   new-task模式下resumeFromIndex恒为0，行为与此前一致。
+  // ②dry-run不再对整个循环体`continue`——§4.2冻结要求dry-run执行完整的读取+计算链路（快照生成预演、
+  //   数据可用性/缺口检查、ATR/PO/阈值计算、outcome/evaluation预演），只是把最终的数据库写入替换为
+  //   空操作。generateReplaySnapshot/evaluateReplayOutcomes本身已经支持dryRun参数（返回'PLANNED'状态、
+  //   跳过INSERT/UPDATE，见两个模块内部实现），此前的问题是本循环从未把dryRun传给它们、也从未调用它们——
+  //   现在统一调用，只把dryRun标志向下传递，不再在循环层面短路。
+  // P1-3修复（独立复审）：统一异常治理——manifest gate之后（本函数前段已单独处理manifest gate自身的
+  // 异常，见上方）、直到report构建与终态更新完成之前的任何一步（生成/评估循环、报告构建）若抛出未预期异常，
+  // 此前会直接从runWalkForward()冒泡出去，validation_runs行永远停留在RUNNING，不会被标记为FAILED——
+  // 这既违反"不得出现失败后仍标记COMPLETED"（更准确地说，是"失败后必须转FAILED，不得停留在非终态"），
+  // 也让下次--resume时无法通过checkResumeVersionConsistency等校验判断这是一次真实失败还是仍在进行中。
+  // failureContext跟踪"异常发生在哪个阶段/哪个节奏点"，写入structured blocked_reasons，供事后诊断；
+  // catch块本身只负责"打上FAILED标记"，不吞掉/替换原始异常——markValidationRunFailed若自身失败（终态
+  // 更新语句本身出错），会抛出一个携带original error作为cause的新错误，而不是静默吞掉任何一方。
+  let failureContext = { phase: null, horizon: null, historicalAsOfTime: null };
+  try {
+    for (const horizon of horizons) {
+      const points = enumerateRhythmPoints({ from, to, horizon });
+      plan.generationAttempts += points.length;
 
-    for (const historicalAsOfTime of points) {
-      const generation = await generateReplaySnapshot({
-        pool, validationRunId, instrument, symbol, horizon, historicalAsOfTime, replayNowMs,
-        algorithmVersion, weightVersion: effective.weightVersion, datasetVersion, ruleVersion,
-        backfillBatchIds: options.backfillBatchIds || []
-      });
-      plan.results.push({ horizon, historicalAsOfTime, phase: 'generation', status: generation.status });
+      const checkpoint = resumeValidationRunId
+        ? await computeResumeCheckpoint({ pool, validationRunId, horizon, points })
+        : { resumeFromIndex: 0, totalPoints: points.length };
+      plan.resumeCheckpoints[horizon] = checkpoint;
 
-      const evaluation = await evaluateReplayOutcomes({ pool, validationRunId, evaluationVersion: effective.evaluationVersion, historicalAsOfTime, replayNowMs });
-      plan.evaluationSweeps += 1;
-      plan.results.push({ horizon, historicalAsOfTime, phase: 'evaluation', evaluated: evaluation.evaluated, deduped: evaluation.deduped });
+      for (let i = checkpoint.resumeFromIndex; i < points.length; i++) {
+        const historicalAsOfTime = points[i];
+        failureContext = { phase: 'GENERATION', horizon, historicalAsOfTime };
+        const generation = await generateReplaySnapshot({
+          pool, validationRunId, instrument, symbol, horizon, historicalAsOfTime, replayNowMs,
+          algorithmVersion, weightVersion: effective.weightVersion, datasetVersion, ruleVersion,
+          backfillBatchIds: options.backfillBatchIds || [], dryRun
+        });
+        plan.results.push({ horizon, historicalAsOfTime, phase: 'generation', status: generation.status });
+
+        failureContext = { phase: 'EVALUATION', horizon, historicalAsOfTime };
+        const evaluation = await evaluateReplayOutcomes({ pool, validationRunId, evaluationVersion: effective.evaluationVersion, historicalAsOfTime, replayNowMs, dryRun });
+        plan.evaluationSweeps += 1;
+        // previewed：本次sweep实际处理过的pending快照数量（dry-run下evaluation.evaluated/deduped恒为0，
+        // 因为INSERT本身被跳过；evaluation.results.length是dry-run场景下唯一能证明"确实扫描过pending快照
+        // 并跑完了locatePathForEvaluationForReplay+computeForecastOutcome全部计算"的证据）。
+        plan.results.push({ horizon, historicalAsOfTime, phase: 'evaluation', evaluated: evaluation.evaluated, deduped: evaluation.deduped, previewed: evaluation.results.length });
+      }
     }
-  }
 
-  // P2-h（独立复审第二轮）：§4.2冻结要求dry-run必须输出一份"执行计划"，列出预计推进的
-  // historical_as_of_time节奏点数量、预计涉及的backfill_batch_id范围、预计的purge边界——此前
-  // 该要求只在runWalkForward内部算出了plan.generationAttempts，从未真正拼装/输出成一份完整的
-  // 执行计划，main()也从未把它打印到stdout（见main()下方的console.info调用）。这里只补齐"计算+
-  // 输出"这一层，不改变任何写入路径、不改变dryRun分支已有的"零业务写入"行为：
-  // - rhythmPointCount：等于plan.generationAttempts（各horizon节奏点数之和），dry-run与真实执行
-  //   共用同一枚举逻辑（enumerateRhythmPoints），数值上完全对应"预计推进的节奏点数量"。
-  // - backfillBatchIds：manifest gate（§4.1a第2步）验证通过后，manifest自身记录的backfill_batch_ids
-  //   即是"预计涉及"的批次集合——manifest已经在上方runManifestGate()中验证通过，直接复用其结果，
-  //   不重新查询、不引入第二套判定。
-  // - purgeBoundary：trainEnd/validationEnd即是report-builder.js在生成分段报告时用于判定
-  //   purged_straddling_count（跨边界剔除）的边界（V1_4D_DATA_BACKFILL_SPEC.md§1.1purge规则），
-  //   此处只读已经算好的effective.trainEnd/validationEnd，不重新定义、不改变该规则本身。
-  if (dryRun) {
-    plan.executionPlan = {
-      rhythmPointCount: plan.generationAttempts,
-      backfillBatchIds: manifestVerification.manifest.backfill_batch_ids,
-      purgeBoundary: { trainEnd, validationEnd }
-    };
-  }
+    // §4.2冻结要求dry-run必须输出一份"执行计划"，列出预计推进的historical_as_of_time节奏点数量、预计涉及的
+    // backfill_batch_id范围、预计的purge边界，以及（P0-2新增）本次dry-run实际完整执行的读取+计算链路产出的
+    // 汇总摘要——证明dry-run不是"只统计数量"，而是真的跑过一遍全部只读计算：
+    // - rhythmPointCount：等于plan.generationAttempts（各horizon节奏点数之和，total，不随resume跳过而减少，
+    //   与既有测试断言"rhythmPointCount===generationAttempts"保持一致）。
+    // - backfillBatchIds/purgeBoundary：同此前实现，来自manifest gate验证结果与effective切分点，未改变。
+    // - generationStatusCounts/evaluationPlannedCount/evaluationDedupedCount：本次dry-run实际执行后，
+    //   plan.results里各阶段状态的汇总计数（PLANNED/BLOCKED及其原因、evaluation的PLANNED/DEDUPED数），
+    //   证明每个节奏点都被真实跑过一次完整计算，不是占位符。
+    // - resumeCheckpoints：resume场景下dry-run同样应用checkpoint跳过已完成点（预览"剩余工作量"更贴近真实
+    //   意图），故一并输出每个horizon的resumeFromIndex/totalPoints供复核。
+    if (dryRun) {
+      const generationStatusCounts = {};
+      for (const r of plan.results) {
+        if (r.phase !== 'generation') continue;
+        const key = `${r.horizon}:${r.status}`;
+        generationStatusCounts[key] = (generationStatusCounts[key] || 0) + 1;
+      }
+      let evaluationPreviewedCount = 0;
+      for (const r of plan.results) {
+        if (r.phase !== 'evaluation') continue;
+        evaluationPreviewedCount += r.previewed || 0;
+      }
+      plan.executionPlan = {
+        rhythmPointCount: plan.generationAttempts,
+        backfillBatchIds: manifestVerification.manifest.backfill_batch_ids,
+        purgeBoundary: { trainEnd, validationEnd },
+        generationStatusCounts,
+        evaluationPreviewedCount,
+        resumeCheckpoints: plan.resumeCheckpoints
+      };
+    }
 
-  if (!dryRun) {
-    plan.reports = await buildValidationReports({
-      pool, validationRunId, datasetVersion, algorithmVersion, ruleVersion,
-      researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd
-    });
-    await pool.query(`UPDATE historical_validation.validation_runs SET status='SUCCEEDED', finished_at=now() WHERE validation_run_id=$1`, [validationRunId]);
+    if (!dryRun) {
+      failureContext = { phase: 'REPORT', horizon: null, historicalAsOfTime: null };
+      plan.reports = await buildValidationReports({
+        pool, validationRunId, datasetVersion, algorithmVersion, ruleVersion,
+        researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd
+      });
+    }
+
+    // dry-run resume：从不touch原run的持久化状态（zero business writes原则的延伸，见§4.2）；
+    // 其余三种组合（new-task非dry-run/resume非dry-run/new-task dry-run）都需要在成功完成后转为SUCCEEDED——
+    // AND status='RUNNING'是防御性写法，避免对已经处于终态的行做无意义的原地更新。
+    if (!(resumeValidationRunId && dryRun)) {
+      await pool.query(`UPDATE historical_validation.validation_runs SET status='SUCCEEDED', finished_at=now() WHERE validation_run_id=$1 AND status='RUNNING'`, [validationRunId]);
+    }
+  } catch (error) {
+    try {
+      await markValidationRunFailed({ pool, validationRunId, error, failureContext });
+    } catch (updateError) {
+      throw Object.assign(
+        new Error(`validation_run ${validationRunId} failed (${error.message}), and marking it FAILED also failed (${updateError.message}); see .originalError/.updateError for both`),
+        { code: 'VALIDATION_RUN_FAILURE_UPDATE_FAILED', originalError: error, updateError, cause: error }
+      );
+    }
+    throw error;
   }
 
   return plan;

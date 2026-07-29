@@ -79,7 +79,19 @@ async function seedRhythmPoint(pool, { referenceCloseTime, replayNowMs }) {
 
   await seedFeatureRecord(pool, { referenceCloseTime, historicalAsOfTime: referenceCloseTime });
 }
-async function buildVerifiedManifest(pool, { from, to }) {
+// P0-4修复联动：integrity-check.js现在要求[from,to)整个范围按interval步长逐位连续覆盖（含边界），
+// 见 v1-4d-cli-entry.integration.test.js 同名辅助函数的详细说明。
+async function fillContiguousCoverage(pool, { from, to, replayNowMs }) {
+  for (const [interval, stepMs] of [['15m', FIFTEEN_MIN_MS], ['4h', FOUR_HOUR_MS]]) {
+    const bars = [];
+    for (let openTime = from; openTime < to; openTime += stepMs) bars.push(kline(openTime, openTime + stepMs - 1, '1000.00'));
+    if (!bars.length) continue;
+    const adapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
+    await backfillInterval({ pool, adapter, symbol: 'ETHUSDT', interval, startTime: from, endTime: to - stepMs, now: () => replayNowMs });
+  }
+}
+async function buildVerifiedManifest(pool, { from, to, replayNowMs = Date.now() }) {
+  await fillContiguousCoverage(pool, { from, to, replayNowMs });
   const result = await buildDatasetManifest({ pool, symbol: 'ETHUSDT', intervals: ['15m', '4h'], from, to });
   assert.equal(result.status, 'SUCCEEDED', 'manifest构建必须成功（前置bar数据必须无缺口）');
   return result.datasetVersion;
@@ -135,8 +147,8 @@ test('main()：完整合法新任务参数——端到端创建新validation_run
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     const capture = captureConsole();
@@ -161,7 +173,10 @@ test('main()：完整合法新任务参数——端到端创建新validation_run
     assert.equal(runRow.algorithm_version, ALGORITHM_VERSION);
   } finally {
     await purgeRun(pool, validationRunId);
-    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 0, 30), toMs: Date.UTC(2026, 1, 3) });
+    // fromMs前移至Jan26（而非Jan30）：referenceCloseTime(Jan31 23:59:59.999)自身的4h ATR回溯窗口
+    // 达60小时(~2.5天)，达到Jan29左右，此前的边界(Jan30)未能完整覆盖该回溯窗口，
+    // 会在测试库中留下无法被本测试自身清理的孤儿market_bars行。
+    await purgeMarketData(pool, { fromMs: Date.UTC(2026, 0, 26), toMs: Date.UTC(2026, 1, 3) });
     await pool.end();
   }
 });
@@ -174,8 +189,8 @@ test('main()：--resume最小形式——省略的symbol/from/to/algorithm-versi
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     // 直接INSERT一条"半途"的原始run行（RUNNING/未完成的等价场景——resume的前置条件只需要该行存在，
@@ -233,8 +248,8 @@ test('main()：--resume时省略的部分参数继承、另一部分参数显式
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     validationRunId = randomUUID();
@@ -309,8 +324,8 @@ test('main()：--dry-run对五张业务表零写入，validation_runs仅新增1�
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     const plan = await withMainEnv(() => main([
@@ -541,8 +556,8 @@ test('P1-A-A：首次run使用weight V1，resume使用V2——拒绝(RESUME_WEIG
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     const plan1 = await withMainEnv(() => main([
@@ -586,8 +601,8 @@ test('P1-A-B：首次run与resume均使用weight V1——允许', { skip }, asyn
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     const plan1 = await withMainEnv(() => main([
@@ -629,7 +644,7 @@ test('P1-A-C：已有outcome使用evaluation V1，resume使用V2——拒绝(RES
     const pathAdapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
     await backfillInterval({ pool, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
 
-    const from = referenceCloseTime - DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
     const to = referenceCloseTime + 2 * DAY_MS;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
@@ -676,7 +691,7 @@ test('P1-A-D：首次run与resume均使用相同evaluation版本——允许', {
     const pathAdapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
     await backfillInterval({ pool, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
 
-    const from = referenceCloseTime - DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
     const to = referenceCloseTime + 2 * DAY_MS;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
@@ -801,8 +816,8 @@ test('P1-A-G：resume继承其他允许继承参数后，main()输出的effectiv
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(pool, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     validationRunId = randomUUID();

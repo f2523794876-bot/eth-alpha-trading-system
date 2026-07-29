@@ -41,6 +41,17 @@ function makeMockAdapter({ pages, serverTimeMs }) {
   };
 }
 
+// P0-4修复联动：integrity-check.js现在要求[from,to)整个范围按interval步长逐位连续覆盖（含边界），
+// 见 v1-4d-cli-entry.integration.test.js 同名辅助函数的详细说明。调用方须确保from/to已对齐open_time相位。
+async function fillContiguousCoverage(pool, { from, to, replayNowMs, interval = '15m' }) {
+  const stepMs = FIFTEEN_MIN_MS;
+  const bars = [];
+  for (let openTime = from; openTime < to; openTime += stepMs) bars.push(kline(openTime, openTime + stepMs - 1, '1000.00'));
+  if (!bars.length) return;
+  const adapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
+  await backfillInterval({ pool, adapter, symbol: 'ETHUSDT', interval, startTime: from, endTime: to - stepMs, now: () => replayNowMs });
+}
+
 test('子进程真实运行（P2-c）：--resume不带值——真实非零退出码，stderr包含INVALID_RESUME_ID，且不需要任何数据库连接（不传DATABASE_URL也应如此）', { skip }, async () => {
   await assert.rejects(
     execFileAsync('node', [CLI_ENTRY_PATH, '--resume', '--symbol', 'ETHUSDT'], {
@@ -67,8 +78,9 @@ test('子进程真实运行（P2-c）：完整合法新任务参数——真实�
     const refAdapter = makeMockAdapter({ pages: [[kline(referenceOpenTime, referenceCloseTime, '1000.00')]], serverTimeMs: replayNowMs });
     await backfillInterval({ pool, adapter: refAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: referenceOpenTime, endTime: referenceOpenTime, now: () => replayNowMs });
 
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // +1对齐open_time相位（referenceCloseTime本身是close_time相位）
+    const to = referenceCloseTime + DAY_MS + 1;
+    await fillContiguousCoverage(pool, { from, to, replayNowMs });
     const manifestResult = await buildDatasetManifest({ pool, symbol: 'ETHUSDT', intervals: ['15m'], from, to });
     assert.equal(manifestResult.status, 'SUCCEEDED');
     const datasetVersion = manifestResult.datasetVersion;
@@ -125,8 +137,9 @@ test('子进程真实运行（P2-h/R9.1b）：--dry-run的真实stdout必须包�
     const refAdapter = makeMockAdapter({ pages: [[kline(referenceOpenTime, referenceCloseTime, '1000.00')]], serverTimeMs: replayNowMs });
     await backfillInterval({ pool, adapter: refAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: referenceOpenTime, endTime: referenceOpenTime, now: () => replayNowMs });
 
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // +1对齐open_time相位（referenceCloseTime本身是close_time相位）
+    const to = referenceCloseTime + DAY_MS + 1;
+    await fillContiguousCoverage(pool, { from, to, replayNowMs });
     const manifestResult = await buildDatasetManifest({ pool, symbol: 'ETHUSDT', intervals: ['15m'], from, to });
     assert.equal(manifestResult.status, 'SUCCEEDED');
     const datasetVersion = manifestResult.datasetVersion;

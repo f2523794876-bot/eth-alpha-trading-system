@@ -83,7 +83,24 @@ async function seedRhythmPoint(client, { referenceCloseTime, replayNowMs }) {
   await seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTime: referenceCloseTime });
 }
 
-async function buildVerifiedManifest(client, { from, to }) {
+// P0-4修复联动：integrity-check.js现在要求[from,to)整个范围按interval步长逐位连续覆盖（含边界），不再只是
+// "已有行之间无缺口"这一弱校验——本文件此前的写法是精确seed某个具体节奏点的referenceBar/ATR窗口，
+// manifest范围却常常取一个更宽的缓冲区间（如referenceCloseTime±1天），依赖旧版integrity-check.js只查
+// 相邻行间隙的弱校验才能侥幸构建成功。这里统一补齐[from,to)区间15m/4h两个周期的完整覆盖（每个位置一根
+// 通用填充bar），ON CONFLICT DO NOTHING与调用方已单独seed的精确referenceBar/ATR数据天然去重不冲突
+// （调用方必须先调用seedRhythmPoint等函数，同一open_time的精确数据先写入、后续填充写入会被静默跳过）。
+async function fillContiguousCoverage(client, { from, to, replayNowMs }) {
+  for (const [interval, stepMs] of [['15m', FIFTEEN_MIN_MS], ['4h', FOUR_HOUR_MS]]) {
+    const bars = [];
+    for (let openTime = from; openTime < to; openTime += stepMs) bars.push(kline(openTime, openTime + stepMs - 1, '1000.00'));
+    if (!bars.length) continue;
+    const adapter = makeMockAdapter({ pages: [bars], serverTimeMs: replayNowMs });
+    await backfillInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval, startTime: from, endTime: to - stepMs, now: () => replayNowMs });
+  }
+}
+
+async function buildVerifiedManifest(client, { from, to, replayNowMs = Date.now() }) {
+  await fillContiguousCoverage(client, { from, to, replayNowMs });
   const result = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m', '4h'], from, to });
   assert.equal(result.status, 'SUCCEEDED', 'manifest构建必须成功（前置bar数据必须无缺口）');
   return result.datasetVersion;
@@ -115,8 +132,8 @@ test('R26.12：--dry-run且manifest哈希不一致——fail closed，五张业�
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
 
     // manifest冻结后market_bars内容漂移（同R26.10/R26.13手法：人为插入一条revision_number=1的行）。
@@ -168,8 +185,8 @@ test('R9.1：--dry-run对五张业务表零写入，validation_runs仅新增1行
     const replayNowMs = Date.now();
     await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
 
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
 
     const plan = await runWalkForward({
@@ -202,8 +219,8 @@ test('完整非dry-run执行：单个24h节奏点产出replay_snapshots/replay_g
     const replayNowMs = Date.now();
     await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
 
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
 
     const plan = await runWalkForward({
@@ -241,8 +258,8 @@ test('R21.2：显式设置search_path=\'historical_validation,public\'后完整�
     const replayNowMs = Date.now();
     await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
 
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
 
     const plan = await runWalkForward({
@@ -299,8 +316,8 @@ test('R26.10/R26.13（resume分支）：resume时若manifest内容漂移，已�
     const referenceCloseTime = dayStart - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
-    const from = referenceCloseTime - DAY_MS;
-    const to = referenceCloseTime + DAY_MS;
+    const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
+    const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
 
     const validationRunId = randomUUID();

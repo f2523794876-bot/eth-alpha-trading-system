@@ -2,13 +2,14 @@
 // 镜像 server/src/outcome/evaluator-service.js `evaluatePending()` 的计算顺序与写入模式，
 // 复用 outcome-engine.js computeForecastOutcome()（纯函数，不修改），只写
 // historical_validation.replay_outcome_events/replay_evaluation_runs 两张表，schema-qualified，
-// 不获取/续租/释放任何生产collector_leases。
+// 不获取/续租/释放任何生产collector_leases。路径查询使用物理独立的 replay-bar-path-queries.js
+// （P0-3修复：不复用/不改写 bar-path-locator.js 的生产SQL）。
 
 import { randomUUID } from 'node:crypto';
-import { locatePathForEvaluation } from '../forecast/bar-path-locator.js';
+import { locatePathForEvaluationForReplay } from './replay-bar-path-queries.js';
 import { computeForecastOutcome } from '../outcome/outcome-engine.js';
 import { canonicalJsonHash } from '../domain/hash.js';
-import { createResearchAvailabilityQueryable, buildResearchDataVintage, RESEARCH_AVAILABILITY_RULE_VERSION } from './research-availability.js';
+import { buildResearchDataVintage, RESEARCH_AVAILABILITY_RULE_VERSION } from './research-availability.js';
 
 function rowToSnapshot(row) {
   return {
@@ -54,22 +55,23 @@ export async function evaluateReplayOutcomes({ pool, validationRunId, evaluation
   const startedAt = now();
   if (!dryRun) await recordEvaluationRun(pool, { evaluationRunId, validationRunId, historicalAsOfTime, status: 'RUNNING', startedAt, finishedAt: null });
 
-  const researchQueryable = createResearchAvailabilityQueryable(pool, { replayNowMs });
   const pending = await findPendingReplaySnapshots(pool, { evaluationVersion, historicalAsOfTime, limit });
 
   let evaluatedCount = 0, dedupedCount = 0;
   const results = [];
   for (const row of pending) {
     const snapshot = rowToSnapshot(row);
-    const located = await locatePathForEvaluation(researchQueryable, {
+    const located = await locatePathForEvaluationForReplay(pool, {
       instrument: row.instrument === 'ETH' ? 'ETHUSDT' : row.instrument,
-      referenceBarRef: snapshot.referenceBarRef, expectedBarCount: snapshot.expectedBarCount, asOfTime: historicalAsOfTime
+      referenceBarRef: snapshot.referenceBarRef, expectedBarCount: snapshot.expectedBarCount, asOfTime: historicalAsOfTime, replayNowMs
     });
     const outcome = computeForecastOutcome({ snapshot, located });
     const contentHash = canonicalJsonHash({ predictionId: outcome.predictionId, evaluationVersion, actualReturn: outcome.actualReturn, actualDirection: outcome.actualDirection, mfe: outcome.mfe, mae: outcome.mae });
 
+    // P1-1修复：auditRecords只含located.auditRecords（真正被查询命中的referenceBar+已观测path bar），
+    // 不包括未匹配到DB行的缺口/占位BarRef——与生成阶段同一原则。
     const researchDataVintage = buildResearchDataVintage({
-      barRefs: [outcome.referenceBarRef, outcome.targetBarRef, ...located.observedBars],
+      auditRecords: located.auditRecords,
       backfillBatchIds: row.backfill_batch_id ? [row.backfill_batch_id] : [],
       asOfTime: historicalAsOfTime
     });
