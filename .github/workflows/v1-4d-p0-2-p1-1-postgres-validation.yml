@@ -33,6 +33,8 @@ jobs:
     steps:
       - name: Checkout validation branch
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up locked Node.js runtime
         uses: actions/setup-node@v4
