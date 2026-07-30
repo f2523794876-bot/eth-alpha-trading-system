@@ -15,6 +15,16 @@ const TARGETED_FILES = Object.freeze([
   'tests/postgres/v1-4d-dry-run-full-compute.integration.test.js',
   'tests/postgres/v1-4d-replay-generator-evaluator.integration.test.js'
 ]);
+// All V1.4D PostgreSQL files share one database. Node runs separate test files
+// concurrently by default, so global zero-write/count assertions can observe
+// another file's uncommitted fixture rows even though every file rolls its own
+// transaction back. Serialize database test files; test cases remain isolated
+// by their existing per-test transactions.
+const POSTGRES_TEST_ARGS = Object.freeze([
+  '--test',
+  '--test-reporter=tap',
+  '--test-concurrency=1'
+]);
 
 const testDatabaseUrl = process.env.TEST_DATABASE_URL;
 if (!testDatabaseUrl) throw new Error('TEST_DATABASE_URL is required');
@@ -151,7 +161,7 @@ try {
     const stats = await runTestCommand(
       `targeted PostgreSQL run ${run}`,
       process.execPath,
-      ['--test', '--test-reporter=tap', ...TARGETED_FILES]
+      [...POSTGRES_TEST_ARGS, ...TARGETED_FILES]
     );
     const after = await countBusinessTables(pool);
     results.targetedRuns.push({ run, stats, before, after });
@@ -167,7 +177,7 @@ try {
   const postgresStats = await runTestCommand(
     'all V1.4D PostgreSQL integration tests',
     process.execPath,
-    ['--test', '--test-reporter=tap', ...postgresFiles]
+    [...POSTGRES_TEST_ARGS, ...postgresFiles]
   );
   results.suites.push({ label: 'all V1.4D PostgreSQL integration tests', stats: postgresStats });
 
