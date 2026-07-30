@@ -491,6 +491,7 @@ export async function runWalkForward(options) {
     weightVersion: effective.weightVersion, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd, dryRun
   };
   const plan = { validationRunId, dryRun, effectiveOptions: effectiveOptionsSummary, generationAttempts: 0, evaluationSweeps: 0, results: [], resumeCheckpoints: {} };
+  const pendingDryRunSnapshots = new Map();
 
   // P0-1/P0-2修复（独立复审）：
   // ①真正的断点续跑——resume时先算出每个horizon各自的checkpoint（见computeResumeCheckpoint），
@@ -528,15 +529,43 @@ export async function runWalkForward(options) {
           algorithmVersion, weightVersion: effective.weightVersion, datasetVersion, ruleVersion,
           backfillBatchIds: options.backfillBatchIds || [], dryRun
         });
-        plan.results.push({ horizon, historicalAsOfTime, phase: 'generation', status: generation.status });
+        const generationResult = {
+          horizon, historicalAsOfTime, phase: 'generation', status: generation.status,
+          predictionId: generation.record?.predictionId ?? null,
+          generationRunId: generation.generationRunId
+        };
+        plan.results.push(generationResult);
+        if (dryRun && generation.status === 'PLANNED') {
+          pendingDryRunSnapshots.set(generation.record.predictionId, {
+            ...generation.record,
+            generationRunId: generation.generationRunId,
+            backfillBatchId: options.backfillBatchIds?.[0] ?? null
+          });
+        }
 
         failureContext = { phase: 'EVALUATION', horizon, historicalAsOfTime };
-        const evaluation = await evaluateReplayOutcomes({ pool, validationRunId, evaluationVersion: effective.evaluationVersion, historicalAsOfTime, replayNowMs, dryRun });
+        const evaluation = await evaluateReplayOutcomes({
+          pool, validationRunId, evaluationVersion: effective.evaluationVersion,
+          historicalAsOfTime, replayNowMs, dryRun,
+          inMemorySnapshots: dryRun ? [...pendingDryRunSnapshots.values()] : []
+        });
         plan.evaluationSweeps += 1;
         // previewed：本次sweep实际处理过的pending快照数量（dry-run下evaluation.evaluated/deduped恒为0，
         // 因为INSERT本身被跳过；evaluation.results.length是dry-run场景下唯一能证明"确实扫描过pending快照
         // 并跑完了locatePathForEvaluationForReplay+computeForecastOutcome全部计算"的证据）。
-        plan.results.push({ horizon, historicalAsOfTime, phase: 'evaluation', evaluated: evaluation.evaluated, deduped: evaluation.deduped, previewed: evaluation.results.length });
+        const inMemoryPreviewed = evaluation.results.filter(result => result.source === 'IN_MEMORY_PLANNED');
+        for (const result of inMemoryPreviewed) pendingDryRunSnapshots.delete(result.predictionId);
+        plan.results.push({
+          horizon, historicalAsOfTime, phase: 'evaluation',
+          evaluated: evaluation.evaluated, deduped: evaluation.deduped,
+          previewed: evaluation.results.length,
+          previewedPredictionIds: evaluation.results.map(result => result.predictionId),
+          sameRunLinks: inMemoryPreviewed.map(result => ({
+            predictionId: result.predictionId,
+            generationRunId: result.generationRunId,
+            evaluatedHistoricalAsOfTime: historicalAsOfTime
+          }))
+        });
       }
     }
 
@@ -559,9 +588,11 @@ export async function runWalkForward(options) {
         generationStatusCounts[key] = (generationStatusCounts[key] || 0) + 1;
       }
       let evaluationPreviewedCount = 0;
+      const sameRunEvaluationLinks = [];
       for (const r of plan.results) {
         if (r.phase !== 'evaluation') continue;
         evaluationPreviewedCount += r.previewed || 0;
+        sameRunEvaluationLinks.push(...(r.sameRunLinks || []));
       }
       plan.executionPlan = {
         rhythmPointCount: plan.generationAttempts,
@@ -569,6 +600,9 @@ export async function runWalkForward(options) {
         purgeBoundary: { trainEnd, validationEnd },
         generationStatusCounts,
         evaluationPreviewedCount,
+        sameRunEvaluationPreviewedCount: sameRunEvaluationLinks.length,
+        sameRunEvaluationLinks,
+        pendingInMemorySnapshotCount: pendingDryRunSnapshots.size,
         resumeCheckpoints: plan.resumeCheckpoints
       };
     }

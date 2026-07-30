@@ -176,6 +176,56 @@ test('R1.2：跨越PAGE_LIMIT分页边界的连续区间，页与页之间open_t
   });
 });
 
+// 999/1000 是单页终止边界，1001 与下面 R1.3 是首次跨页边界，R1.2 的 1005
+// 进一步覆盖多页后的短尾页。这里使用互不重叠的 2027 fixture，避免与其他集成测试
+// 的时间范围发生 vintage_id 冲突。
+for (const totalBars of [999, 1000]) {
+  test(`R1.2边界：${totalBars}根连续K线不重复、不遗漏且不发起多余分页`, { skip }, async () => {
+    await withTxClient(async (client) => {
+      const base = Date.UTC(2027, totalBars === 999 ? 0 : 1, 1, 0, 0, 0);
+      const allBars = Array.from({ length: totalBars }, (_, i) => {
+        const openTime = base + i * 900000;
+        return kline(openTime, openTime + 900000 - 1, '1000.00');
+      });
+      const startTimes = [];
+      const endTime = allBars.at(-1)[0];
+      const nowMs = allBars.at(-1)[6] + 60000;
+      const adapter = {
+        serverTime: async () => ({ body: { serverTime: nowMs }, requestId: randomUUID() }),
+        spotKlines: async (symbol, interval, opts) => {
+          startTimes.push(opts.startTime);
+          const page = allBars
+            .filter(row => row[0] >= opts.startTime && row[0] <= opts.endTime)
+            .slice(0, 1000);
+          return { body: page, requestId: randomUUID(), status: 200, headers: {} };
+        }
+      };
+
+      const result = await backfillInterval({
+        pool: client, adapter, symbol: 'ETHUSDT', interval: '15m',
+        startTime: base, endTime, now: () => nowMs
+      });
+
+      assert.equal(result.status, 'SUCCEEDED');
+      assert.equal(result.rowsInserted, totalBars);
+      assert.equal(result.rowsDeduped, 0);
+      assert.deepEqual(startTimes, [base], `${totalBars}根以内必须由单页完整覆盖`);
+
+      const rows = (await client.query(
+        `SELECT open_time FROM market_bars
+         WHERE instrument='ETHUSDT' AND interval_name='15m'
+           AND open_time>=to_timestamp($1/1000.0) AND open_time<=to_timestamp($2/1000.0)
+         ORDER BY open_time ASC`,
+        [base, endTime]
+      )).rows;
+      assert.equal(rows.length, totalBars);
+      for (let i = 0; i < rows.length; i += 1) {
+        assert.equal(rows[i].open_time.getTime(), base + i * 900000);
+      }
+    });
+  });
+}
+
 // R1.3：请求区间恰好落在两页边界中间（不是PAGE_LIMIT的整数倍）——验证分页游标正确对齐，不产生半页重复请求。
 // 用与R1.2相同的思路，但把总量设为1000+1（恰好跨过边界1根），第二页只有1根bar，用来确认边界对齐精确到
 // "恰好1根"这个最紧的情形，而不仅是R1.2里较宽松的5根。
