@@ -146,6 +146,59 @@ test('P0-2：数据充分时，dry-run真实执行生成阶段全部只读计算
   });
 });
 
+test('P0-2：零预存快照时，同一dry-run生成的内存PLANNED快照在成熟节奏点完成路径/outcome评估，五张业务表逐表零写入', { skip }, async () => {
+  await withTxClient(async (client) => {
+    const referenceCloseTime = Date.UTC(2026, 5, 1, 0, 0, 0) - 1;
+    const referenceOpenTime = referenceCloseTime - FIFTEEN_MIN_MS + 1;
+    const targetEndTime = referenceCloseTime + DAY_MS;
+    const replayNowMs = Date.now();
+
+    const preexistingSnapshots = (await client.query(
+      'SELECT count(*)::int AS n FROM historical_validation.replay_snapshots'
+    )).rows[0].n;
+    assert.equal(preexistingSnapshots, 0, '本用例要求真实测试库开始时不存在任何replay snapshot');
+
+    // 第一节奏点具备reference/ATR/feature；manifest覆盖随后完整24h 15m路径，使内存快照在
+    // targetEndTime节奏点可由真实locator+computeForecastOutcome完成评估。其余生成节奏点允许按既有
+    // FEATURE_RECORD_MISSING门禁BLOCKED，不影响首条PLANNED快照的同轮成熟与评估。
+    await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
+    const from = referenceCloseTime - FOUR_HOUR_MS + 1;
+    const to = targetEndTime + 1;
+    const datasetVersion = await buildVerifiedManifest(client, { from, to, replayNowMs });
+
+    const before = await tableCounts(client);
+    for (const table of BUSINESS_TABLES) assert.equal(before[table], 0, `${table}执行前必须为0`);
+
+    const plan = await runWalkForward({
+      pool: client, symbol: 'ETHUSDT', from, to, horizons: ['24h'],
+      algorithmVersion: ALGORITHM_VERSION, datasetVersion, ruleVersion: RULE_VERSION,
+      weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: true,
+      nowMs: Date.now(), replayNowMs
+    });
+
+    const plannedGeneration = plan.results.find(result => (
+      result.phase === 'generation' &&
+      result.historicalAsOfTime === referenceCloseTime &&
+      result.status === 'PLANNED'
+    ));
+    assert.ok(plannedGeneration?.predictionId, '首个节奏点必须产生带predictionId的内存PLANNED快照');
+
+    const sameRunLink = plan.executionPlan.sameRunEvaluationLinks.find(link => (
+      link.predictionId === plannedGeneration.predictionId &&
+      link.generationRunId === plannedGeneration.generationRunId
+    ));
+    assert.ok(sameRunLink, 'executionPlan必须以predictionId+generationRunId证明同轮生成与评估关系');
+    assert.equal(sameRunLink.evaluatedHistoricalAsOfTime, targetEndTime);
+    assert.ok(plan.executionPlan.evaluationPreviewedCount > 0, '数据门禁通过时实际evaluationPreviewedCount必须>0');
+    assert.ok(plan.executionPlan.sameRunEvaluationPreviewedCount > 0, '必须至少评估一条本轮内存PLANNED快照');
+
+    const after = await tableCounts(client);
+    for (const table of BUSINESS_TABLES) {
+      assert.equal(after[table], before[table], `${table} dry-run前后必须逐表零写入`);
+    }
+  });
+});
+
 test('P0-2：数据不足（feature_record缺失）时，dry-run真实执行数据可用性检查并报告BLOCKED及具体原因（证明gap/可用性检查真实生效，不是形式空跑）', { skip }, async () => {
   await withTxClient(async (client) => {
     // referenceBar+ATR14所需的15根4h历史bar照常真实seed（不受replay自身[from,to)范围限制——ATR查询本身

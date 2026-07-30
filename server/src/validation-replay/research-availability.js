@@ -23,9 +23,24 @@ export const RESEARCH_AVAILABILITY_RULE_VERSION = 'v1.4d-research-availability-1
 // DB查询、拿到过真实行的bar才会出现在auditRecords里（缺口/未来占位BarRef从不出现在这里，见
 // replay-bar-path-queries.js对missingBarRefs与auditRecords的区分），故不会为"未实际消费"的K线错误生成审计行。
 export function buildResearchDataVintage({ auditRecords = [], backfillBatchIds = [], asOfTime }) {
+  const requiredFields = Object.freeze([
+    'vintageId', 'symbol', 'interval', 'openTime', 'closeTime',
+    'availableAt', 'fetchedAt', 'sourceId', 'revisionNumber'
+  ]);
   const seen = new Map();
   for (const record of auditRecords) {
-    if (!record || !record.vintageId) continue;
+    const missing = requiredFields.filter(field => (
+      !record ||
+      record[field] == null ||
+      (['openTime', 'closeTime', 'availableAt', 'fetchedAt', 'revisionNumber'].includes(field) && !Number.isFinite(Number(record[field]))) ||
+      (['vintageId', 'symbol', 'interval', 'sourceId'].includes(field) && String(record[field]).trim() === '')
+    ));
+    if (missing.length) {
+      throw Object.assign(
+        new Error(`research_data_vintage audit record is incomplete: ${missing.join(', ')}`),
+        { code: 'INCOMPLETE_RESEARCH_DATA_VINTAGE', missing }
+      );
+    }
     if (!seen.has(record.vintageId)) seen.set(record.vintageId, record);
   }
   return {

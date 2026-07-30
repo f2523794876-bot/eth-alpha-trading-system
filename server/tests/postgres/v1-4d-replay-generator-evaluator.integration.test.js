@@ -22,6 +22,22 @@ const WEIGHT_VERSION = 'v1.4c-server-weight-1';
 const DATASET_VERSION = 'v1.4d-sha256-' + '11'.repeat(32);
 const RULE_VERSION = 'v1.4c-po-rule-1';
 const EVALUATION_VERSION = 'v1.4c-outcome-evaluation-1';
+const AUDIT_FIELDS = Object.freeze([
+  'vintageId', 'symbol', 'interval', 'openTime', 'closeTime',
+  'availableAt', 'fetchedAt', 'sourceId', 'revisionNumber'
+]);
+
+function assertCompleteReferenceAudit(consumedBars, referenceCloseTime, phase) {
+  const referenceAudit = consumedBars.find(bar => bar.interval === '15m' && bar.closeTime === referenceCloseTime);
+  assert.ok(referenceAudit, `${phase} research_data_vintage必须包含reference bar`);
+  for (const field of AUDIT_FIELDS) {
+    assert.ok(field in referenceAudit, `${phase} reference bar必须包含审计字段 ${field}`);
+    assert.notEqual(referenceAudit[field], null, `${phase} reference bar审计字段 ${field}不得为null`);
+  }
+  assert.equal(referenceAudit.closeTime, referenceCloseTime, `${phase} reference bar必须保留精确close_time边界`);
+  assert.ok(referenceAudit.availableAt > referenceAudit.closeTime, `${phase}回填bar的available_at应为晚于历史close_time的真实回填时刻`);
+  assert.ok(referenceAudit.fetchedAt >= referenceAudit.availableAt, `${phase} fetched_at不得早于available_at`);
+}
 
 function makeMockAdapter({ pages, serverTimeMs }) {
   let call = 0;
@@ -231,6 +247,7 @@ test('INSERTED：完整生成流程——predictionId格式/source_origin/calibr
     assert.ok(row.research_data_vintage, 'research_data_vintage必须非空');
     assert.equal(row.research_data_vintage.researchAvailabilityRuleVersion, RESEARCH_AVAILABILITY_RULE_VERSION);
     assert.match(row.research_data_vintage.disclosure, /not a record of when the system historically/);
+    assertCompleteReferenceAudit(row.research_data_vintage.consumedBars, referenceCloseTime, 'generation');
     assert.equal(Number(row.scenario_weight_baseline) + Number(row.scenario_weight_upside) + Number(row.scenario_weight_downside), 100);
 
     const runRow = (await client.query('SELECT status, generated_count FROM historical_validation.replay_generation_runs WHERE generation_run_id=$1', [first.generationRunId])).rows[0];
@@ -387,6 +404,7 @@ test('replay-evaluator：完整评估流程——mfe/mae/actual_return/幂等去
     assert.equal(row.endpoint_data_complete, true);
     assert.equal(row.path_data_complete, true);
     assert.ok(row.research_data_vintage, 'research_data_vintage必须非空');
+    assertCompleteReferenceAudit(row.research_data_vintage.consumedBars, referenceCloseTime, 'evaluation');
 
     const runRow = (await client.query('SELECT status, evaluated_count FROM historical_validation.replay_evaluation_runs WHERE evaluation_run_id=$1', [first.evaluationRunId])).rows[0];
     assert.equal(runRow.status, 'SUCCEEDED');

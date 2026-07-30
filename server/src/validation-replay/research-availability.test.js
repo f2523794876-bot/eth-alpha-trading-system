@@ -24,7 +24,6 @@ test('P0-3：research-availability.js 源码不导入 bar-path-locator.js，不�
 test('buildResearchDataVintage：产出包含规则版本/asOfTime/去重后的消费bar列表(按vintageId)/批次列表/明确声明文本', () => {
   const auditRecords = [
     { vintageId: 'v-1', barKey: 'ETH-15m-1000', symbol: 'ETH', interval: '15m', openTime: 100, closeTime: 1000, availableAt: 1500, fetchedAt: 1600, sourceId: 'binance', revisionNumber: 0 },
-    null,
     { vintageId: 'v-2', barKey: 'ETH-15m-2000', symbol: 'ETH', interval: '15m', openTime: 1100, closeTime: 2000, availableAt: 2500, fetchedAt: 2600, sourceId: 'binance', revisionNumber: 0 },
     // 同一vintageId重复出现（例如ATR窗口与breakout窗口重叠消费了同一根4h bar）——必须被去重，不重复计入consumedBars。
     { vintageId: 'v-1', barKey: 'ETH-15m-1000', symbol: 'ETH', interval: '15m', openTime: 100, closeTime: 1000, availableAt: 1500, fetchedAt: 1600, sourceId: 'binance', revisionNumber: 0 }
@@ -32,7 +31,7 @@ test('buildResearchDataVintage：产出包含规则版本/asOfTime/去重后的�
   const vintage = buildResearchDataVintage({ auditRecords, backfillBatchIds: ['b1', 'b1', 'b2'], asOfTime: 5000 });
   assert.equal(vintage.researchAvailabilityRuleVersion, RESEARCH_AVAILABILITY_RULE_VERSION);
   assert.equal(vintage.asOfTime, 5000);
-  assert.equal(vintage.consumedBars.length, 2, '重复vintageId必须去重，null条目必须被丢弃');
+  assert.equal(vintage.consumedBars.length, 2, '重复vintageId必须去重');
   assert.deepEqual(new Set(vintage.consumedBars.map(b => b.vintageId)), new Set(['v-1', 'v-2']));
   // P1-1核验：每条consumedBars必须携带完整审计字段，不再是只有{barKey, closeTime}两项。
   for (const bar of vintage.consumedBars) {
@@ -44,17 +43,22 @@ test('buildResearchDataVintage：产出包含规则版本/asOfTime/去重后的�
   assert.match(vintage.disclosure, /not a record of when the system historically\/actually possessed this data/);
 });
 
-test('buildResearchDataVintage：未实际消费的K线(无vintageId的占位/缺口BarRef)不会被写入consumedBars', () => {
-  const vintage = buildResearchDataVintage({
+test('buildResearchDataVintage：缺少关键审计字段时fail closed，不得静默产出不完整consumedBars', () => {
+  assert.throws(() => buildResearchDataVintage({
     auditRecords: [
       { vintageId: 'v-1', barKey: 'ETH-15m-1000', symbol: 'ETH', interval: '15m', openTime: 100, closeTime: 1000, availableAt: 1500, fetchedAt: 1600, sourceId: 'binance', revisionNumber: 0 },
-      { barKey: 'ETH-15m-9999-placeholder', symbol: 'ETH', interval: '15m', openTime: 9000, closeTime: 9999 } // 占位BarRef：无vintageId，因为它从未被任何SQL查询实际返回过
+      { barKey: 'ETH-15m-9999-incomplete', symbol: 'ETH', interval: '15m', openTime: 9000, closeTime: 9999 }
     ],
     backfillBatchIds: [],
     asOfTime: 5000
-  });
-  assert.equal(vintage.consumedBars.length, 1, '缺少vintageId的占位/缺口BarRef不得出现在consumedBars中');
-  assert.equal(vintage.consumedBars[0].vintageId, 'v-1');
+  }), error => (
+    error.code === 'INCOMPLETE_RESEARCH_DATA_VINTAGE' &&
+    error.missing.includes('vintageId') &&
+    error.missing.includes('availableAt') &&
+    error.missing.includes('fetchedAt') &&
+    error.missing.includes('sourceId') &&
+    error.missing.includes('revisionNumber')
+  ));
 });
 
 test('buildResearchDataVintage：空输入产出空consumedBars（不报错）', () => {

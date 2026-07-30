@@ -41,12 +41,40 @@ function buildBarRef(row, sequenceIndex, symbol, timeframeMs = TIMEFRAME_MS) {
 // market_bars表上UNIQUE约束的那一列，是"这一条具体版本的K线"的权威身份证据，revision_number/source_id
 // 佐证其修订与来源，available_at/fetched_at是该行在生产回填协议下的原始时间戳（与researchAvailability
 // 使用的close_time判据是两回事——记录它们本身就是审计证据的一部分，不代表回放使用了它们做可得性判断）。
-function buildAuditRecord(row, { symbol, interval }) {
+function buildAuditRecord(row, { instrument, symbol, interval }) {
+  if (row.instrument !== instrument || row.interval_name !== interval) {
+    throw Object.assign(
+      new Error(`replay audit row identity mismatch: expected ${instrument}/${interval}, received ${row.instrument}/${row.interval_name}`),
+      { code: 'REPLAY_AUDIT_IDENTITY_MISMATCH' }
+    );
+  }
+  const values = {
+    vintageId: row.vintage_id,
+    symbol,
+    interval,
+    openTime: toMs(row.open_time),
+    closeTime: toMs(row.close_time),
+    availableAt: toMs(row.available_at),
+    fetchedAt: toMs(row.fetched_at),
+    sourceId: row.source_id,
+    revisionNumber: Number(row.revision_number)
+  };
+  const missing = Object.entries(values)
+    .filter(([key, value]) => (
+      value == null ||
+      (['openTime', 'closeTime', 'availableAt', 'fetchedAt', 'revisionNumber'].includes(key) && !Number.isFinite(value)) ||
+      (['vintageId', 'symbol', 'interval', 'sourceId'].includes(key) && String(value).trim() === '')
+    ))
+    .map(([key]) => key);
+  if (missing.length) {
+    throw Object.assign(
+      new Error(`replay audit record is missing critical market_bars field(s): ${missing.join(', ')}`),
+      { code: 'INCOMPLETE_REPLAY_AUDIT_RECORD', missing }
+    );
+  }
   return Object.freeze({
-    vintageId: row.vintage_id, barKey: `${symbol}-${interval}-${toMs(row.close_time)}`,
-    symbol, interval, openTime: toMs(row.open_time), closeTime: toMs(row.close_time),
-    availableAt: toMs(row.available_at), fetchedAt: toMs(row.fetched_at),
-    sourceId: row.source_id ?? null, revisionNumber: row.revision_number ?? null
+    ...values,
+    barKey: `${symbol}-${interval}-${values.closeTime}`
   });
 }
 
@@ -62,8 +90,8 @@ function assertReplayNowMs(replayNowMs) {
 async function queryRecentContiguousBarsForReplay(pool, { instrument, intervalName, asOfTime, replayNowMs, limit }) {
   assertReplayNowMs(replayNowMs);
   const result = await pool.query(
-    `SELECT open_time, close_time, open::text, high::text, low::text, close::text, revision_number,
-            vintage_id, available_at, fetched_at, source_id
+    `SELECT instrument, interval_name, open_time, close_time, open::text, high::text, low::text, close::text,
+            revision_number, vintage_id, available_at, fetched_at, source_id
      FROM market_bars
      WHERE instrument=$1 AND market_type='spot' AND interval_name=$2
        AND close_time<=to_timestamp($3/1000.0) AND fetched_at<=to_timestamp($4/1000.0)
@@ -87,7 +115,7 @@ export async function computeFourHourAtr14ForReplay(pool, { instrument, asOfTime
   if (!contiguous || bars.length !== 15) return { ok: false, reason: 'ATR14_4H_INSUFFICIENT', auditRecords: [] };
   try {
     const atr14FourHourAtGeneration = computeFourHourAtr14FromBars(bars);
-    return { ok: true, atr14FourHourAtGeneration, auditRecords: bars.map(row => buildAuditRecord(row, { symbol, interval: '4h' })) };
+    return { ok: true, atr14FourHourAtGeneration, auditRecords: bars.map(row => buildAuditRecord(row, { instrument, symbol, interval: '4h' })) };
   } catch (error) {
     return { ok: false, reason: error.code || 'ATR14_4H_INSUFFICIENT', auditRecords: [] };
   }
@@ -111,7 +139,7 @@ export async function computeConsecutiveBreakoutBarsForReplay(pool, { instrument
   for (let i = candidateStates.length - 1; i >= 0; i--) {
     if (candidateStates[i] === 'BREAKOUT') count += 1; else break;
   }
-  return { count, state: count > 0 ? 'BREAKOUT_ACTIVE' : 'NOT_BREAKOUT', maxLookback, auditRecords: bars.map(row => buildAuditRecord(row, { symbol, interval: '4h' })) };
+  return { count, state: count > 0 ? 'BREAKOUT_ACTIVE' : 'NOT_BREAKOUT', maxLookback, auditRecords: bars.map(row => buildAuditRecord(row, { instrument, symbol, interval: '4h' })) };
 }
 
 // referenceBar的candidate closeTime本身是 computeAlignedReferenceCloseTime(asOfTime, horizon) 的确定性
@@ -125,7 +153,9 @@ export async function locateReferenceBarAndPathForReplay(pool, { instrument, hor
 
   const alignedCloseTime = computeAlignedReferenceCloseTime(asOfTime, horizon);
   const refResult = await pool.query(
-    `SELECT open_time, close_time, close::text FROM market_bars
+    `SELECT vintage_id, instrument, interval_name, open_time, close_time, close::text,
+            available_at, fetched_at, source_id, revision_number
+     FROM market_bars
      WHERE instrument=$1 AND market_type='spot' AND interval_name='15m'
        AND close_time=to_timestamp($2/1000.0)
        AND close_time<=to_timestamp($3/1000.0) AND fetched_at<=to_timestamp($4/1000.0)
@@ -137,13 +167,14 @@ export async function locateReferenceBarAndPathForReplay(pool, { instrument, hor
   }
   const referenceBar = refResult.rows[0];
   const referenceBarRef = buildBarRef(referenceBar, 0, symbol);
-  const referenceAudit = buildAuditRecord(referenceBar, { symbol, interval: '15m' });
+  const referenceAudit = buildAuditRecord(referenceBar, { instrument, symbol, interval: '15m' });
   const referencePrice = Number(referenceBar.close);
   const referenceCloseTime = toMs(referenceBar.close_time);
   const pathEndOpenTime = referenceCloseTime + 1 + (expectedBarCount - 1) * TIMEFRAME_MS;
 
   const pathResult = await pool.query(
-    `SELECT open_time, close_time, vintage_id, available_at, fetched_at, source_id, revision_number FROM market_bars
+    `SELECT instrument, interval_name, open_time, close_time, vintage_id, available_at, fetched_at, source_id, revision_number
+     FROM market_bars
      WHERE instrument=$1 AND market_type='spot' AND interval_name='15m'
        AND open_time>=to_timestamp($2/1000.0) AND open_time<=to_timestamp($3/1000.0)
        AND close_time<=to_timestamp($4/1000.0) AND fetched_at<=to_timestamp($5/1000.0)
@@ -162,7 +193,7 @@ export async function locateReferenceBarAndPathForReplay(pool, { instrument, hor
     const row = byOpenTime.get(expectedOpenTime);
     if (row) {
       observedBars.push(buildBarRef(row, i, symbol));
-      observedAudits.push(buildAuditRecord(row, { symbol, interval: '15m' }));
+      observedAudits.push(buildAuditRecord(row, { instrument, symbol, interval: '15m' }));
       cursorCloseTime = toMs(row.close_time);
     } else {
       const placeholderCloseTime = expectedOpenTime + TIMEFRAME_MS - 1;
@@ -214,7 +245,9 @@ export async function locatePathForEvaluationForReplay(pool, { instrument, refer
   }
 
   const refResult = await pool.query(
-    `SELECT open_time, close_time, close::text FROM market_bars
+    `SELECT vintage_id, instrument, interval_name, open_time, close_time, close::text,
+            available_at, fetched_at, source_id, revision_number
+     FROM market_bars
      WHERE instrument=$1 AND market_type='spot' AND interval_name='15m'
        AND close_time=to_timestamp($2/1000.0)
        AND close_time<=to_timestamp($3/1000.0) AND fetched_at<=to_timestamp($4/1000.0)
@@ -223,12 +256,12 @@ export async function locatePathForEvaluationForReplay(pool, { instrument, refer
   );
   const referenceRow = refResult.rows[0] || null;
   const referenceBarRefResolved = referenceRow ? buildBarRef(referenceRow, 0, symbol) : null;
-  const referenceAudit = referenceRow ? buildAuditRecord(referenceRow, { symbol, interval: '15m' }) : null;
+  const referenceAudit = referenceRow ? buildAuditRecord(referenceRow, { instrument, symbol, interval: '15m' }) : null;
   const actualStartPrice = referenceRow ? Number(referenceRow.close) : null;
 
   const pathEndOpenTime = referenceCloseTime + 1 + (expectedBarCount - 1) * TIMEFRAME_MS;
   const pathResult = await pool.query(
-    `SELECT open_time, close_time, high::text, low::text, close::text,
+    `SELECT instrument, interval_name, open_time, close_time, high::text, low::text, close::text,
             vintage_id, available_at, fetched_at, source_id, revision_number
      FROM market_bars
      WHERE instrument=$1 AND market_type='spot' AND interval_name='15m'
@@ -249,7 +282,7 @@ export async function locatePathForEvaluationForReplay(pool, { instrument, refer
     const row = byOpenTime.get(expectedOpenTime);
     if (row) {
       observedBars.push({ ...buildBarRef(row, i, symbol), high: Number(row.high), low: Number(row.low), close: Number(row.close) });
-      observedAudits.push(buildAuditRecord(row, { symbol, interval: '15m' }));
+      observedAudits.push(buildAuditRecord(row, { instrument, symbol, interval: '15m' }));
       cursorCloseTime = toMs(row.close_time);
     } else {
       const placeholderCloseTime = expectedOpenTime + TIMEFRAME_MS - 1;

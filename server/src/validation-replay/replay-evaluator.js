@@ -12,12 +12,23 @@ import { canonicalJsonHash } from '../domain/hash.js';
 import { buildResearchDataVintage, RESEARCH_AVAILABILITY_RULE_VERSION } from './research-availability.js';
 
 function rowToSnapshot(row) {
+  if (row.predictionId) return row;
   return {
     predictionId: row.prediction_id, instrument: row.instrument, horizon: row.horizon,
     referencePrice: Number(row.reference_price), referenceBarRef: row.reference_bar_ref,
     expectedDirection: row.expected_direction, directionThreshold: Number(row.direction_threshold),
     expectedBarCount: row.expected_bar_count, expectedPriceZones: row.expected_price_zones
   };
+}
+
+function snapshotField(record, camelCase, snakeCase) {
+  return record[camelCase] ?? record[snakeCase];
+}
+
+function snapshotDue(record, historicalAsOfTime) {
+  const value = snapshotField(record, 'targetEndTime', 'target_end_time');
+  const targetEndTime = value instanceof Date ? value.getTime() : Number(value);
+  return Number.isFinite(targetEndTime) && targetEndTime <= historicalAsOfTime;
 }
 
 // 找出targetEndTime（以历史模拟时钟衡量）已到达、且本evaluationVersion+research_availability_rule_version
@@ -50,19 +61,34 @@ async function recordEvaluationRun(pool, { evaluationRunId, validationRunId, his
 // historicalAsOfTime的推进循环由调用方(cli-entry.js)负责。
 // dryRun=true：§4.2冻结要求——完整执行读取+计算逻辑，但replay_outcome_events/replay_evaluation_runs
 // 两张表零写入，返回值形状与正常路径一致（status均报告为'PLANNED'而非'INSERTED'/'DEDUPED'，供执行计划展示）。
-export async function evaluateReplayOutcomes({ pool, validationRunId, evaluationVersion, historicalAsOfTime, replayNowMs, limit = 50, now = Date.now, dryRun = false }) {
+export async function evaluateReplayOutcomes({
+  pool, validationRunId, evaluationVersion, historicalAsOfTime, replayNowMs,
+  limit = 50, now = Date.now, dryRun = false, inMemorySnapshots = []
+}) {
+  if (!dryRun && inMemorySnapshots.length) {
+    throw Object.assign(
+      new Error('inMemorySnapshots are only valid for dry-run evaluation'),
+      { code: 'IN_MEMORY_SNAPSHOTS_REQUIRE_DRY_RUN' }
+    );
+  }
   const evaluationRunId = randomUUID();
   const startedAt = now();
   if (!dryRun) await recordEvaluationRun(pool, { evaluationRunId, validationRunId, historicalAsOfTime, status: 'RUNNING', startedAt, finishedAt: null });
 
-  const pending = await findPendingReplaySnapshots(pool, { evaluationVersion, historicalAsOfTime, limit });
+  const persistedPending = await findPendingReplaySnapshots(pool, { evaluationVersion, historicalAsOfTime, limit });
+  const dueInMemory = inMemorySnapshots.filter(record => snapshotDue(record, historicalAsOfTime));
+  const pending = [
+    ...dueInMemory.map(record => ({ record, source: 'IN_MEMORY_PLANNED' })),
+    ...persistedPending.map(record => ({ record, source: 'PERSISTED' }))
+  ].slice(0, limit);
 
   let evaluatedCount = 0, dedupedCount = 0;
   const results = [];
-  for (const row of pending) {
+  for (const pendingItem of pending) {
+    const { record: row, source } = pendingItem;
     const snapshot = rowToSnapshot(row);
     const located = await locatePathForEvaluationForReplay(pool, {
-      instrument: row.instrument === 'ETH' ? 'ETHUSDT' : row.instrument,
+      instrument: snapshot.instrument === 'ETH' ? 'ETHUSDT' : snapshot.instrument,
       referenceBarRef: snapshot.referenceBarRef, expectedBarCount: snapshot.expectedBarCount, asOfTime: historicalAsOfTime, replayNowMs
     });
     const outcome = computeForecastOutcome({ snapshot, located });
@@ -72,11 +98,21 @@ export async function evaluateReplayOutcomes({ pool, validationRunId, evaluation
     // 不包括未匹配到DB行的缺口/占位BarRef——与生成阶段同一原则。
     const researchDataVintage = buildResearchDataVintage({
       auditRecords: located.auditRecords,
-      backfillBatchIds: row.backfill_batch_id ? [row.backfill_batch_id] : [],
+      backfillBatchIds: snapshotField(row, 'backfillBatchId', 'backfill_batch_id')
+        ? [snapshotField(row, 'backfillBatchId', 'backfill_batch_id')]
+        : [],
       asOfTime: historicalAsOfTime
     });
 
-    if (dryRun) { results.push({ status: 'PLANNED', predictionId: outcome.predictionId }); continue; }
+    if (dryRun) {
+      results.push({
+        status: 'PLANNED',
+        predictionId: outcome.predictionId,
+        source,
+        generationRunId: row.generationRunId ?? null
+      });
+      continue;
+    }
 
     const insertResult = await pool.query(
       `INSERT INTO historical_validation.replay_outcome_events(
