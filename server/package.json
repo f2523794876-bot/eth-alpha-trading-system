@@ -24,6 +24,9 @@
     "maintenance:health": "node src/maintenance/cleanup-health.js",
     "features:generate": "node src/features/generate-features.js",
     "features:serve": "node src/features/generator-service-entry.js",
+    "backfill:market-bars": "node src/backfill/backfill-cli-entry.js",
+    "dataset:build-manifest": "node src/validation-replay/dataset-manifest-cli-entry.js",
+    "validation:walk-forward": "node src/validation-replay/cli-entry.js",
     "check": "node --check src/index.js && node --test tests/*.test.js tests/forecast/*.test.js"
   },
   "dependencies": { "pg": "^8.16.3" }

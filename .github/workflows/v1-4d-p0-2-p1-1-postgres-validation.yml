@@ -1,0 +1,86 @@
+name: V1.4D P0-2 P1-1 PostgreSQL 16 validation
+
+on:
+  push:
+    branches:
+      - codex/v1.4d-p0-2-p1-1-postgres-validation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres16-validation:
+    name: P0-2/P1-1 isolated PostgreSQL 16 validation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: eth_alpha_test
+          POSTGRES_PASSWORD: actions-test-only-password
+          POSTGRES_DB: eth_alpha_v14d_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U eth_alpha_test -d eth_alpha_v14d_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql://eth_alpha_test:actions-test-only-password@127.0.0.1:5432/eth_alpha_v14d_test
+    steps:
+      - name: Checkout validation branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up locked Node.js runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Wait for isolated PostgreSQL 16 service
+        working-directory: server
+        run: |
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U eth_alpha_test -d eth_alpha_v14d_test; then
+              break
+            fi
+            echo "Waiting for isolated PostgreSQL service ($attempt/30)"
+            sleep 2
+          done
+          pg_isready -h 127.0.0.1 -p 5432 -U eth_alpha_test -d eth_alpha_v14d_test
+
+      - name: Install package-lock dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Run strict PostgreSQL and offline validation
+        working-directory: server
+        run: node scripts/v1-4d-postgres-validation.mjs
+
+      - name: Check patch whitespace
+        run: |
+          git diff --check
+          git diff --check f5e64fc3e2882897324d054d837789d4c62e297d..HEAD
+
+      - name: Verify frozen draft-4 documents are unchanged
+        run: |
+          git diff --exit-code dc6e573cdbc5aece7b932ab1cbbbe3daa3623437 -- \
+            V1_4D_DATA_BACKFILL_SPEC.md \
+            V1_4D_HISTORICAL_REPLAY_SPEC.md \
+            V1_4D_CODEX_IMPLEMENTATION_TASK.md \
+            V1_4D_ACCEPTANCE_TESTS.md \
+            V1_4D_ARCHITECTURE_REVIEW.md
+
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1-4d-p0-2-p1-1-postgres-validation
+          path: server/v1-4d-postgres-validation-results.json
+          if-no-files-found: warn
