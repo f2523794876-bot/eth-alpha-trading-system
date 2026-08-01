@@ -5,6 +5,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { computeReplayWindow, parseReplayDays } from './v1-4d-verification-arguments.mjs';
+import {
+  classifyReplayFailure, deriveVerificationStatus, exitCodeForStatus,
+  extractChildErrorCode, redactSensitiveText
+} from './v1-4d-verification-contract.mjs';
 
 const script = new URL('./v1-4d-scorecard-cli.mjs', import.meta.url);
 const cleanEnv = () => {
@@ -38,7 +42,14 @@ function fixtureRows() {
     { horizon: '24h', split: 'TEST', actualDirection: 'DOWN', predictedDirection: 'DOWN', trend4hDirection: 'DOWN', actualReturn: -0.02, mfe: 0.03, mae: 0.01 },
     { horizon: '72h', split: 'TRAIN', actualDirection: 'RANGE', predictedDirection: 'RANGE', trend4hDirection: 'RANGE', actualReturn: 0.001 },
     { horizon: '72h', split: 'TEST', actualDirection: 'UP', predictedDirection: 'UP', trend4hDirection: 'UP', actualReturn: 0.03, mfe: 0.04, mae: 0.01 }
-  ];
+  ].map((row, index) => ({
+    ...row,
+    predictionId: `fixture-${index}`,
+    targetStartTime: index * 1000,
+    targetEndTime: index * 1000 + 500,
+    directionEligibleForStatistics: true,
+    pathEligibleForStatistics: row.mfe != null || row.mae != null
+  }));
 }
 
 test('scorecard CLI writes evaluable JSON and Markdown without a database', async () => {
@@ -56,6 +67,8 @@ test('scorecard CLI writes evaluable JSON and Markdown without a database', asyn
   assert.equal(parsed.status, 'EVALUATED');
   assert.equal(parsed.horizons['24h'].status, 'EVALUATED');
   assert.equal(parsed.horizons['72h'].status, 'EVALUATED');
+  assert.equal(parsed.horizons['24h'].rawSampleCount, 2);
+  assert.equal(parsed.horizons['24h'].effectiveSampleCount, 2);
   assert.match(await readFile(markdown, 'utf8'), /Leakage-safe baselines/);
 });
 
@@ -82,4 +95,41 @@ test('scorecard CLI ignores generic DATABASE_URL and requires explicit V14D_REPL
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /V14D_REPLAY_DATABASE_URL is required/);
   assert.match(result.stderr, /generic DATABASE_URL is intentionally ignored/);
+});
+
+test('verification exit-code matrix is strict for PASS/NOT_EVALUABLE/BLOCKED/FAIL', () => {
+  assert.equal(exitCodeForStatus('PASS'), 0);
+  assert.notEqual(exitCodeForStatus('NOT_EVALUABLE'), 0);
+  assert.notEqual(exitCodeForStatus('BLOCKED'), 0);
+  assert.notEqual(exitCodeForStatus('FAIL'), 0);
+  assert.equal(deriveVerificationStatus({ mode: 'FULL', gates: [{ required: true, status: 'NOT_EVALUABLE' }] }), 'NOT_EVALUABLE');
+  assert.equal(deriveVerificationStatus({ mode: 'OFFLINE_LIGHTWEIGHT', gates: [{ required: true, status: 'PASS' }], replays: { 7: { status: 'OUT_OF_SCOPE' } } }), 'PASS');
+  const contractUrl = new URL('./v1-4d-verification-contract.mjs', import.meta.url).href;
+  for (const [status, expected] of [['PASS', 0], ['NOT_EVALUABLE', 2], ['BLOCKED', 3], ['FAIL', 1]]) {
+    const child = spawnSync(process.execPath, ['--input-type=module', '--eval', `import { exitCodeForStatus } from ${JSON.stringify(contractUrl)}; process.exitCode=exitCodeForStatus(${JSON.stringify(status)});`]);
+    assert.equal(child.status, expected, `${status} subprocess exit code`);
+  }
+});
+
+test('replay failures preserve DATASET_MANIFEST_NOT_FOUND as DATA_NOT_READY', () => {
+  const stderr = "validation:walk-forward failed { code: 'DATASET_MANIFEST_NOT_FOUND' }";
+  const code = extractChildErrorCode('', stderr);
+  assert.equal(code, 'DATASET_MANIFEST_NOT_FOUND');
+  assert.deepEqual(classifyReplayFailure({ code, stderr }), { classification: 'DATA_NOT_READY', status: 'BLOCKED' });
+});
+
+test('configuration, database connection and unknown child failures remain distinguishable', () => {
+  assert.deepEqual(classifyReplayFailure({ code: 'REPLAY_CONFIG_MISSING' }), { classification: 'CONFIG_MISSING', status: 'BLOCKED' });
+  assert.deepEqual(classifyReplayFailure({ code: 'ECONNREFUSED', stderr: 'connect ECONNREFUSED 127.0.0.1:5432' }), {
+    classification: 'EXECUTION_FAILURE', failureType: 'DATABASE_CONNECTION_FAILURE', status: 'FAIL'
+  });
+  assert.deepEqual(classifyReplayFailure({ code: null, stderr: 'unexpected crash' }), {
+    classification: 'EXECUTION_FAILURE', failureType: 'CHILD_PROCESS_FAILURE', status: 'FAIL'
+  });
+});
+
+test('replay stderr summaries redact database URLs and passwords', () => {
+  const redacted = redactSensitiveText('postgresql://user:secret@example/db password=hunter2 TEST_DATABASE_URL=postgres://u:p@host/db');
+  assert.doesNotMatch(redacted, /secret|hunter2|u:p@host/);
+  assert.match(redacted, /\[REDACTED\]/);
 });

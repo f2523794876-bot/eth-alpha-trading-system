@@ -34,8 +34,9 @@ if (args.input) {
   const pool = new Pool({ connectionString: databaseUrl, max: 2 });
   try {
     const result = await pool.query(
-      `SELECT s.horizon, s.expected_direction AS "predictedDirection", s.feature_values_used AS "featureValuesUsed",
-              s.proxy_state_at_generation AS "proxyStateAtGeneration", s.target_end_time AS "targetEndTime",
+      `SELECT s.prediction_id AS "predictionId", s.horizon, s.expected_direction AS "predictedDirection", s.feature_values_used AS "featureValuesUsed",
+              s.proxy_state_at_generation AS "proxyStateAtGeneration", s.target_start_time AS "targetStartTime",
+              s.target_end_time AS "targetEndTime",
               e.actual_direction AS "actualDirection", e.actual_return AS "actualReturn",
               e.mfe, e.mae, e.endpoint_data_complete AS "endpointDataComplete", e.path_data_complete AS "pathDataComplete",
               e.direction_eligible_for_statistics AS "directionEligibleForStatistics",
@@ -55,12 +56,12 @@ if (args.input) {
       [args['validation-run-id'], args['evaluation-version']]
     );
     rows = result.rows.map(row => {
-      const targetEnd = new Date(row.targetEndTime).getTime();
-      const trainEnd = row.trainEnd == null ? null : new Date(row.trainEnd).getTime();
-      const validationEnd = row.validationEnd == null ? null : new Date(row.validationEnd).getTime();
       const trend = row.featureValuesUsed?.trend4h ?? row.featureValuesUsed?.trend4hDirection ?? null;
       return {
+        predictionId: row.predictionId,
         horizon: row.horizon,
+        targetStartTime: row.targetStartTime,
+        targetEndTime: row.targetEndTime,
         predictedDirection: row.predictedDirection,
         actualDirection: row.actualDirection,
         actualReturn: row.actualReturn == null ? null : Number(row.actualReturn),
@@ -69,7 +70,8 @@ if (args.input) {
         trend4hDirection: trend === 'up' ? 'UP' : trend === 'down' ? 'DOWN' : trend === 'flat' ? 'RANGE' : null,
         proxyStateAtGeneration: row.proxyStateAtGeneration ?? null,
         marketRegime: row.featureValuesUsed?.marketRegime ?? null,
-        split: trainEnd == null || validationEnd == null ? 'ALL' : targetEnd < trainEnd ? 'TRAIN' : targetEnd < validationEnd ? 'VALIDATION' : 'TEST',
+        trainEnd: row.trainEnd,
+        validationEnd: row.validationEnd,
         endpointDataComplete: row.endpointDataComplete === true,
         pathDataComplete: row.pathDataComplete === true,
         directionEligibleForStatistics: row.directionEligibleForStatistics === true,
@@ -90,7 +92,14 @@ if (args['round-trip-cost-bps'] != null && (args['fee-bps'] != null || args['sli
 const costOptions = args['round-trip-cost-bps'] != null
   ? { roundTripCostBps: Number(args['round-trip-cost-bps']) }
   : { feeBps: args['fee-bps'] == null ? 8 : Number(args['fee-bps']), slippageBps: args['slippage-bps'] == null ? 4 : Number(args['slippage-bps']) };
-const scorecard = buildResearchScorecard(rows, { ...costOptions, randomSeed: args.seed == null ? 1404 : Number(args.seed) });
+const trainEnd = rows.find(row => row.trainEnd != null)?.trainEnd ?? null;
+const validationEnd = rows.find(row => row.validationEnd != null)?.validationEnd ?? null;
+const scorecard = buildResearchScorecard(rows, {
+  ...costOptions,
+  randomSeed: args.seed == null ? 1404 : Number(args.seed),
+  trainEnd,
+  validationEnd
+});
 await writeFile(output, `${JSON.stringify(scorecard, null, 2)}\n`);
 await writeFile(markdownOutput, renderResearchScorecardMarkdown(scorecard));
 console.log(`research_scorecard_status ${scorecard.status}`);

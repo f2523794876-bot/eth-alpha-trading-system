@@ -23,7 +23,14 @@ function completeRows() {
     { actualDirection: 'UP', predictedDirection: 'UP', trend4hDirection: 'UP', actualReturn: .015, mfe: .02, mae: .01, horizon: '72h', split: 'TRAIN', marketRegime: 'BULL', endpointDataComplete: true, pathDataComplete: true },
     { actualDirection: 'DOWN', predictedDirection: 'DOWN', trend4hDirection: 'DOWN', actualReturn: -.03, mfe: .04, mae: .015, horizon: '72h', split: 'VALIDATION', marketRegime: 'BEAR', endpointDataComplete: true, pathDataComplete: true },
     { actualDirection: 'UP', predictedDirection: 'UP', trend4hDirection: 'UP', actualReturn: .02, mfe: .025, mae: .012, horizon: '72h', split: 'TEST', marketRegime: 'BULL', degraded: true, endpointDataComplete: true, pathDataComplete: true }
-  ];
+  ].map((row, index) => ({
+    ...row,
+    predictionId: `complete-${index}`,
+    targetStartTime: index * 1000,
+    targetEndTime: index * 1000 + 500,
+    directionEligibleForStatistics: true,
+    pathEligibleForStatistics: row.mfe != null || row.mae != null
+  }));
 }
 
 test('scorecard is deterministic and reports separate 24H/72H, grouped, path and economic metrics', () => {
@@ -58,8 +65,8 @@ test('TRAIN-proportion random baseline derives proportions only from same-horizo
 
 test('fees and slippage are reported separately and RANGE carries no directional position or transaction cost', () => {
   const rows = [
-    { actualDirection: 'UP', predictedDirection: 'UP', actualReturn: .01, horizon: '24h' },
-    { actualDirection: 'RANGE', predictedDirection: 'RANGE', actualReturn: .5, horizon: '24h' }
+    { predictionId: 'fee-up', actualDirection: 'UP', predictedDirection: 'UP', actualReturn: .01, horizon: '24h', targetStartTime: 0, targetEndTime: 100, directionEligibleForStatistics: true },
+    { predictionId: 'fee-range', actualDirection: 'RANGE', predictedDirection: 'RANGE', actualReturn: .5, horizon: '24h', targetStartTime: 100, targetEndTime: 200, directionEligibleForStatistics: true }
   ];
   const economics = buildResearchScorecard(rows, { feeBps: 8, slippageBps: 4 }).system.economics;
   assert.equal(economics.tradeCount, 1);
@@ -71,9 +78,9 @@ test('fees and slippage are reported separately and RANGE carries no directional
 
 test('maximum drawdown, consecutive classification errors and consecutive net losses are computed in row order', () => {
   const rows = [
-    { actualDirection: 'DOWN', predictedDirection: 'UP', actualReturn: -.01, horizon: '24h' },
-    { actualDirection: 'DOWN', predictedDirection: 'UP', actualReturn: -.02, horizon: '24h' },
-    { actualDirection: 'UP', predictedDirection: 'UP', actualReturn: .005, horizon: '24h' }
+    { predictionId: 'risk-1', actualDirection: 'DOWN', predictedDirection: 'UP', actualReturn: -.01, horizon: '24h', targetStartTime: 0, targetEndTime: 100, directionEligibleForStatistics: true },
+    { predictionId: 'risk-2', actualDirection: 'DOWN', predictedDirection: 'UP', actualReturn: -.02, horizon: '24h', targetStartTime: 100, targetEndTime: 200, directionEligibleForStatistics: true },
+    { predictionId: 'risk-3', actualDirection: 'UP', predictedDirection: 'UP', actualReturn: .005, horizon: '24h', targetStartTime: 200, targetEndTime: 300, directionEligibleForStatistics: true }
   ];
   const system = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0 }).system;
   assert.equal(system.maxConsecutiveWrong, 2);
@@ -119,4 +126,93 @@ test('Markdown report contains horizon, baseline, data-quality and explicit NOT_
 test('invalid costs fail closed instead of producing NaN scorecard values', () => {
   assert.throws(() => buildResearchScorecard(completeRows(), { feeBps: -1 }), /finite non-negative/);
   assert.throws(() => buildResearchScorecard(completeRows(), { slippageBps: Number.NaN }), /finite non-negative/);
+});
+
+function statisticalRow({ id, horizon = '24h', start, end, split = 'TEST' }) {
+  return {
+    predictionId: id,
+    horizon,
+    targetStartTime: start,
+    targetEndTime: end,
+    split,
+    actualDirection: 'UP',
+    predictedDirection: 'UP',
+    trend4hDirection: 'UP',
+    actualReturn: .01,
+    directionEligibleForStatistics: true,
+    pathEligibleForStatistics: false
+  };
+}
+
+test('scorecard uses frozen boundary semantics and purges samples ending exactly on split boundaries', () => {
+  const rows = [
+    statisticalRow({ id: 'train', start: 0, end: 50 }),
+    statisticalRow({ id: 'at-train-end', start: 50, end: 100 }),
+    statisticalRow({ id: 'validation', start: 100, end: 150 }),
+    statisticalRow({ id: 'at-validation-end', start: 150, end: 200 }),
+    statisticalRow({ id: 'test', start: 200, end: 250 })
+  ];
+  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  assert.equal(horizon.rawSampleCount, 5);
+  assert.equal(horizon.prePurgeEffectiveSampleCount, 5);
+  assert.equal(horizon.purgedStraddlingCount, 2);
+  assert.equal(horizon.effectiveSampleCount, 3);
+  assert.deepEqual(horizon.segments, {
+    TRAIN: { rawSampleCount: 1, effectiveSampleCount: 1 },
+    VALIDATION: { rawSampleCount: 2, effectiveSampleCount: 1 },
+    TEST: { rawSampleCount: 2, effectiveSampleCount: 1 }
+  });
+});
+
+test('TRAIN→VALIDATION and VALIDATION→TEST straddlers are removed before segment aggregation', () => {
+  const rows = [
+    statisticalRow({ id: 'train-validation', start: 90, end: 110 }),
+    statisticalRow({ id: 'validation-test', start: 190, end: 210 })
+  ];
+  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  assert.equal(horizon.rawSampleCount, 2);
+  assert.equal(horizon.prePurgeEffectiveSampleCount, 2);
+  assert.equal(horizon.purgedStraddlingCount, 2);
+  assert.equal(horizon.effectiveSampleCount, 0);
+  assert.equal(horizon.segments.TRAIN.effectiveSampleCount, 0);
+  assert.equal(horizon.segments.VALIDATION.effectiveSampleCount, 0);
+  assert.equal(horizon.segments.TEST.effectiveSampleCount, 0);
+});
+
+test('overlap removal reports independent raw/effective counts for 24H and 72H', () => {
+  const rows = [
+    statisticalRow({ id: '24-a', horizon: '24h', start: 0, end: 100 }),
+    statisticalRow({ id: '24-b', horizon: '24h', start: 10, end: 110 }),
+    statisticalRow({ id: '72-a', horizon: '72h', start: 1000, end: 1300 }),
+    statisticalRow({ id: '72-b', horizon: '72h', start: 1010, end: 1310 })
+  ];
+  const scorecard = buildResearchScorecard(rows);
+  assert.equal(scorecard.horizons['24h'].rawSampleCount, 2);
+  assert.equal(scorecard.horizons['24h'].effectiveSampleCount, 1);
+  assert.equal(scorecard.horizons['72h'].rawSampleCount, 2);
+  assert.equal(scorecard.horizons['72h'].effectiveSampleCount, 1);
+  assert.equal(scorecard.dataQuality.rawSampleCount, 4);
+  assert.equal(scorecard.dataQuality.effectiveSampleCount, 2);
+});
+
+test('non-overlapping samples preserve raw=effective and empty TRAIN remains explicit', () => {
+  const rows = [
+    statisticalRow({ id: 'validation', start: 100, end: 150 }),
+    statisticalRow({ id: 'test', start: 200, end: 250 })
+  ];
+  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  assert.equal(horizon.rawSampleCount, 2);
+  assert.equal(horizon.effectiveSampleCount, 2);
+  assert.deepEqual(horizon.segments.TRAIN, { rawSampleCount: 0, effectiveSampleCount: 0 });
+  assert.equal(horizon.baselines.historicalProportionRandom.status, 'NOT_EVALUABLE');
+});
+
+test('purge can leave a segment empty without fabricating segment performance', () => {
+  const rows = [
+    statisticalRow({ id: 'crossing-only', start: 90, end: 110 }),
+    statisticalRow({ id: 'test', start: 200, end: 250 })
+  ];
+  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  assert.equal(horizon.purgedStraddlingCount, 1);
+  assert.deepEqual(horizon.segments.VALIDATION, { rawSampleCount: 1, effectiveSampleCount: 0 });
 });

@@ -1,6 +1,10 @@
 import { spawn } from 'node:child_process';
 import { appendFile, readFile, writeFile } from 'node:fs/promises';
 import { computeReplayWindow, parseReplayDays } from './v1-4d-verification-arguments.mjs';
+import {
+  classifyReplayFailure, deriveVerificationStatus, exitCodeForStatus,
+  extractChildErrorCode, redactSensitiveText
+} from './v1-4d-verification-contract.mjs';
 
 const FROZEN_REF = 'dc6e573cdbc5aece7b932ab1cbbbe3daa3623437';
 const FROZEN_DOCS = Object.freeze([
@@ -20,14 +24,15 @@ const valueArg = name => {
 const hasArg = name => argv.includes(`--${name}`);
 const replayDays = parseReplayDays(valueArg('replay-days'));
 const replayTo = valueArg('replay-to');
+const mode = hasArg('lightweight') ? 'OFFLINE_LIGHTWEIGHT' : 'FULL';
 if (replayTo != null) computeReplayWindow({ days: 7, replayTo });
 
 const startedAt = new Date().toISOString();
 const report = {
-  schemaVersion: 'v1.4d-verification/2', startedAt, status: 'RUNNING', replayDays, gates: [],
+  schemaVersion: 'v1.4d-verification/3', startedAt, status: 'RUNNING', mode, replayDays, gates: [],
   replays: Object.fromEntries([7, 90].map(days => [String(days), replayDays.includes(days)
     ? { status: 'PENDING' }
-    : { status: 'NOT_EVALUABLE', reason: `${days}-day replay was not requested.` }]))
+    : { status: mode === 'OFFLINE_LIGHTWEIGHT' ? 'OUT_OF_SCOPE' : 'NOT_EVALUABLE', reason: `${days}-day replay was not requested.` }]))
 };
 
 async function run(label, command, args, { cwd = process.cwd(), env = {}, required = true } = {}) {
@@ -36,12 +41,34 @@ async function run(label, command, args, { cwd = process.cwd(), env = {}, requir
   const child = spawn(command, args, { cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   let stdout = '';
   let stderr = '';
-  child.stdout.on('data', chunk => { const text = chunk.toString(); stdout += text; process.stdout.write(text); });
-  child.stderr.on('data', chunk => { const text = chunk.toString(); stderr += text; process.stderr.write(text); });
-  const exitCode = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
-  Object.assign(gate, { finishedAt: new Date().toISOString(), exitCode, status: exitCode === 0 ? 'PASS' : 'FAIL', stdoutTail: stdout.slice(-4000), stderrTail: stderr.slice(-4000) });
+  child.stdout.on('data', chunk => { stdout += chunk.toString(); });
+  child.stderr.on('data', chunk => { stderr += chunk.toString(); });
+  let spawnError = null;
+  const exitCode = await new Promise(resolve => {
+    let settled = false;
+    const finish = value => { if (!settled) { settled = true; resolve(value); } };
+    child.once('error', error => { spawnError = error; stderr += `${error.code || 'SPAWN_ERROR'}: ${error.message}\n`; finish(null); });
+    child.once('close', finish);
+  });
+  if (stdout) process.stdout.write(redactSensitiveText(stdout));
+  if (stderr) process.stderr.write(redactSensitiveText(stderr));
+  const sourceCode = exitCode === 0 ? null : (spawnError?.code || extractChildErrorCode(stdout, stderr));
+  const failure = exitCode === 0 ? null : classifyReplayFailure({ code: sourceCode, stderr });
+  Object.assign(gate, {
+    finishedAt: new Date().toISOString(), exitCode, status: exitCode === 0 ? 'PASS' : 'FAIL',
+    sourceCode, classification: failure?.classification ?? null, failureType: failure?.failureType ?? null,
+    stdoutTail: redactSensitiveText(stdout.slice(-4000)), stderrTail: redactSensitiveText(stderr.slice(-4000))
+  });
   Object.defineProperty(gate, 'fullStdout', { value: stdout, enumerable: false });
-  if (exitCode !== 0 && required) throw Object.assign(new Error(`${label} failed with exit code ${exitCode}`), { gate });
+  Object.defineProperty(gate, 'fullStderr', { value: stderr, enumerable: false });
+  if (exitCode !== 0 && required) {
+    throw Object.assign(new Error(sourceCode ? `${label} failed: ${sourceCode}` : `${label} failed with exit code ${exitCode}`), {
+      code: sourceCode || 'CHILD_PROCESS_FAILED', gate,
+      classification: failure.classification, failureType: failure.failureType,
+      verificationStatus: failure.status,
+      stderrSummary: redactSensitiveText(stderr.slice(-4000))
+    });
+  }
   return gate;
 }
 
@@ -65,13 +92,16 @@ function replayArgs(days) {
 
 async function publish(error = null) {
   report.finishedAt = new Date().toISOString();
-  const postgresNotEvaluable = report.gates.some(gate => gate.label === 'PostgreSQL migrations and integration tests' && gate.status === 'NOT_EVALUABLE');
-  const blockedCodes = new Set(['POSTGRES_CONFIG_MISSING', 'REPLAY_CONFIG_MISSING', 'VALIDATION_RUN_ID_MISSING', 'SCORECARD_NOT_EVALUABLE']);
-  report.status = error ? (blockedCodes.has(error.code) ? 'BLOCKED' : 'FAIL') : postgresNotEvaluable ? 'NOT_EVALUABLE' : 'PASS';
-  report.error = error ? { message: error.message, code: error.code || null, missing: error.missing || null } : null;
+  report.status = deriveVerificationStatus({ error, gates: report.gates, replays: report.replays, mode });
+  report.error = error ? {
+    message: redactSensitiveText(error.message), code: error.code || null, missing: error.missing || null,
+    classification: error.classification || null, failureType: error.failureType || null,
+    stderrSummary: error.stderrSummary || null
+  } : null;
   await writeFile('v1-4d-verification-report.json', `${JSON.stringify(report, null, 2)}\n`);
   const markdown = [
-    '# V1.4D verification', '', `- Status: **${report.status}**`, `- Replay days: ${replayDays.length ? replayDays.join(', ') : 'not requested'}`, '',
+    mode === 'OFFLINE_LIGHTWEIGHT' ? '# V1.4D offline/lightweight checks' : '# V1.4D full verification', '',
+    `- Mode: **${mode}**`, `- Status: **${report.status}**`, `- Replay days: ${replayDays.length ? replayDays.join(', ') : 'not requested'}`, '',
     '| Gate | Required | Status |', '|---|---:|---|',
     ...report.gates.map(gate => `| ${gate.label} | ${gate.required ? 'yes' : 'no'} | ${gate.status || 'NOT_RUN'} |`),
     '', '## Historical replay status', '',
@@ -84,9 +114,26 @@ async function publish(error = null) {
   ].join('\n');
   await writeFile('v1-4d-verification-report.md', `${markdown}\n`);
   if (process.env.GITHUB_STEP_SUMMARY) await appendFile(process.env.GITHUB_STEP_SUMMARY, `${markdown}\n`);
+  process.exitCode = exitCodeForStatus(report.status);
 }
 
 try {
+  if (mode === 'FULL' && (!replayDays.includes(7) || !replayDays.includes(90))) {
+    throw Object.assign(new Error('Full V1.4D verification requires --replay-days=both'), {
+      code: 'FULL_REPLAY_PLAN_REQUIRED', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
+    });
+  }
+  if (mode === 'FULL' && hasArg('offline-only')) {
+    throw Object.assign(new Error('--offline-only is valid only with --lightweight; full verification cannot omit PostgreSQL'), {
+      code: 'FULL_OFFLINE_MODE_INVALID', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
+    });
+  }
+  if (mode === 'FULL' && !process.env.TEST_DATABASE_URL) {
+    throw Object.assign(new Error('TEST_DATABASE_URL is required for full V1.4D verification'), {
+      code: 'POSTGRES_CONFIG_MISSING', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
+    });
+  }
+  if (mode === 'FULL') for (const days of replayDays) replayArgs(days);
   await run('Patch whitespace', 'git', ['diff', '--check'], { cwd: '..' });
   await run('Frozen draft-4 documents', 'git', ['diff', '--exit-code', FROZEN_REF, '--', ...FROZEN_DOCS], { cwd: '..' });
   await run('Validation replay unit tests', process.execPath, ['--test', ...await (async () => {
@@ -95,7 +142,7 @@ try {
   })()]);
   await run('Verification bundle CLI tests', process.execPath, ['--test', 'scripts/v1-4d-scorecard-cli.test.mjs']);
   if (hasArg('lightweight')) {
-    report.gates.push({ label: 'Server unit tests', required: false, status: 'NOT_EVALUABLE', reason: 'Deliberate lightweight verification; run without --lightweight for the complete server regression.' });
+    report.gates.push({ label: 'Server unit tests', required: false, status: 'OUT_OF_SCOPE', reason: 'Offline/lightweight mode; run full verification for complete server regression.' });
   } else {
     await run('Server unit tests', process.execPath, ['--test', ...await (async () => {
       const { readdir } = await import('node:fs/promises');
@@ -107,7 +154,11 @@ try {
   if (process.env.TEST_DATABASE_URL && !hasArg('offline-only')) {
     await run('PostgreSQL migrations and integration tests', process.execPath, ['scripts/v1-4d-postgres-validation.mjs']);
   } else {
-    report.gates.push({ label: 'PostgreSQL migrations and integration tests', required: !hasArg('offline-only'), status: hasArg('offline-only') ? 'NOT_EVALUABLE' : 'BLOCKED', reason: 'TEST_DATABASE_URL is not configured' });
+    report.gates.push({
+      label: 'PostgreSQL migrations and integration tests', required: !hasArg('offline-only'),
+      status: mode === 'OFFLINE_LIGHTWEIGHT' ? 'OUT_OF_SCOPE' : hasArg('offline-only') ? 'NOT_EVALUABLE' : 'BLOCKED',
+      reason: 'TEST_DATABASE_URL is not configured'
+    });
     if (!hasArg('offline-only')) throw Object.assign(new Error('TEST_DATABASE_URL is required; use --offline-only only for a deliberate local partial check'), { code: 'POSTGRES_CONFIG_MISSING' });
   }
   const replayErrors = [];
@@ -134,21 +185,41 @@ try {
       }
       Object.assign(replayState, { status: 'EVALUATED', validationRunId, scorecardJson, scorecardMarkdown });
     } catch (error) {
-      Object.assign(replayState, { status: 'BLOCKED', reason: error.message, code: error.code || null });
+      const failure = error.classification
+        ? { classification: error.classification, failureType: error.failureType, status: error.verificationStatus || 'FAIL' }
+        : classifyReplayFailure({ code: error.code, stderr: error.stderrSummary || '' });
+      Object.assign(replayState, {
+        status: failure.status,
+        reason: redactSensitiveText(error.message),
+        code: error.code || null,
+        classification: failure.classification,
+        failureType: failure.failureType || null,
+        stderrSummary: error.stderrSummary || null
+      });
       replayErrors.push({ days, error });
     }
   }
   if (replayErrors.length) {
-    const first = replayErrors[0].error;
-    throw Object.assign(new Error(`Historical replay bundle blocked for ${replayErrors.map(item => `${item.days}d`).join(', ')}: ${first.message}`), {
-      code: first.code || 'REPLAY_BLOCKED', missing: first.missing || null, replayErrors: replayErrors.map(item => ({ days: item.days, message: item.error.message, code: item.error.code || null }))
+    const first = replayErrors.find(item => report.replays[String(item.days)].status === 'FAIL')?.error || replayErrors[0].error;
+    const firstState = report.replays[String(replayErrors.find(item => item.error === first).days)];
+    throw Object.assign(new Error(`Historical replay bundle ${firstState.status === 'FAIL' ? 'failed' : 'blocked'} for ${replayErrors.map(item => `${item.days}d`).join(', ')}: ${first.message}`), {
+      code: first.code || 'REPLAY_BLOCKED', missing: first.missing || null,
+      classification: firstState.classification, failureType: firstState.failureType,
+      verificationStatus: firstState.status,
+      stderrSummary: firstState.stderrSummary,
+      replayErrors: replayErrors.map(item => ({ days: item.days, message: redactSensitiveText(item.error.message), code: item.error.code || null }))
     });
   }
   await publish();
 } catch (error) {
   for (const replay of Object.values(report.replays)) {
-    if (replay.status === 'PENDING') Object.assign(replay, { status: 'BLOCKED', reason: `Not executed because an earlier required step blocked: ${error.message}`, code: error.code || null });
+    if (replay.status === 'PENDING') Object.assign(replay, {
+      status: 'BLOCKED',
+      reason: redactSensitiveText(`Not executed because an earlier required step blocked: ${error.message}`),
+      code: error.code || null,
+      classification: error.classification || null,
+      failureType: error.failureType || null
+    });
   }
   await publish(error);
-  process.exitCode = 1;
 }

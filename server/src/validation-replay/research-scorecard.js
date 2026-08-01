@@ -1,3 +1,6 @@
+import { computeSplitEffectiveSamples } from './purge.js';
+import { splitTimeOrdered } from '../validation/walk-forward.js';
+
 const DIRECTIONS = Object.freeze(['UP', 'DOWN', 'RANGE']);
 const RESEARCH_ACTION_PERMISSIONS = Object.freeze(['DISPLAY_ONLY', 'AUDIT_ONLY']);
 
@@ -267,7 +270,81 @@ function buildDataQuality(inputRows, eligibleRows) {
     degradedCount: count(row => row.degraded === true),
     blockedCount: count(row => row.blocked === true),
     invalidActionPermissionCount: count(row => row.actionPermission != null && !RESEARCH_ACTION_PERMISSIONS.includes(row.actionPermission)),
+    invalidTimingCount: count(row => !Number.isFinite(toEpochMs(row.targetStartTime)) || !Number.isFinite(toEpochMs(row.targetEndTime))),
     byHorizon
+  };
+}
+
+function toEpochMs(value) {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === 'number') return value;
+  if (typeof value === 'string' && value.trim()) return Date.parse(value);
+  return Number.NaN;
+}
+
+function normalizeStatisticalRows(inputRows, horizon) {
+  return inputRows.filter(row => row.horizon === horizon).map((row, index) => {
+    const targetStartTime = toEpochMs(row.targetStartTime);
+    const targetEndTime = toEpochMs(row.targetEndTime);
+    return {
+      ...row,
+      predictionId: typeof row.predictionId === 'string' && row.predictionId ? row.predictionId : `${horizon}-${index}`,
+      targetStartTime,
+      targetEndTime,
+      directionEligibleForStatistics: row.directionEligibleForStatistics === true ||
+        (row.directionEligibleForStatistics == null && DIRECTIONS.includes(row.actualDirection) && DIRECTIONS.includes(row.predictedDirection)),
+      pathEligibleForStatistics: row.pathEligibleForStatistics === true ||
+        (row.pathEligibleForStatistics == null && (finiteNumber(row.mfe) != null || finiteNumber(row.mae) != null))
+    };
+  });
+}
+
+function hasSplitBoundaries(options) {
+  return Number.isFinite(toEpochMs(options.trainEnd)) && Number.isFinite(toEpochMs(options.validationEnd));
+}
+
+function buildHorizonStatisticalPipeline(inputRows, horizon, options) {
+  const normalized = normalizeStatisticalRows(inputRows, horizon);
+  const timed = normalized.filter(row => Number.isFinite(row.targetStartTime) && Number.isFinite(row.targetEndTime));
+  const boundaries = hasSplitBoundaries(options)
+    ? { trainEnd: toEpochMs(options.trainEnd), validationEnd: toEpochMs(options.validationEnd) }
+    : {};
+  const result = computeSplitEffectiveSamples(timed, {
+    eligibilityField: 'directionEligibleForStatistics',
+    ...boundaries
+  });
+
+  if (!hasSplitBoundaries(options)) {
+    return {
+      rows: result.all,
+      rawSampleCount: result.rawSampleCount,
+      effectiveSampleCount: result.effectiveSampleCount,
+      prePurgeEffectiveSampleCount: result.effectiveSampleCount,
+      purgedStraddlingCount: 0,
+      invalidTimingCount: normalized.length - timed.length,
+      segments: null
+    };
+  }
+
+  const raw = splitTimeOrdered(timed.filter(row => row.directionEligibleForStatistics), boundaries);
+  const segmentDefinitions = [
+    ['TRAIN', raw.training, result.training],
+    ['VALIDATION', raw.validation, result.validation],
+    ['TEST', raw.test, result.test]
+  ];
+  const segments = Object.fromEntries(segmentDefinitions.map(([name, rawRows, effectiveRows]) => [name, {
+    rawSampleCount: rawRows.length,
+    effectiveSampleCount: effectiveRows.length
+  }]));
+  const rows = segmentDefinitions.flatMap(([split, , effectiveRows]) => effectiveRows.map(row => ({ ...row, split })));
+  return {
+    rows,
+    rawSampleCount: result.rawSampleCount,
+    effectiveSampleCount: rows.length,
+    prePurgeEffectiveSampleCount: result.effectiveSampleCount,
+    purgedStraddlingCount: result.purgedStraddlingCount,
+    invalidTimingCount: normalized.length - timed.length,
+    segments
   };
 }
 
@@ -275,11 +352,21 @@ export function buildResearchScorecard(inputRows, options = {}) {
   if (!Array.isArray(inputRows)) throw new TypeError('inputRows must be an array');
   const randomSeed = finiteNumber(options.randomSeed) ?? 1404;
   const costs = normalizeCosts(options);
-  const rows = inputRows.filter(row => DIRECTIONS.includes(row.actualDirection) && DIRECTIONS.includes(row.predictedDirection));
-  const horizons = Object.fromEntries(['24h', '72h'].map((horizon, index) => [
-    horizon,
-    buildScope(rows.filter(row => row.horizon === horizon), costs, randomSeed + index)
-  ]));
+  const pipelines = Object.fromEntries(['24h', '72h'].map(horizon => [horizon, buildHorizonStatisticalPipeline(inputRows, horizon, options)]));
+  const rows = Object.values(pipelines).flatMap(pipeline => pipeline.rows)
+    .filter(row => DIRECTIONS.includes(row.actualDirection) && DIRECTIONS.includes(row.predictedDirection));
+  const horizons = Object.fromEntries(['24h', '72h'].map((horizon, index) => {
+    const pipeline = pipelines[horizon];
+    return [horizon, {
+      ...buildScope(pipeline.rows, costs, randomSeed + index),
+      rawSampleCount: pipeline.rawSampleCount,
+      effectiveSampleCount: pipeline.effectiveSampleCount,
+      prePurgeEffectiveSampleCount: pipeline.prePurgeEffectiveSampleCount,
+      purgedStraddlingCount: pipeline.purgedStraddlingCount,
+      invalidTimingCount: pipeline.invalidTimingCount,
+      segments: pipeline.segments
+    }];
+  }));
   const evaluatedHorizons = Object.values(horizons).filter(value => value.status === 'EVALUATED').length;
   const populatedHorizons = Object.values(horizons).filter(value => value.sampleCount > 0).length;
   const marketRegimeGroups = groupSummaries(rows, 'marketRegime', 'predictedDirection', costs);
@@ -309,7 +396,12 @@ export function buildResearchScorecard(inputRows, options = {}) {
     byActionPermission: Object.keys(actionPermissionGroups).length
       ? { status: 'EVALUATED', groups: actionPermissionGroups }
       : notEvaluable('V1.4D replay snapshots structurally exclude ActionPermission; no caller-supplied audit labels were available.', { groups: {} }),
-    dataQuality: buildDataQuality(inputRows, rows),
+    dataQuality: {
+      ...buildDataQuality(inputRows, rows),
+      rawSampleCount: Object.values(pipelines).reduce((sum, value) => sum + value.rawSampleCount, 0),
+      effectiveSampleCount: Object.values(pipelines).reduce((sum, value) => sum + value.effectiveSampleCount, 0),
+      purgedStraddlingCount: Object.values(pipelines).reduce((sum, value) => sum + value.purgedStraddlingCount, 0)
+    },
     disclosures: {
       actionPermission: Object.keys(actionPermissionGroups).length
         ? 'Computed only from caller-supplied DISPLAY_ONLY/AUDIT_ONLY research labels; V1.4D replay schema does not generate ActionPermission.'
@@ -357,6 +449,7 @@ export function renderResearchScorecardMarkdown(scorecard) {
     `- Generated at: ${scorecard.generatedAt}`,
     `- Fee/slippage/total cost (bps): ${scorecard.assumptions.feeBps}/${scorecard.assumptions.slippageBps}/${scorecard.assumptions.roundTripCostBps}`,
     `- Input/eligible/economic/path samples: ${scorecard.dataQuality.inputCount}/${scorecard.dataQuality.eligibleDirectionCount}/${scorecard.dataQuality.economicEligibleCount}/${scorecard.dataQuality.pathEligibleCount}`,
+    `- Raw/effective/purged samples: ${scorecard.dataQuality.rawSampleCount}/${scorecard.dataQuality.effectiveSampleCount}/${scorecard.dataQuality.purgedStraddlingCount}`,
     '', '## 24H / 72H system results', '',
     '| Horizon | Samples | Accuracy | Macro-F1 | Avg MFE | Avg MAE | Cost-adjusted expected return | Max drawdown | Max consecutive errors |',
     '|---|---:|---:|---:|---:|---:|---:|---:|---:|',
