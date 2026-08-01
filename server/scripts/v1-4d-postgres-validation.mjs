@@ -15,6 +15,17 @@ const TARGETED_FILES = Object.freeze([
   'tests/postgres/v1-4d-dry-run-full-compute.integration.test.js',
   'tests/postgres/v1-4d-replay-generator-evaluator.integration.test.js'
 ]);
+// Stage 1 最终验收补齐的6个文件（5组P0+2组P1+R11.4全量状态机表覆盖，共29项测试）——单独跑两轮，
+// 与上面既有的TARGETED_FILES两轮制度并列，互不替代：TARGETED_FILES验证的是P0-2/P1-1既有闭环，
+// 这里验证的是本轮新增的验收覆盖本身的可重复性与五张业务表零写入不变量。
+const STAGE1_FINAL_ACCEPTANCE_FILES = Object.freeze([
+  'tests/postgres/v1-4d-r7-schema-isolation.integration.test.js',
+  'tests/postgres/v1-4d-r8-production-isolation.integration.test.js',
+  'tests/postgres/v1-4d-r9-2-resume-content-hash.integration.test.js',
+  'tests/postgres/v1-4d-r11-4-terminal-immutability.integration.test.js',
+  'tests/postgres/v1-4d-r15-check-constraints.integration.test.js',
+  'tests/postgres/v1-4d-r19-4-buffer-missing.integration.test.js'
+]);
 // All V1.4D PostgreSQL files share one database. Node runs separate test files
 // concurrently by default, so global zero-write/count assertions can observe
 // another file's uncommitted fixture rows even though every file rolls its own
@@ -44,6 +55,7 @@ const results = {
   database: configuredDatabase,
   migrations: [],
   targetedRuns: [],
+  stage1FinalAcceptanceRounds: [],
   suites: []
 };
 
@@ -128,6 +140,17 @@ async function publishSummary(status, error = null) {
       ''
     );
   }
+  for (const round of results.stage1FinalAcceptanceRounds) {
+    lines.push(
+      `## Stage 1 final acceptance round${round.round}`,
+      '',
+      `- Tests/pass/fail/skip: ${round.stats.tests}/${round.stats.pass}/${round.stats.fail}/${round.stats.skipped}`,
+      `- Before: \`${JSON.stringify(round.before)}\``,
+      `- After: \`${JSON.stringify(round.after)}\``,
+      '- Five-table zero-write check: PASS',
+      ''
+    );
+  }
   for (const suite of results.suites) {
     lines.push(`- ${suite.label}: ${suite.stats.tests}/${suite.stats.pass}/${suite.stats.fail}/${suite.stats.skipped}`);
   }
@@ -168,6 +191,20 @@ try {
     assertCountsUnchanged(before, after, `targeted PostgreSQL run ${run}`);
     console.log(`targeted PostgreSQL run ${run} counts before=${JSON.stringify(before)}`);
     console.log(`targeted PostgreSQL run ${run} counts after=${JSON.stringify(after)}`);
+  }
+
+  for (let round = 1; round <= 2; round += 1) {
+    const before = await countBusinessTables(pool);
+    const stats = await runTestCommand(
+      `round${round}`,
+      process.execPath,
+      [...POSTGRES_TEST_ARGS, ...STAGE1_FINAL_ACCEPTANCE_FILES]
+    );
+    const after = await countBusinessTables(pool);
+    results.stage1FinalAcceptanceRounds.push({ round, stats, before, after });
+    assertCountsUnchanged(before, after, `round${round}`);
+    console.log(`round${round} counts before=${JSON.stringify(before)}`);
+    console.log(`round${round} counts after=${JSON.stringify(after)}`);
   }
 
   const postgresFiles = (await readdir('tests/postgres'))
