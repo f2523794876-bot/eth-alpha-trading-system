@@ -11,6 +11,7 @@ import { Pool } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { main } from '../../src/validation-replay/cli-entry.js';
 import { generateReplaySnapshot } from '../../src/validation-replay/replay-generator.js';
+import { evaluateReplayOutcomes } from '../../src/validation-replay/replay-evaluator.js';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { buildDatasetManifest } from '../../src/validation-replay/dataset-manifest-builder.js';
 import { RESEARCH_AVAILABILITY_RULE_VERSION } from '../../src/validation-replay/research-availability.js';
@@ -560,18 +561,26 @@ test('P1-A-A：首次run使用weight V1，resume使用V2——拒绝(RESUME_WEIG
     const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
-    const plan1 = await withMainEnv(() => main([
-      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
-      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
-      '--rule-version', RULE_VERSION, '--weight-version', 'v1.4c-server-weight-V1', '--evaluation-version', EVALUATION_VERSION
-    ]));
-    validationRunId = plan1.validationRunId;
+    // R11.4修复后，--resume只接受真正仍处于RUNNING的run——不能再像修复前那样让首次run经main()一路
+    // 跑到SUCCEEDED后再对它发起resume（那属于R11.4分类下的终态不可变违规，现在会被
+    // RESUME_VALIDATION_RUN_ALREADY_TERMINAL提前拦截）。改为直接INSERT一条RUNNING行（复用本文件
+    // 已建立的"半途run"模式，见上方"main()：--resume最小形式"用例），并手工调用一次
+    // generateReplaySnapshot()，精确构造"该run已经在weight-version V1下产生过一次成功生成尝试，
+    // 但run本身仍在进行中（未到达SUCCEEDED终态）"这一checkResumeVersionConsistency真正要防护的场景。
+    validationRunId = randomUUID();
+    await pool.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+    const generation = await generateReplaySnapshot({
+      pool, validationRunId, instrument: 'ETHUSDT', symbol: 'ETHUSDT', horizon: '24h', historicalAsOfTime: referenceCloseTime, replayNowMs,
+      algorithmVersion: ALGORITHM_VERSION, weightVersion: 'v1.4c-server-weight-V1', datasetVersion, ruleVersion: RULE_VERSION, backfillBatchIds: []
+    });
+    assert.equal(generation.status, 'INSERTED', '前提确认：该点必须真实产出一条SUCCEEDED生成记录（weight-version V1）');
+
     const before = await generationRunCountFor(pool, validationRunId);
-    // 首次run会枚举整个[from,to)窗口内的全部24h节奏点（本测试窗口为2天，产生12条
-    // generation_run记录，其中仅seedRhythmPoint覆盖的那个点会SUCCEEDED，其余因缺少数据
-    // 而BLOCKED——但BLOCKED点同样会写入generation_run行）。这里不硬编码具体数值，只确认
-    // 确实已有生成记录，真正要验证的不变量是resume拒绝后的after===before。
-    assert.ok(before > 0, '前提确认：首次run必须已经产生至少一条generation_run记录');
+    assert.ok(before > 0, '前提确认：run必须已经产生至少一条generation_run记录');
 
     await assert.rejects(
       withMainEnv(() => main([
@@ -605,12 +614,18 @@ test('P1-A-B：首次run与resume均使用weight V1——允许', { skip }, asyn
     const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
-    const plan1 = await withMainEnv(() => main([
-      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
-      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
-      '--rule-version', RULE_VERSION, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
-    ]));
-    validationRunId = plan1.validationRunId;
+    // R11.4修复后不能再让首次run先跑到SUCCEEDED——见P1-A-A同款说明，改为RUNNING行+手工生成一次。
+    validationRunId = randomUUID();
+    await pool.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+    const generation = await generateReplaySnapshot({
+      pool, validationRunId, instrument: 'ETHUSDT', symbol: 'ETHUSDT', horizon: '24h', historicalAsOfTime: referenceCloseTime, replayNowMs,
+      algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION, datasetVersion, ruleVersion: RULE_VERSION, backfillBatchIds: []
+    });
+    assert.equal(generation.status, 'INSERTED');
 
     const plan2 = await withMainEnv(() => main([
       '--resume', validationRunId, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
@@ -648,12 +663,24 @@ test('P1-A-C：已有outcome使用evaluation V1，resume使用V2——拒绝(RES
     const to = referenceCloseTime + 2 * DAY_MS;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
-    const plan1 = await withMainEnv(() => main([
-      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
-      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
-      '--rule-version', RULE_VERSION, '--weight-version', WEIGHT_VERSION, '--evaluation-version', 'v1.4c-outcome-evaluation-V1'
-    ]));
-    validationRunId = plan1.validationRunId;
+    // R11.4修复后不能再让首次run先跑到SUCCEEDED——见P1-A-A同款说明，改为RUNNING行+手工完成一次
+    // 生成+评估，构造"该run已经在evaluation-version V1下产生过一条真实outcome，但run本身仍在
+    // 进行中"这一checkResumeVersionConsistency真正要防护的场景。
+    validationRunId = randomUUID();
+    await pool.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+    const generation = await generateReplaySnapshot({
+      pool, validationRunId, instrument: 'ETHUSDT', symbol: 'ETHUSDT', horizon: '24h', historicalAsOfTime: referenceCloseTime, replayNowMs,
+      algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION, datasetVersion, ruleVersion: RULE_VERSION, backfillBatchIds: []
+    });
+    assert.equal(generation.status, 'INSERTED');
+    const evaluation = await evaluateReplayOutcomes({
+      pool, validationRunId, evaluationVersion: 'v1.4c-outcome-evaluation-V1', historicalAsOfTime: referenceCloseTime + DAY_MS, replayNowMs
+    });
+    assert.ok(evaluation.evaluated > 0, '前提确认：该点必须真实产出至少一条outcome（evaluation-version V1）');
     const outcomeCount = (await pool.query(
       `SELECT count(*)::int AS n FROM historical_validation.replay_outcome_events e
        JOIN historical_validation.replay_evaluation_runs er ON er.evaluation_run_id=e.evaluation_run_id
@@ -695,12 +722,23 @@ test('P1-A-D：首次run与resume均使用相同evaluation版本——允许', {
     const to = referenceCloseTime + 2 * DAY_MS;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
-    const plan1 = await withMainEnv(() => main([
-      '--symbol', 'ETHUSDT', '--from', new Date(from).toISOString(), '--to', new Date(to).toISOString(),
-      '--horizons', '24h', '--algorithm-version', ALGORITHM_VERSION, '--dataset-version', datasetVersion,
-      '--rule-version', RULE_VERSION, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION
-    ]));
-    validationRunId = plan1.validationRunId;
+    // R11.4修复后不能再让首次run先跑到SUCCEEDED——见P1-A-A/P1-A-C同款说明，改为RUNNING行+手工完成
+    // 一次生成+评估。
+    validationRunId = randomUUID();
+    await pool.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, status, started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+    const generation = await generateReplaySnapshot({
+      pool, validationRunId, instrument: 'ETHUSDT', symbol: 'ETHUSDT', horizon: '24h', historicalAsOfTime: referenceCloseTime, replayNowMs,
+      algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION, datasetVersion, ruleVersion: RULE_VERSION, backfillBatchIds: []
+    });
+    assert.equal(generation.status, 'INSERTED');
+    const evaluation = await evaluateReplayOutcomes({
+      pool, validationRunId, evaluationVersion: EVALUATION_VERSION, historicalAsOfTime: referenceCloseTime + DAY_MS, replayNowMs
+    });
+    assert.ok(evaluation.evaluated > 0);
 
     const plan2 = await withMainEnv(() => main([
       '--resume', validationRunId, '--weight-version', WEIGHT_VERSION, '--evaluation-version', EVALUATION_VERSION

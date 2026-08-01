@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 import { randomUUID } from 'node:crypto';
 import { runBackfillForInterval, main as backfillMain } from '../../src/backfill/backfill-cli-entry.js';
+import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = !TEST_DATABASE_URL;
@@ -24,6 +25,23 @@ function makeMockAdapter({ pages, serverTimeMs, calls }) {
 
 function kline(openTime, closeTime, closeStr = '1000.00') {
   return [openTime, '999.00', '1001.00', '998.00', closeStr, '10.5', closeTime, '10500.00', 5, '5.0', '5000.00'];
+}
+
+// R11.4修复后，--resume只接受真正仍处于RUNNING的批次。此前多个测试把"first run"跑到一个自然终态
+// （ATTENTION_REQUIRED/SUCCEEDED）后直接对它发起--resume，依赖的是修复前"resume可以复活任意终态"的
+// 错误行为——现在必须改为真实模拟"进程在finalize之前被杀死"：直接创建status='RUNNING'的审计行，
+// 再直接调用底层backfillInterval()（不经过runBackfillForInterval的finalize包装）完成"抓取+落库+
+// 推进游标"，使批次行精确停留在真实中断时的状态（status仍是RUNNING，last_completed_open_time已推进）。
+async function createRunningBatch(client, { symbol, interval, requestedStart, requestedEnd, pages, serverTimeMs, calls }) {
+  const backfillBatchId = randomUUID();
+  await client.query(
+    `INSERT INTO historical_validation.backfill_batches(backfill_batch_id,symbol,interval_name,requested_start_utc,requested_end_utc,status,started_at)
+     VALUES($1,$2,$3,to_timestamp($4/1000.0),to_timestamp($5/1000.0),'RUNNING',now())`,
+    [backfillBatchId, symbol, interval, requestedStart, requestedEnd]
+  );
+  const adapter = makeMockAdapter({ pages, serverTimeMs, calls });
+  const result = await backfillInterval({ pool: client, adapter, symbol, interval, startTime: requestedStart, endTime: requestedEnd, backfillBatchId, now: () => serverTimeMs });
+  return { backfillBatchId, result };
 }
 
 async function withTxClient(fn) {
@@ -91,12 +109,18 @@ test('resume：携带已有backfill_batch_id时从last_completed_open_time之后
     const bar1Open = base + 900000, bar1Close = bar1Open + 900000 - 1;
     const nowMs1 = bar0Close + 60000;
 
+    // R11.4修复后，--resume只接受真正仍处于RUNNING的批次——用createRunningBatch精确模拟"进程在
+    // finalize之前被杀死"：只喂一页(bar0)并直接调用底层backfillInterval()，批次行停留在RUNNING，
+    // 不经过runBackfillForInterval的finalize（那会立刻把它转成ATTENTION_REQUIRED终态）。
     const calls1 = [];
-    const adapter1 = makeMockAdapter({ pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1, calls: calls1 });
-    const first = await runBackfillForInterval({ pool: client, adapter: adapter1, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close, now: () => nowMs1 });
-    // 首次运行只喂了一页(bar0)，第二页留空模拟"运行到一半中断"——checkIntegrity 会发现区间末尾缺口(ATTENTION_REQUIRED)，
+    const first = await createRunningBatch(client, {
+      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close,
+      pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1, calls: calls1
+    });
     // resume校验的重点是：续跑时 backfillInterval 传给 adapter.spotKlines 的 startTime 已经推进到 bar0之后，而不是从bar0Open重新拉取。
     assert.equal(calls1[0].startTime, bar0Open);
+    const runningBatch = (await client.query('SELECT status FROM historical_validation.backfill_batches WHERE backfill_batch_id=$1', [first.backfillBatchId])).rows[0];
+    assert.equal(runningBatch.status, 'RUNNING', '中断模拟前提：批次必须真实停留在RUNNING，而不是任何终态');
 
     const nowMs2 = bar1Close + 60000;
     const calls2 = [];
@@ -121,8 +145,11 @@ test('P1-6：正确symbol和interval恢复成功（回归——修复前的合�
     const bar1Open = base + 900000, bar1Close = bar1Open + 900000 - 1;
     const nowMs1 = bar0Close + 60000;
 
-    const adapter1 = makeMockAdapter({ pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1 });
-    const first = await runBackfillForInterval({ pool: client, adapter: adapter1, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close, now: () => nowMs1 });
+    // R11.4修复后，resume只接受真正仍处于RUNNING的批次——用createRunningBatch模拟真实中断。
+    const first = await createRunningBatch(client, {
+      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close,
+      pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1
+    });
 
     const nowMs2 = bar1Close + 60000;
     const adapter2 = makeMockAdapter({ pages: [[kline(bar1Open, bar1Close)]], serverTimeMs: nowMs2 });
@@ -223,8 +250,11 @@ test('P1-6：单个--resume加单个interval不受影响——runBackfillForInte
     const bar0Open = base, bar0Close = base + 900000 - 1;
     const bar1Open = base + 900000, bar1Close = bar1Open + 900000 - 1;
     const nowMs1 = bar0Close + 60000;
-    const adapter1 = makeMockAdapter({ pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1 });
-    const first = await runBackfillForInterval({ pool: client, adapter: adapter1, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close, now: () => nowMs1 });
+    // R11.4修复后，resume只接受真正仍处于RUNNING的批次——用createRunningBatch模拟真实中断。
+    const first = await createRunningBatch(client, {
+      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close,
+      pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1
+    });
 
     // main()级别RESUME_INTERVALS_CONFLICT只应在intervals.length>1时触发；单interval场景下main()
     // 必须把args.resume原样透传给runBackfillForInterval，continue正常resume。此处直接验证
