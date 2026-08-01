@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildResearchScorecard, classificationMetrics, renderResearchScorecardMarkdown } from './research-scorecard.js';
+import { buildValidationReports } from './report-builder.js';
 
 test('classificationMetrics calculates three-class macro-F1', () => {
   const rows = [
@@ -215,4 +216,88 @@ test('purge can leave a segment empty without fabricating segment performance', 
   const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
   assert.equal(horizon.purgedStraddlingCount, 1);
   assert.deepEqual(horizon.segments.VALIDATION, { rawSampleCount: 1, effectiveSampleCount: 0 });
+});
+
+function independentEligibilityRows() {
+  return [
+    {
+      predictionId: 'both', horizon: '24h', targetStartTime: 0, targetEndTime: 100, split: 'TRAIN',
+      actualDirection: 'UP', predictedDirection: 'UP', expectedDirection: 'UP', actualReturn: .01,
+      directionEligibleForStatistics: true, pathEligibleForStatistics: true, mfe: .05, mae: .01
+    },
+    {
+      predictionId: 'path-only', horizon: '24h', targetStartTime: 100, targetEndTime: 200, split: 'TEST',
+      actualDirection: null, predictedDirection: 'UP', expectedDirection: 'UP', actualReturn: null,
+      directionEligibleForStatistics: false, pathEligibleForStatistics: true, mfe: .99, mae: .02
+    },
+    {
+      predictionId: 'direction-only', horizon: '24h', targetStartTime: 200, targetEndTime: 300, split: 'TEST',
+      actualDirection: 'DOWN', predictedDirection: 'DOWN', expectedDirection: 'DOWN', actualReturn: -.01,
+      directionEligibleForStatistics: true, pathEligibleForStatistics: false, mfe: .77, mae: .77
+    }
+  ];
+}
+
+test('direction and path pipelines retain opposite eligibility cases with independent denominators', () => {
+  const scorecard = buildResearchScorecard(independentEligibilityRows());
+  const horizon = scorecard.horizons['24h'];
+  assert.equal(horizon.directionSampleCounts.rawSampleCount, 2);
+  assert.equal(horizon.directionSampleCounts.effectiveSampleCount, 2);
+  assert.equal(horizon.pathSampleCounts.rawSampleCount, 2);
+  assert.equal(horizon.pathSampleCounts.effectiveSampleCount, 2);
+  assert.equal(horizon.system.sampleCount, 2);
+  assert.equal(horizon.system.path.mfeSampleCount, 2);
+  assert.equal(horizon.system.path.averageMfe, .52, 'path-only mfe=0.99 must be included; direction-only mfe=0.77 must be excluded');
+});
+
+test('research scorecard and report-builder expose the same independent direction/path denominators', async () => {
+  const rows = independentEligibilityRows();
+  const inserted = [];
+  const pool = {
+    async query(sql, params = []) {
+      if (sql.includes('SELECT s.prediction_id')) {
+        const horizon = params[1];
+        return { rows: horizon === '24h' ? rows.map(row => ({
+          predictionId: row.predictionId,
+          horizon: row.horizon,
+          targetStartTimeRaw: new Date(row.targetStartTime),
+          targetEndTimeRaw: new Date(row.targetEndTime),
+          proxyStateAtGeneration: 'PO_UNKNOWN',
+          expectedDirection: row.expectedDirection,
+          featureValuesUsed: {},
+          directionEligibleForStatistics: row.directionEligibleForStatistics,
+          pathEligibleForStatistics: row.pathEligibleForStatistics,
+          directionCorrect: row.directionEligibleForStatistics ? row.actualDirection === row.expectedDirection : null,
+          actualDirection: row.actualDirection,
+          endpointDataComplete: true,
+          pathDataComplete: row.pathEligibleForStatistics,
+          mfe: row.mfe,
+          mae: row.mae,
+          realizedRangeInsideExpectedEnvelope: null,
+          expectedEnvelopeTouched: null
+        })) : [] };
+      }
+      if (sql.includes('INSERT INTO historical_validation.validation_reports')) {
+        inserted.push(params);
+        return { rowCount: 1, rows: [] };
+      }
+      throw new Error(`Unexpected SQL in report-builder parity test: ${sql}`);
+    }
+  };
+  const reports = await buildValidationReports({
+    pool,
+    validationRunId: '00000000-0000-0000-0000-000000000001',
+    datasetVersion: 'v1.4d-sha256-' + 'a'.repeat(64),
+    algorithmVersion: 'test-algorithm',
+    ruleVersion: 'test-rule',
+    researchAvailabilityRuleVersion: 'test-availability',
+    evaluationVersion: 'test-evaluation'
+  });
+  assert.equal(inserted.length, 2);
+  const report = reports.find(value => value.horizon === '24h' && value.reportScope === 'ALL');
+  const horizon = buildResearchScorecard(rows).horizons['24h'];
+  assert.equal(horizon.directionSampleCounts.rawSampleCount, report.directionRawSampleCount);
+  assert.equal(horizon.directionSampleCounts.effectiveSampleCount, report.directionEffectiveSampleCount);
+  assert.equal(horizon.pathSampleCounts.rawSampleCount, report.pathRawSampleCount);
+  assert.equal(horizon.pathSampleCounts.effectiveSampleCount, report.pathEffectiveSampleCount);
 });

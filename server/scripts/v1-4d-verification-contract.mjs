@@ -19,16 +19,16 @@ export function exitCodeForStatus(status) {
 export function redactSensitiveText(value) {
   return String(value ?? '')
     .replace(/\b(postgres(?:ql)?:\/\/)[^\s'"`]+/gi, '$1[REDACTED]')
-    .replace(/\b(password|pass|pwd)\s*[=:]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/\b(password|pass|pwd|user|username|token)\s*[=:]\s*[^\s,;]+/gi, '$1=[REDACTED]')
     .replace(/\b(TEST_DATABASE_URL|V14D_REPLAY_DATABASE_URL|DATABASE_URL)\s*[=:]\s*[^\s]+/g, '$1=[REDACTED]');
 }
 
 export function extractChildErrorCode(stdout, stderr) {
   const combined = `${stdout ?? ''}\n${stderr ?? ''}`;
   const patterns = [
-    /["']code["']\s*:\s*["']([A-Z][A-Z0-9_]+)["']/,
-    /\bcode\s*:\s*["']?([A-Z][A-Z0-9_]+)["']?/,
-    /\berrorCode\s*[:=]\s*["']?([A-Z][A-Z0-9_]+)["']?/
+    /["']code["']\s*:\s*["']([A-Z0-9][A-Z0-9_]+)["']/,
+    /\bcode\s*:\s*["']?([A-Z0-9][A-Z0-9_]+)["']?/,
+    /\berrorCode\s*[:=]\s*["']?([A-Z0-9][A-Z0-9_]+)["']?/
   ];
   for (const pattern of patterns) {
     const match = pattern.exec(combined);
@@ -45,7 +45,8 @@ export function classifyReplayFailure({ code, stderr = '', spawnCode = null }) {
   }
   if (
     /ECONNREFUSED|ENOTFOUND|connection\s+(?:refused|terminated|failed)|database\s+.*(?:unavailable|does not exist)/i.test(stderr) ||
-    ['ECONNREFUSED', 'ENOTFOUND', 'DATABASE_UNAVAILABLE', 'DATABASE_CONNECTION_FAILED'].includes(normalizedCode)
+    /^08[A-Z0-9]{3}$/.test(normalizedCode || '') ||
+    ['3D000', '28000', '28P01', 'ECONNREFUSED', 'ENOTFOUND', 'DATABASE_UNAVAILABLE', 'DATABASE_CONNECTION_FAILED'].includes(normalizedCode)
   ) {
     return { classification: 'EXECUTION_FAILURE', failureType: 'DATABASE_CONNECTION_FAILURE', status: 'FAIL' };
   }
@@ -64,6 +65,8 @@ export function deriveVerificationStatus({ error = null, gates = [], replays = {
   if (statuses.includes('FAIL')) return 'FAIL';
   if (statuses.includes('BLOCKED')) return 'BLOCKED';
   if (statuses.includes('NOT_EVALUABLE')) return 'NOT_EVALUABLE';
-  if (mode === 'OFFLINE_LIGHTWEIGHT' && statuses.every(status => status === 'PASS' || status === 'OUT_OF_SCOPE')) return 'PASS';
-  return statuses.every(status => status === 'PASS' || status === 'OUT_OF_SCOPE') ? 'PASS' : 'NOT_EVALUABLE';
+  if (mode === 'OFFLINE_LIGHTWEIGHT') {
+    return statuses.length > 0 && statuses.every(status => status === 'PASS' || status === 'OUT_OF_SCOPE') ? 'PASS' : 'NOT_EVALUABLE';
+  }
+  return statuses.length > 0 && statuses.every(status => status === 'PASS' || status === 'EVALUATED') ? 'PASS' : 'NOT_EVALUABLE';
 }

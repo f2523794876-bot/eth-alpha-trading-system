@@ -111,6 +111,32 @@ test('verification exit-code matrix is strict for PASS/NOT_EVALUABLE/BLOCKED/FAI
   }
 });
 
+test('FULL completion treats six PASS gates plus 7/90 EVALUATED as PASS and exits zero', () => {
+  const gates = Array.from({ length: 6 }, (_, index) => ({ label: `gate-${index}`, required: true, status: 'PASS' }));
+  const replays = { 7: { status: 'EVALUATED' }, 90: { status: 'EVALUATED' } };
+  assert.equal(deriveVerificationStatus({ mode: 'FULL', gates, replays }), 'PASS');
+  const contractUrl = new URL('./v1-4d-verification-contract.mjs', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', `
+    import { deriveVerificationStatus, exitCodeForStatus } from ${JSON.stringify(contractUrl)};
+    const status = deriveVerificationStatus(${JSON.stringify({ mode: 'FULL', gates, replays })});
+    process.exitCode = exitCodeForStatus(status);
+  `]);
+  assert.equal(child.status, 0, child.stderr?.toString());
+});
+
+test('FULL mixed replay statuses remain non-zero with FAIL/BLOCKED/NOT_EVALUABLE precedence', () => {
+  const gates = Array.from({ length: 6 }, () => ({ required: true, status: 'PASS' }));
+  for (const [replayStatus, expectedStatus, expectedExit] of [
+    ['FAIL', 'FAIL', 1],
+    ['BLOCKED', 'BLOCKED', 3],
+    ['NOT_EVALUABLE', 'NOT_EVALUABLE', 2]
+  ]) {
+    const status = deriveVerificationStatus({ mode: 'FULL', gates, replays: { 7: { status: 'EVALUATED' }, 90: { status: replayStatus } } });
+    assert.equal(status, expectedStatus);
+    assert.equal(exitCodeForStatus(status), expectedExit);
+  }
+});
+
 test('replay failures preserve DATASET_MANIFEST_NOT_FOUND as DATA_NOT_READY', () => {
   const stderr = "validation:walk-forward failed { code: 'DATASET_MANIFEST_NOT_FOUND' }";
   const code = extractChildErrorCode('', stderr);
@@ -128,8 +154,20 @@ test('configuration, database connection and unknown child failures remain disti
   });
 });
 
-test('replay stderr summaries redact database URLs and passwords', () => {
-  const redacted = redactSensitiveText('postgresql://user:secret@example/db password=hunter2 TEST_DATABASE_URL=postgres://u:p@host/db');
-  assert.doesNotMatch(redacted, /secret|hunter2|u:p@host/);
+test('PostgreSQL connection/auth SQLSTATE matrix is classified without swallowing unknown crashes', () => {
+  for (const code of ['3D000', '08006', '08001', '28000', '28P01', 'ECONNREFUSED', 'ENOTFOUND']) {
+    assert.deepEqual(classifyReplayFailure({ code }), {
+      classification: 'EXECUTION_FAILURE', failureType: 'DATABASE_CONNECTION_FAILURE', status: 'FAIL'
+    }, code);
+  }
+  assert.equal(extractChildErrorCode('', "database failed { code: '3D000' }"), '3D000');
+  assert.deepEqual(classifyReplayFailure({ code: 'XX999', stderr: 'unknown child crash' }), {
+    classification: 'EXECUTION_FAILURE', failureType: 'CHILD_PROCESS_FAILURE', status: 'FAIL'
+  });
+});
+
+test('replay stderr summaries redact database URLs, usernames, passwords and tokens', () => {
+  const redacted = redactSensitiveText('postgresql://user:secret@example/db username=alice password=hunter2 token=abc123 TEST_DATABASE_URL=postgres://u:p@host/db');
+  assert.doesNotMatch(redacted, /secret|alice|hunter2|abc123|u:p@host/);
   assert.match(redacted, /\[REDACTED\]/);
 });
