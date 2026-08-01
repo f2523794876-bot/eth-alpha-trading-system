@@ -69,8 +69,24 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
     if (!existing.rowCount) throw Object.assign(new Error(`Unknown backfill_batch_id: ${backfillBatchId}`), { code: 'BACKFILL_BATCH_NOT_FOUND' });
     const batch = existing.rows[0];
     assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTime, backfillBatchId });
+    // R11.4修复：--resume只能作用于真正仍处于RUNNING（进程中途被杀死、从未走到finalize）的批次。
+    // 此前对已到达任一终态（SUCCEEDED/FAILED/ATTENTION_REQUIRED）的批次重新--resume，会把该行静默
+    // 改回RUNNING并重写finished_at，破坏终态不可变红线（R11.4）；ATTENTION_REQUIRED批次尤其不得被
+    // 这样"自动重试覆盖"（R3.1红线原文："不自动重试覆盖"）。检查必须发生在任何状态写入或
+    // backfillInterval调用之前。
+    if (batch.status !== 'RUNNING') {
+      throw Object.assign(
+        new Error(`--resume batch ${backfillBatchId} is already in terminal state ${batch.status}; refusing to reprocess a finished batch`),
+        { code: 'BACKFILL_RESUME_ALREADY_TERMINAL', currentStatus: batch.status }
+      );
+    }
     if (batch.last_completed_open_time) resumeFrom = new Date(batch.last_completed_open_time).getTime() + 1;
-    await pool.query(`UPDATE historical_validation.backfill_batches SET status='RUNNING' WHERE backfill_batch_id=$1`, [backfillBatchId]);
+    // 防御性条件更新：仅在status确实仍为RUNNING时才生效，防止上面的检查与此处之间出现竞态窗口下的
+    // 二次覆盖；受影响行数不为1时fail-closed，不得假装继续。
+    const runningGuard = await pool.query(`UPDATE historical_validation.backfill_batches SET status='RUNNING' WHERE backfill_batch_id=$1 AND status='RUNNING'`, [backfillBatchId]);
+    if (runningGuard.rowCount !== 1) {
+      throw Object.assign(new Error(`backfill_batch_id ${backfillBatchId} status changed concurrently before resume could proceed`), { code: 'BACKFILL_BATCH_STATE_CONFLICT' });
+    }
   } else {
     backfillBatchId = randomUUID();
     await pool.query(
@@ -83,24 +99,43 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
   try {
     const result = await backfillInterval({ pool, adapter, symbol, interval, startTime: resumeFrom, endTime, backfillBatchId, now });
     if (result.status === 'BLOCKED') {
-      await pool.query(`UPDATE historical_validation.backfill_batches SET status='FAILED', error_code=$2, finished_at=now() WHERE backfill_batch_id=$1`, [backfillBatchId, result.reason]);
+      const failGuard = await pool.query(`UPDATE historical_validation.backfill_batches SET status='FAILED', error_code=$2, finished_at=now() WHERE backfill_batch_id=$1 AND status='RUNNING'`, [backfillBatchId, result.reason]);
+      if (failGuard.rowCount !== 1) {
+        throw Object.assign(new Error(`backfill_batch_id ${backfillBatchId} status changed concurrently while recording BLOCKED result`), { code: 'BACKFILL_BATCH_STATE_CONFLICT' });
+      }
       return { backfillBatchId, status: 'FAILED', reason: result.reason };
     }
 
     // §2.12 回填后完整性校验：对整个请求区间（含本次之前已完成的部分）重新检测。
     const integrity = await checkIntegrity(pool, { instrument: symbol, interval, from: startTime, to: endTime });
     if (integrity.gapCount > 0 || integrity.duplicateCount > 0 || integrity.outOfOrderCount > 0) {
-      await pool.query(
-        `UPDATE historical_validation.backfill_batches SET status='ATTENTION_REQUIRED', error_code='INTEGRITY_CHECK_FAILED', finished_at=now() WHERE backfill_batch_id=$1`,
+      const attentionGuard = await pool.query(
+        `UPDATE historical_validation.backfill_batches SET status='ATTENTION_REQUIRED', error_code='INTEGRITY_CHECK_FAILED', finished_at=now() WHERE backfill_batch_id=$1 AND status='RUNNING'`,
         [backfillBatchId]
       );
+      if (attentionGuard.rowCount !== 1) {
+        throw Object.assign(new Error(`backfill_batch_id ${backfillBatchId} status changed concurrently while recording ATTENTION_REQUIRED result`), { code: 'BACKFILL_BATCH_STATE_CONFLICT' });
+      }
       return { backfillBatchId, status: 'ATTENTION_REQUIRED', integrity };
     }
 
-    await pool.query(`UPDATE historical_validation.backfill_batches SET status='SUCCEEDED', finished_at=now() WHERE backfill_batch_id=$1`, [backfillBatchId]);
+    const successGuard = await pool.query(`UPDATE historical_validation.backfill_batches SET status='SUCCEEDED', finished_at=now() WHERE backfill_batch_id=$1 AND status='RUNNING'`, [backfillBatchId]);
+    if (successGuard.rowCount !== 1) {
+      throw Object.assign(new Error(`backfill_batch_id ${backfillBatchId} status changed concurrently while recording SUCCEEDED result`), { code: 'BACKFILL_BATCH_STATE_CONFLICT' });
+    }
     return { backfillBatchId, status: 'SUCCEEDED', ...result, integrity };
   } catch (error) {
-    await pool.query(`UPDATE historical_validation.backfill_batches SET status='FAILED', error_code=$2, finished_at=now() WHERE backfill_batch_id=$1`, [backfillBatchId, error.code || error.message]);
+    // BACKFILL_BATCH_STATE_CONFLICT已经证明该行不再处于RUNNING（上面某个防御性条件更新0行命中），
+    // 该行本身未被本次调用触碰，不需要（也不应该）再尝试标记FAILED——避免对一个已经处于其它终态的行
+    // 做多余的条件更新尝试。其余任何真实异常（网络错误/校验失败等）才需要走FAILED归档路径。
+    if (error.code !== 'BACKFILL_BATCH_STATE_CONFLICT') {
+      const failGuard = await pool.query(`UPDATE historical_validation.backfill_batches SET status='FAILED', error_code=$2, finished_at=now() WHERE backfill_batch_id=$1 AND status='RUNNING'`, [backfillBatchId, error.code || error.message]);
+      if (failGuard.rowCount !== 1) {
+        // 该行在真正的失败发生前就已经离开RUNNING状态（理论上不应该发生，单线程调用下没有已知触发路径）——
+        // 不伪造一个新的"归档成功"假象，也不生成一个掩盖原始异常的新错误，只标记后原样抛出原始异常。
+        error.auditRowUnchanged = true;
+      }
+    }
     throw error;
   }
 }

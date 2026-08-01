@@ -174,12 +174,18 @@ async function markValidationRunFailed({ pool, validationRunId, error, failureCo
     code: error.code || null,
     at: new Date().toISOString()
   };
-  await pool.query(
+  const failGuard = await pool.query(
     `UPDATE historical_validation.validation_runs
      SET status='FAILED', error_code=$2, blocked_reasons=blocked_reasons || $3::jsonb, finished_at=now()
      WHERE validation_run_id=$1 AND status='RUNNING'`,
     [validationRunId, error.code || reason.phase || 'UNHANDLED_EXCEPTION', JSON.stringify([reason])]
   );
+  // R11.4防御性核验：受影响行数不为1说明该行在真正失败发生前就已经离开RUNNING状态（单线程调用下
+  // 没有已知触发路径，属于纵深防御）——不伪造"已归档"的假象，标记后交由调用方（runWalkForward的
+  // catch块）连同原始异常一并处理，本函数自身不吞掉/替换调用方传入的原始error。
+  if (failGuard.rowCount !== 1) {
+    error.auditRowUnchanged = true;
+  }
 }
 
 // P0-1修复（独立复审）：真正的断点续跑——此前的实现在--resume时会把[from,to)整个区间重新枚举、重新调用
@@ -413,9 +419,23 @@ export async function runWalkForward(options) {
         ...(options.validationEnd !== undefined && options.validationEnd !== null ? { validationEndUtc: options.validationEnd } : {})
       };
 
-  const { effective, validationRunId } = await buildEffectiveOptions({
+  const { effective, originalRun, validationRunId } = await buildEffectiveOptions({
     pool, resumeValidationRunId, explicitParams: effectiveExplicitParams, splitRatio, weightVersion, evaluationVersion
   });
+
+  // R11.4修复：--resume只能作用于真正仍处于RUNNING的validation_run。此前buildEffectiveOptions只是
+  // 加载原run参数供合并使用，从未检查其status——若原run已到达任一终态（SUCCEEDED/FAILED，以及
+  // migration 005 CHECK约束允许但当前代码从未写入的PARTIAL），resume仍会继续往下走到manifest gate/
+  // 版本一致性校验/生成/评估/报告等步骤；一旦manifest gate此后失败（数据集漂移/规则版本升级/内容损坏
+  // 等任何原因），第449行会把这个本已终结的run静默改写为FAILED，破坏终态不可变红线（R11.4）。
+  // 检查必须发生在manifest gate/checkResumeVersionConsistency/任何INSERT或UPDATE之前——本函数此处
+  // 是buildEffectiveOptions返回后的第一个语句，之后才第一次触碰originalRun以外的任何状态。
+  if (resumeValidationRunId && originalRun.status !== 'RUNNING') {
+    throw Object.assign(
+      new Error(`--resume validation_run ${resumeValidationRunId} is already in terminal state ${originalRun.status}; refusing to reprocess a finished run`),
+      { code: 'RESUME_VALIDATION_RUN_ALREADY_TERMINAL', currentStatus: originalRun.status }
+    );
+  }
 
   // P1-A修复（独立复审第二轮）：resume时weight_version/evaluation_version必须与本run已有snapshot/outcome
   // 实际记录的版本一致（若尚无历史数据则允许本次显式提供的值）——发生在manifest gate、任何INSERT、
@@ -445,10 +465,16 @@ export async function runWalkForward(options) {
     manifestVerification = await runManifestGate({ pool, datasetVersion: effective.datasetVersion });
   } catch (error) {
     if (resumeValidationRunId) {
-      await pool.query(
-        `UPDATE historical_validation.validation_runs SET status='FAILED', error_code=$2, finished_at=now() WHERE validation_run_id=$1`,
+      // 防御性条件更新：上方R11.4检查已确认进入此处时originalRun.status==='RUNNING'，此处再加
+      // AND status='RUNNING'防止两次读取之间出现竞态窗口下的二次覆盖；受影响行数不为1时不伪造
+      // "已归档为FAILED"的假象，只标记后原样抛出原始的manifest校验异常，不生成掩盖它的新错误。
+      const failGuard = await pool.query(
+        `UPDATE historical_validation.validation_runs SET status='FAILED', error_code=$2, finished_at=now() WHERE validation_run_id=$1 AND status='RUNNING'`,
         [resumeValidationRunId, error.code || 'MANIFEST_VERIFICATION_FAILED']
       );
+      if (failGuard.rowCount !== 1) {
+        error.auditRowUnchanged = true;
+      }
     }
     throw error;
   }
@@ -619,9 +645,16 @@ export async function runWalkForward(options) {
     // 其余三种组合（new-task非dry-run/resume非dry-run/new-task dry-run）都需要在成功完成后转为SUCCEEDED——
     // AND status='RUNNING'是防御性写法，避免对已经处于终态的行做无意义的原地更新。
     if (!(resumeValidationRunId && dryRun)) {
-      await pool.query(`UPDATE historical_validation.validation_runs SET status='SUCCEEDED', finished_at=now() WHERE validation_run_id=$1 AND status='RUNNING'`, [validationRunId]);
+      const successGuard = await pool.query(`UPDATE historical_validation.validation_runs SET status='SUCCEEDED', finished_at=now() WHERE validation_run_id=$1 AND status='RUNNING'`, [validationRunId]);
+      if (successGuard.rowCount !== 1) {
+        throw Object.assign(new Error(`validation_run ${validationRunId} status changed concurrently while recording SUCCEEDED result`), { code: 'VALIDATION_RUN_STATE_CONFLICT' });
+      }
     }
   } catch (error) {
+    // VALIDATION_RUN_STATE_CONFLICT已经证明该行不再处于RUNNING（上面的防御性条件更新0行命中），
+    // 该行本身未被本次调用触碰，不需要（也不应该）再尝试markValidationRunFailed对它做多余的
+    // 条件更新尝试。其余任何真实异常（manifest gate之后的生成/评估/报告阶段失败）才需要归档为FAILED。
+    if (error.code === 'VALIDATION_RUN_STATE_CONFLICT') throw error;
     try {
       await markValidationRunFailed({ pool, validationRunId, error, failureContext });
     } catch (updateError) {
