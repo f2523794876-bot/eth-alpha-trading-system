@@ -23,6 +23,9 @@ class MockStorage{
 }
 function entry(id,extra=''){return{id:'D-'+id,timestamp:id,price:1000+id,state:'RANGE_CHOP',htfState:'HTF_RANGE',mtfState:'RANGE_CHOP',signalPermission:{},worthBetting:false,supportingEvidence:[],opposingEvidence:[],dataHealth:'normal',pad:extra};}
 function bigEntry(id,bytes){return entry(id,'x'.repeat(bytes));}
+// V1.1增强日志条目的完整字段形状（logsHtml()真实渲染所需），供预置ethAlphaDecisionLogsV11场景使用，
+// 与C.buildEnhancedLogEntry()产出的真实结构对齐，而不是简化后的V1 entry()。
+function v11Entry(id){return{id:'D-'+id,timestamp:id,source:'Binance',marketType:'现货',ethPrice:2000+id,btcPrice:60000,htfState:'HTF_RANGE',mtfState:'RANGE_CHOP',ltfState:'RANGE_CHOP',previousState:'RANGE_CHOP',newState:'RANGE_CHOP',changeReason:'测试固定治具',opportunityScores:{long:10,short:5},advice:'观察',supportingEvidence:[],opposingEvidence:[],longMissing:[],shortMissing:[]};}
 
 // ===========================================================================
 // 1. 正常追加日志
@@ -272,6 +275,53 @@ test('11c-清除日志按钮只清两个决策日志key并刷新状态显示',()
   assert.equal(s.getItem('ethAlphaDecisionLogsV11'),null);
   assert.equal(s.getItem('ethAlphaRiskSettings'),'{"capital":10000}');
   assert.match(d.nodes.decisionLogStatus.textContent,/暂无记录/);
+});
+
+// ===========================================================================
+// 12. Codex独立复审REQUEST_CHANGES修复验证：页面初始化（未发生任何本次保存）时，
+//    状态栏必须直接读取localStorage中两个key已有的真实合法数组长度，而不是一直显示
+//    "暂无记录"直到下一次保存发生。
+// ===========================================================================
+test('12a-页面初始化前预置两个日志key：未调用renderDashboard，状态栏直接显示真实数量',()=>{
+  const s=new MockStorage({
+    ethAlphaDecisionLogs:JSON.stringify([entry(1),entry(2),entry(3)]),
+    ethAlphaDecisionLogsV11:JSON.stringify([v11Entry(1),v11Entry(2),v11Entry(3),v11Entry(4),v11Entry(5)])
+  });
+  const before={v1:s.getItem('ethAlphaDecisionLogs'),v11:s.getItem('ethAlphaDecisionLogsV11')};
+  const d=fakeDomForStorageTests(s); // 仅初始化，不调用d.window.renderDashboard(...)
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1：已保存 3 条/,'必须直接反映localStorage中已有的V1日志真实条数');
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1\.1：已保存 5 条/,'必须直接反映localStorage中已有的V1.1日志真实条数');
+  assert.equal(s.getItem('ethAlphaDecisionLogs'),before.v1,'初始化过程只读，不得修改任何localStorage内容');
+  assert.equal(s.getItem('ethAlphaDecisionLogsV11'),before.v11,'初始化过程只读，不得修改任何localStorage内容');
+});
+test('12b-没有任何日志时初始化应显示暂无记录而非报错',()=>{
+  const s=new MockStorage();
+  const d=fakeDomForStorageTests(s);
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1：暂无记录/);
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1\.1：暂无记录/);
+});
+test('12c-一个key损坏、另一个正常时初始化不崩溃：正常key显示真实数量，损坏key显示安全状态',()=>{
+  const s=new MockStorage({
+    ethAlphaDecisionLogs:'{this is not valid json[[[',
+    ethAlphaDecisionLogsV11:JSON.stringify([v11Entry(1),v11Entry(2),v11Entry(3),v11Entry(4)])
+  });
+  let d;
+  assert.doesNotThrow(()=>{d=fakeDomForStorageTests(s);},'损坏的日志key不得导致页面初始化崩溃');
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1：⚠ 历史记录读取异常/,'损坏的V1必须显示安全状态提示，而不是抛错或显示错误数量');
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1\.1：已保存 4 条/,'未损坏的V1.1必须继续显示真实数量');
+  assert.equal(s.getItem('ethAlphaDecisionLogs'),'{this is not valid json[[[','只读展示不得改写或清除损坏的原始内容');
+  assert.equal(JSON.parse(s.getItem('ethAlphaDecisionLogsV11')).length,4,'正常key的内容不得被初始化过程改变');
+});
+test('12e-初始化后发生一次真实保存，状态栏从"真实历史数量"正确过渡到"本次保存结果"',()=>{
+  const s=new MockStorage({
+    ethAlphaDecisionLogs:JSON.stringify([entry(1),entry(2)]),
+    ethAlphaDecisionLogsV11:JSON.stringify([v11Entry(1),v11Entry(2)])
+  });
+  const d=fakeDomForStorageTests(s);
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1：已保存 2 条/);
+  const success={...C.buildDecision({tf15m:[],tf1h:[],tf4h:[]},{tf15m:[],tf1h:[],tf4h:[]},{ethPrice:3000,btcPrice:60000,recentHigh:3100,recentLow:2900,high20:3200,low20:2800}),isManual:false,dataHealth:'normal',updatedAt:Date.now()};
+  d.window.renderDashboard(success);
+  assert.match(d.nodes.decisionLogStatus.textContent,/V1：已保存 3 条/,'保存后必须反映本次保存后的真实条数');
 });
 
 process.on('beforeExit',()=>{process.stdout.write(`\nRESULT passed=${passed} failed=${failed}\n`);if(failed)process.exitCode=1;});
