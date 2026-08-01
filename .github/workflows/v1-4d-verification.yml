@@ -1,0 +1,42 @@
+name: V1.4D verification bundle
+
+on:
+  pull_request:
+    paths:
+      - 'server/**'
+      - '.github/workflows/v1-4d-verification.yml'
+      - 'V1_4D_*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - working-directory: server
+        run: npm ci
+      - name: Run lightweight offline V1.4D verification
+        working-directory: server
+        run: npm run verify:v1.4d -- --offline-only --lightweight
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1-4d-verification
+          path: |
+            server/v1-4d-verification-report.json
+            server/v1-4d-verification-report.md
+            server/v1-4d-postgres-validation-results.json
+            server/v1-4d-research-scorecard*.json
+            server/v1-4d-research-scorecard*.md
+          if-no-files-found: warn

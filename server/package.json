@@ -27,6 +27,9 @@
     "backfill:market-bars": "node src/backfill/backfill-cli-entry.js",
     "dataset:build-manifest": "node src/validation-replay/dataset-manifest-cli-entry.js",
     "validation:walk-forward": "node src/validation-replay/cli-entry.js",
+    "verify:v1.4d": "node scripts/verify-v1-4d.mjs",
+    "scorecard:v1.4d": "node scripts/v1-4d-scorecard-cli.mjs",
+    "test:verification-bundle": "node --test src/validation-replay/research-scorecard.test.js scripts/v1-4d-scorecard-cli.test.mjs",
     "check": "node --check src/index.js && node --test tests/*.test.js tests/forecast/*.test.js"
   },
   "dependencies": { "pg": "^8.16.3" }
