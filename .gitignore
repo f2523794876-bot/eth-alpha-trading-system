@@ -1,1 +1,6 @@
 claude-eth-architecture.tar.gz
+server/v1-4d-verification-report.json
+server/v1-4d-verification-report.md
+server/v1-4d-postgres-validation-results.json
+server/v1-4d-research-scorecard*.json
+server/v1-4d-research-scorecard*.md
