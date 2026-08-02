@@ -23,6 +23,7 @@
     "test:postgres:v1.4c-lifecycle": "node --test tests/postgres/v1-4c-lifecycle.integration.test.js",
     "maintenance:health": "node src/maintenance/cleanup-health.js",
     "features:generate": "node src/features/generate-features.js",
+    "features:backfill-historical": "node src/features/historical-feature-backfill-cli.js",
     "features:serve": "node src/features/generator-service-entry.js",
     "backfill:market-bars": "node src/backfill/backfill-cli-entry.js",
     "dataset:build-manifest": "node src/validation-replay/dataset-manifest-cli-entry.js",

@@ -37,6 +37,16 @@ export function computeFeatureValues(input){
   return {...eth15,...derivatives,btcReturn:btc15.logReturn1,btcTrendState:btc15.trend,btcVolatility:btc15.realizedVolatility,ethBtcReturnSpread:Number.isFinite(eth15.logReturn1)&&Number.isFinite(btc15.logReturn1)?eth15.logReturn1-btc15.logReturn1:null,ethBtcRollingCorrelation:pearson(ethReturns,btcReturns),btcConflictState:eth15.trend&&btc15.trend&&eth15.trend!==btc15.trend?'CONFLICT':'ALIGNED',trend15m:eth15.trend,trend1h:eth1.trend,trend4h:eth4.trend,multiTimeframeAlignment:allSame?alignment[0]:'MIXED',multiTimeframeConflict:conflict,strategicRegime:eth4.trend};
 }
 
+// Authoritative market-bar inputs actually consumed by computeFeatureValues.
+// Keep historical tooling coupled to this declaration rather than duplicating a
+// broader, speculative BTC dependency list.
+export const FEATURE_BAR_DEPENDENCIES = Object.freeze([
+  Object.freeze({key:'eth15',symbol:'ETHUSDT',marketType:'spot',interval:'15m',minimumBars:30}),
+  Object.freeze({key:'eth1h',symbol:'ETHUSDT',marketType:'spot',interval:'1h',minimumBars:21}),
+  Object.freeze({key:'eth4h',symbol:'ETHUSDT',marketType:'spot',interval:'4h',minimumBars:21}),
+  Object.freeze({key:'btc15',symbol:'BTCUSDT',marketType:'spot',interval:'15m',minimumBars:30})
+]);
+
 export function generateFeatureRecord(input,{now=Date.now}={}){
   const targetInterval=input.targetInterval||'15m',targetKey=targetInterval==='15m'?'eth15':targetInterval==='1h'?'eth1h':'eth4h',target=sorted(input[targetKey]||[]).at(-1);const asOfTime=input.asOfTime??target?.closeTime;const allRows=[...(input.eth15||[]),...(input.eth1h||[]),...(input.eth4h||[]),...(input.btc15||[]),...(input.btc1h||[]),...(input.btc4h||[]),...(input.funding||[]),...(input.openInterest||[]),...(input.longShort||[]),...(input.takerFlow||[])];
   if(!target)throw Object.assign(new Error('Critical ETH 15m window missing'),{code:'CRITICAL_ETH_WINDOW_INSUFFICIENT'});
@@ -54,6 +64,6 @@ export class FeatureEngine{
   }
   async generateRange({symbol='ETHUSDT',targetInterval='15m',from,to,featureSetVersion=FEATURE_SET_VERSION,dryRun=false,resumeAfter=null},lease){
     const targets=await this.repository.listFeatureTargets({symbol,targetInterval,from,to,resumeAfter});const runId=randomUUID();if(!dryRun)await this.repository.startFeatureRun?.({runId,symbol,targetInterval,from,to,featureSetVersion,startedAt:this.now()},lease);const results=[];
-    try{for(const target of targets)results.push(await this.generatePoint({symbol,targetInterval,targetBarCloseTime:Number(target.closeTime),featureSetVersion,dryRun},lease));if(!dryRun)await this.repository.finishFeatureRun?.(runId,{status:'SUCCEEDED',results,cursorCloseTime:targets.at(-1)?.closeTime},lease);return{runId,status:dryRun?'DRY_RUN':'SUCCEEDED',results};}catch(error){if(!dryRun)await this.repository.finishFeatureRun?.(runId,{status:'FAILED',errorCode:error.code||'FEATURE_GENERATION_FAILED',results},lease);throw error;}
+    try{for(const target of targets){const historicalAsOfTime=Number(target.closeTime);results.push(await this.generatePoint({symbol,targetInterval,targetBarCloseTime:historicalAsOfTime,asOfTime:historicalAsOfTime,featureSetVersion,dryRun},lease));}if(!dryRun)await this.repository.finishFeatureRun?.(runId,{status:'SUCCEEDED',results,cursorCloseTime:targets.at(-1)?.closeTime},lease);return{runId,status:dryRun?'DRY_RUN':'SUCCEEDED',results};}catch(error){if(!dryRun)await this.repository.finishFeatureRun?.(runId,{status:'FAILED',errorCode:error.code||'FEATURE_GENERATION_FAILED',results},lease);throw error;}
   }
 }

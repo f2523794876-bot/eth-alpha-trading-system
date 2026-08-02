@@ -48,11 +48,10 @@ function buildAuxiliaryConflictNotes(proxyState, auxiliaryEvidence) {
   return notes;
 }
 
-// feature_records.as_of_time 对已经真实运行过的历史时段而言就是当时的真实系统时间（生产FeatureGeneratorService
-// 实时写入，不是回填产物），不存在market_bars.available_at那种"回填执行时间"悖论，故直接用真实pool查询，
-// 不经research-availability queryable包装；不做重试等待（生产waitForExactFeature的重试是为应对实时竞态，
-// 回放数据是静态历史，一次未命中即fail closed，见V1_4D_CODEX_IMPLEMENTATION_TASK.md任务边界）。
-async function findExactFeatureForReplay(pool, { instrument, targetBarCloseTime, historicalAsOfTime }) {
+// feature_records.as_of_time 对实时生成记录和经过manifest校验的历史feature backfill记录均是其精确
+// reference time，不是回填执行墙钟；因此可直接按as_of_time做精确只读消费，不复用market-bar查询包装。
+// 不做重试等待（生产waitForExactFeature的重试是为应对实时竞态，历史回放数据是静态的）。
+export async function findExactFeatureForReplay(pool, { instrument, targetBarCloseTime, historicalAsOfTime }) {
   const result = await pool.query(
     `SELECT feature_record_id, feature_values, quality_state, completeness FROM feature_records
      WHERE symbol=$1 AND target_interval='15m' AND target_bar_close_time=to_timestamp($2/1000.0)
