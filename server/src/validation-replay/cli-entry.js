@@ -8,6 +8,7 @@
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from '../config.js';
 import { createPgPool } from '../db/postgres.js';
+import { createGuardedResearchPgPool } from '../db/research-database-guard.js';
 import { parseUtc } from '../backfill/backfill-cli-entry.js';
 import { rhythmBoundaryMs, computeAlignedReferenceCloseTime } from '../forecast/bar-path-locator.js';
 import { verifyDatasetManifest } from './dataset-manifest-verifier.js';
@@ -701,7 +702,7 @@ export function validateCliArgsBeforeDbAccess({ args, resumeId }) {
   }
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), { createPgPool: createPgPoolOverride = createPgPool } = {}) {
   // §4.1：启动横幅必须是本次CLI调用stdout的第一行，且无论后续参数校验是否通过都必须打印
   // （"每次启动"，不是"校验通过后才启动"）——因此place在main()最开头，先于parseArgs/任何校验/任何DB连接。
   console.info(STARTUP_BANNER);
@@ -730,7 +731,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (args['validation-end'] !== undefined) explicitParams.validationEndUtc = parseUtc(args['validation-end'], '--validation-end');
 
   const config = loadConfig();
-  const pool = await createPgPool(config);
+  const pool = await createGuardedResearchPgPool(config, { createPgPool: createPgPoolOverride });
   try {
     const plan = await runWalkForward({
       pool, dryRun: Boolean(args['dry-run']), resumeValidationRunId: typeof resumeId === 'string' ? resumeId : null,

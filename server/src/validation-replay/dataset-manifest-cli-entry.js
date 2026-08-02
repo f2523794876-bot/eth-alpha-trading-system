@@ -4,6 +4,7 @@
 
 import { loadConfig } from '../config.js';
 import { createPgPool } from '../db/postgres.js';
+import { createGuardedResearchPgPool } from '../db/research-database-guard.js';
 import { parseUtc } from '../backfill/backfill-cli-entry.js';
 import { buildDatasetManifest } from './dataset-manifest-builder.js';
 
@@ -20,7 +21,7 @@ export function parseArgs(argv) {
   return args;
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), { createPgPool: createPgPoolOverride = createPgPool } = {}) {
   const args = parseArgs(argv);
   const symbol = args.symbol;
   const intervals = String(args.intervals || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -29,7 +30,7 @@ export async function main(argv = process.argv.slice(2)) {
   if (!symbol || !intervals.length) throw Object.assign(new Error('--symbol and --intervals are required'), { code: 'MISSING_REQUIRED_ARG' });
 
   const config = loadConfig();
-  const pool = await createPgPool(config);
+  const pool = await createGuardedResearchPgPool(config, { createPgPool: createPgPoolOverride });
   try {
     const result = await buildDatasetManifest({ pool, symbol, intervals, from, to });
     if (result.status === 'REJECTED') {

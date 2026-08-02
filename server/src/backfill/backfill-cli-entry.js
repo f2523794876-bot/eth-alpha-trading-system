@@ -7,6 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from '../config.js';
 import { createPgPool } from '../db/postgres.js';
+import { createGuardedResearchPgPool } from '../db/research-database-guard.js';
 import { PublicHttpClient } from '../http/client.js';
 import { BinancePublicAdapter } from '../sources/binance.js';
 import { backfillInterval } from './binance-kline-backfill.js';
@@ -140,7 +141,7 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
   }
 }
 
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), { createPgPool: createPgPoolOverride = createPgPool } = {}) {
   const args = parseArgs(argv);
   const symbol = args.symbol;
   const intervals = String(args.intervals || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -162,7 +163,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   const config = loadConfig();
-  const pool = await createPgPool(config);
+  const pool = await createGuardedResearchPgPool(config, { createPgPool: createPgPoolOverride });
   const client = new PublicHttpClient(config);
   const adapter = new BinancePublicAdapter({ client, spotBaseUrl: config.spotBaseUrl, futuresBaseUrl: config.futuresBaseUrl });
   try {
