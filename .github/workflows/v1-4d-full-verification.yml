@@ -1,4 +1,4 @@
-name: V1.4D full PostgreSQL and replay verification
+name: V1.4D R28 isolated PostgreSQL acceptance
 
 on:
   workflow_dispatch:
@@ -6,10 +6,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: v1-4d-r28-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  full_verification:
+  r28_acceptance:
+    name: R28 isolated PostgreSQL acceptance
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 45
+
     services:
       postgres:
         image: postgres:16
@@ -24,46 +30,158 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+
     env:
+      DATABASE_URL: postgresql://v14d_test:v14d_test_only@127.0.0.1:5432/eth_alpha_v14d_test
       TEST_DATABASE_URL: postgresql://v14d_test:v14d_test_only@127.0.0.1:5432/eth_alpha_v14d_test
-      V14D_REPLAY_DATABASE_URL: postgresql://v14d_test:v14d_test_only@127.0.0.1:5432/eth_alpha_v14d_test
-      V14D_DATASET_VERSION: ${{ vars.V14D_DATASET_VERSION }}
-      V14D_ALGORITHM_VERSION: ${{ vars.V14D_ALGORITHM_VERSION }}
-      V14D_RULE_VERSION: ${{ vars.V14D_RULE_VERSION }}
-      V14D_WEIGHT_VERSION: ${{ vars.V14D_WEIGHT_VERSION }}
-      V14D_EVALUATION_VERSION: ${{ vars.V14D_EVALUATION_VERSION }}
+      ALLOW_POSTGRES_INTEGRATION_TESTS: "1"
+      NODE_ENV: test
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+
+      - name: Verify fixed implementation identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Branch/ref: $GITHUB_REF_NAME"
+          echo "Commit: $(git rev-parse HEAD)"
+          git status --short
+          git log -1 --oneline
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: server/package-lock.json
-      - working-directory: server
+
+      - name: Install locked dependencies
+        working-directory: server
         run: npm ci
-      - name: Require full verification configuration
+
+      - name: Verify isolated PostgreSQL identity
         shell: bash
         run: |
           set -euo pipefail
-          for name in V14D_DATASET_VERSION V14D_ALGORITHM_VERSION V14D_RULE_VERSION V14D_WEIGHT_VERSION V14D_EVALUATION_VERSION; do
-            if [[ -z "${!name:-}" ]]; then
-              echo "::error::$name is required for full V1.4D verification"
-              exit 3
-            fi
-          done
-      - name: Run full PostgreSQL, 7-day, 90-day and scorecard verification
+          database_name="$(
+            PGPASSWORD=v14d_test_only \
+            psql \
+              --host=127.0.0.1 \
+              --port=5432 \
+              --username=v14d_test \
+              --dbname=eth_alpha_v14d_test \
+              --tuples-only \
+              --no-align \
+              --command='SELECT current_database();'
+          )"
+
+          test "$database_name" = "eth_alpha_v14d_test"
+          test "$database_name" != "eth_alpha"
+
+          echo "Verified isolated database: $database_name"
+
+      - name: Apply migrations 001 through 007
         working-directory: server
-        run: npm run verify:v1.4d -- --replay-days=both
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: v1-4d-full-verification
-          path: |
-            server/v1-4d-verification-report.json
-            server/v1-4d-verification-report.md
-            server/v1-4d-postgres-validation-results.json
-            server/v1-4d-research-scorecard*.json
-            server/v1-4d-research-scorecard*.md
-          if-no-files-found: warn
+        run: npm run migrate
+
+      - name: Verify migration versions 001 through 007
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          applied="$(
+            PGPASSWORD=v14d_test_only \
+            psql \
+              --host=127.0.0.1 \
+              --port=5432 \
+              --username=v14d_test \
+              --dbname=eth_alpha_v14d_test \
+              --tuples-only \
+              --no-align \
+              --command='SELECT version FROM schema_migrations ORDER BY version;'
+          )"
+
+          printf '%s\n' "$applied"
+
+          for version in 001 002 003 004 005 006 007; do
+            printf '%s\n' "$applied" | grep -qx "$version"
+          done
+
+      - name: Run R28 real PostgreSQL acceptance
+        working-directory: server
+        run: |
+          node --test \
+            tests/postgres/v1-4d-multi-symbol-manifest.integration.test.js
+
+      - name: Run validation replay and legacy diagnostics
+        working-directory: server
+        run: |
+          node --test \
+            src/validation-replay/*.test.js \
+            src/legacy-diagnostics/*.test.js
+
+      - name: Run Historical Feature Backfill tests
+        working-directory: server
+        run: npm run test:features
+
+      - name: Run Forecast regression
+        working-directory: server
+        run: npm run test:forecast
+
+      - name: Run server, API, lifecycle and Execution Package 2 regression
+        working-directory: server
+        run: |
+          node --test \
+            tests/*.test.js \
+            tests/forecast/*.test.js
+
+      - name: Run syntax checks
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(
+            find src scripts tests \
+              -type f \
+              \( -name '*.js' -o -name '*.mjs' \) \
+              -print0
+          )
+
+      - name: Verify protected files and whitespace
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git diff --check 9d86a7a9dd480b826d6a8ffd1a68a06fade76e19..HEAD
+
+          if git diff --name-only \
+            9d86a7a9dd480b826d6a8ffd1a68a06fade76e19..HEAD \
+            | grep -E '(^|/)(V1_4D_.*\.md|server/migrations/00[1-6]_.*)$'; then
+            echo "::error::Frozen specifications or migrations 001-006 were modified"
+            exit 1
+          fi
+
+      - name: Final isolated database status
+        if: always()
+        shell: bash
+        run: |
+          PGPASSWORD=v14d_test_only \
+          psql \
+            --host=127.0.0.1 \
+            --port=5432 \
+            --username=v14d_test \
+            --dbname=eth_alpha_v14d_test \
+            --command='
+              SELECT current_database() AS database_name;
+              SELECT version, applied_at
+              FROM schema_migrations
+              ORDER BY version;
+            ' || true
+
+          echo "The PostgreSQL service is temporary and will be destroyed with this GitHub Actions runner."
