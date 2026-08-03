@@ -1,7 +1,8 @@
-name: V1.4D R28 isolated PostgreSQL acceptance
-
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - codex/v1.4d-multi-symbol-manifest-implementation
 
 permissions:
   contents: read
