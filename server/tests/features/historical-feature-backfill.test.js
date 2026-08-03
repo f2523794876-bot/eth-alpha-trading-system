@@ -7,7 +7,7 @@ import { PostgresRepository } from '../../src/db/postgres.js';
 import { FeatureEngine } from '../../src/features/feature-engine.js';
 import { FEATURE_ALGORITHM_VERSION, FEATURE_SET_VERSION } from '../../src/features/feature-version.js';
 import { enumerateHistoricalFeaturePoints, exitCodeForHistoricalBackfill, runHistoricalFeatureBackfill, validateHistoricalBackfillOptions, validateHistoricalFeatureInputs } from '../../src/features/historical-feature-backfill.js';
-import { parseHistoricalBackfillArgs, sanitizeHistoricalBackfillError } from '../../src/features/historical-feature-backfill-cli.js';
+import { parseHistoricalBackfillArgs, sanitizeHistoricalBackfillError, main } from '../../src/features/historical-feature-backfill-cli.js';
 import { enumerateRhythmPoints } from '../../src/validation-replay/cli-entry.js';
 
 const START=Date.parse('2026-07-22T00:00:00.000Z'),REF=START+4*3600_000-1,EXEC=Date.parse('2026-08-01T00:00:00.000Z'),DATASET=`v1.4d-sha256-${'a'.repeat(64)}`;
@@ -30,3 +30,53 @@ test('重复或乱序bar不会被排序掩盖',async()=>{const repo=seededRepo()
 test('正式写入可安全重跑：一致记录ALREADY_PRESENT，内容/vintage冲突不覆盖',async()=>{const repo=seededRepo(),first=await runHistoricalFeatureBackfill({repository:repo,options:options(),executionTime:EXEC});assert.equal(first.generatedPoints,1);const originalHash=repo.featureRecords[0].contentHash;const second=await runHistoricalFeatureBackfill({repository:repo,options:options(),executionTime:EXEC+1});assert.equal(second.alreadyPresent,1);assert.equal(repo.featureRecords.length,1);repo.bars.find(x=>x.instrument==='ETHUSDT'&&x.interval==='15m'&&x.closeTime===REF).close='9999';repo.bars.find(x=>x.instrument==='ETHUSDT'&&x.interval==='15m'&&x.closeTime===REF).contentHash=sha256('changed');await assert.rejects(()=>runHistoricalFeatureBackfill({repository:repo,options:options(),executionTime:EXEC+2}),e=>e.code==='HISTORICAL_FEATURE_CONFLICT');assert.equal(repo.featureRecords.length,1);assert.equal(repo.featureRecords[0].contentHash,originalHash);});
 test('CLI参数、退出码和敏感连接目标契约明确',()=>{const parsed=parseHistoricalBackfillArgs(['--symbol','ETHUSDT','--from',new Date(REF).toISOString(),'--to',new Date(REF+1).toISOString(),'--interval','15m','--feature-version',FEATURE_SET_VERSION,'--algorithm-version',FEATURE_ALGORITHM_VERSION,'--dataset-version',DATASET,'--dry-run','--batch-size','5']);assert.equal(parsed.dryRun,true);assert.equal(parsed.batchSize,5);assert.equal(exitCodeForHistoricalBackfill(),0);assert.equal(exitCodeForHistoricalBackfill({code:'INVALID_ARGUMENT'}),2);assert.equal(exitCodeForHistoricalBackfill({code:'INPUT_WINDOW_INCOMPLETE'}),3);assert.equal(exitCodeForHistoricalBackfill({code:'HISTORICAL_FEATURE_CONFLICT'}),4);assert.equal(exitCodeForHistoricalBackfill({code:'08006'}),5);assert.equal(exitCodeForHistoricalBackfill({code:'DATABASE_URL_REQUIRED'}),5);const redacted=sanitizeHistoricalBackfillError('postgresql://alice:secret@db/x password=hunter2 token=abc');assert.doesNotMatch(redacted,/alice|secret|hunter2|abc/);});
 test('历史持久化路径物理独立于生产collector lease',async()=>{const source=await readFile(new URL('../../src/db/postgres.js',import.meta.url),'utf8'),section=source.slice(source.indexOf('async historicalFeatureTransaction'),source.indexOf('async listFeatureTargets'));assert.doesNotMatch(section,/collector_leases|assertLease|acquireLease|releaseLease/);assert.match(section,/BEGIN/);assert.match(section,/ROLLBACK/);});
+
+// 回归测试：main()改为委托research-database-guard.js之后，既有的TEST_DATABASE_URL契约（只读TEST_DATABASE_URL、
+// 不接受通用DATABASE_URL回退、格式/库名/身份校验、对应错误码）必须逐条保持不变。createPgPool通过main()
+// 既有的options对象新增的可选createPgPool字段注入，不需要真实PostgreSQL，且不修改main()的CLI参数/环境变量约定。
+const VALID_ARGV = ['--symbol', 'ETHUSDT', '--from', new Date(START).toISOString(), '--to', new Date(START + 4 * 3600_000).toISOString(), '--interval', '15m', '--feature-version', FEATURE_SET_VERSION, '--algorithm-version', FEATURE_ALGORITHM_VERSION, '--dataset-version', DATASET, '--dry-run'];
+
+test('main()（回归）：缺失TEST_DATABASE_URL时DATABASE_URL_REQUIRED，且从不建立数据库连接', async () => {
+  let called = false;
+  const exitCode = await main(VALID_ARGV, {}, { stdout: () => {}, stderr: () => {}, createPgPool: async () => { called = true; return { query: async () => ({ rows: [] }), end: async () => {} }; } });
+  assert.equal(exitCode, 5);
+  assert.equal(called, false);
+});
+
+test('main()（回归）：TEST_DATABASE_URL格式非法时拒绝，不建立连接', async () => {
+  let called = false;
+  const exitCode = await main(VALID_ARGV, { TEST_DATABASE_URL: 'not-a-url' }, { stdout: () => {}, stderr: () => {}, createPgPool: async () => { called = true; return { query: async () => ({ rows: [] }), end: async () => {} }; } });
+  assert.equal(exitCode, 5);
+  assert.equal(called, false);
+});
+
+test('main()（回归）：TEST_DATABASE_URL指向生产eth_alpha时拒绝，从不建立数据库连接', async () => {
+  let called = false;
+  const exitCode = await main(VALID_ARGV, { TEST_DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/eth_alpha' }, { stdout: () => {}, stderr: () => {}, createPgPool: async () => { called = true; return { query: async () => ({ rows: [] }), end: async () => {} }; } });
+  assert.equal(exitCode, 5);
+  assert.equal(called, false);
+});
+
+test('main()（回归）：TEST_DATABASE_URL指向eth_alpha_v14d_test但current_database()返回其他库名时拒绝，且关闭连接、只发起一次身份核验查询', async () => {
+  const calls = { query: 0, end: 0 };
+  const pool = { async query() { calls.query += 1; return { rows: [{ database: 'eth_alpha' }] }; }, async end() { calls.end += 1; } };
+  const exitCode = await main(VALID_ARGV, { TEST_DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/eth_alpha_v14d_test' }, { stdout: () => {}, stderr: () => {}, createPgPool: async () => pool });
+  assert.equal(exitCode, 5);
+  assert.equal(calls.query, 1);
+  assert.equal(calls.end, 1);
+});
+
+test('main()（回归）：TEST_DATABASE_URL指向eth_alpha_v14d_test且身份核验一致时，保护通过，真正越过guard进入回填业务逻辑（用哨兵错误证明）', async () => {
+  let queryCount = 0;
+  const pool = {
+    async query() {
+      queryCount += 1;
+      if (queryCount === 1) return { rows: [{ database: 'eth_alpha_v14d_test' }] };
+      throw Object.assign(new Error('SENTINEL_PAST_GUARD'), { code: 'SENTINEL_PAST_GUARD' });
+    },
+    async end() {}
+  };
+  const exitCode = await main(VALID_ARGV, { TEST_DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/eth_alpha_v14d_test' }, { stdout: () => {}, stderr: () => {}, createPgPool: async () => pool });
+  assert.notEqual(exitCode, 5, 'guard成功后不应报DATABASE_TARGET_REJECTED对应的退出码');
+  assert.ok(queryCount >= 2, 'guard通过后必须真的走到了业务查询（verifyHistoricalFeatureDataset），证明保护本身没有误伤正常路径');
+});

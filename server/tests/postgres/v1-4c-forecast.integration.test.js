@@ -12,7 +12,9 @@ import { computeFourHourAtr14, computeConsecutiveBreakoutBars } from '../../src/
 import { ForecastGenerator, LEASE_NAME } from '../../src/forecast/generator-service.js';
 import { ALGORITHM_VERSION } from '../../src/forecast/forecast-version.js';
 
-const url = process.env.TEST_DATABASE_URL, enabled = Boolean(url), pgtest = enabled ? test : test.skip;
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
+const url = process.env.TEST_DATABASE_URL, enabled = isPostgresIntegrationTestAuthorized(url), pgtest = enabled ? test : test.skip;
 const FOUR_HOUR_MS = 14400000;
 const END = 1_767_311_999_999; // P1-2修复后referenceBar须精确落在4H/UTC自然日边界，此锚点=2026-01-01T23:59:59.999Z同时满足两者（(END+1)%FOUR_HOUR_MS===0 且 (END+1)%ONE_DAY_MS===0）
 let pool, repo, seedLease, featureLease;

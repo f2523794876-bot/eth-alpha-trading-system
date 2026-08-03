@@ -15,8 +15,10 @@ import { runWalkForward, computeResumeCheckpoint, enumerateRhythmPoints } from '
 import { FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION } from '../../src/features/feature-version.js';
 import { sha256 } from '../../src/domain/hash.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 const FOUR_HOUR_MS = 14400000;
 const FIFTEEN_MIN_MS = 900000;
 

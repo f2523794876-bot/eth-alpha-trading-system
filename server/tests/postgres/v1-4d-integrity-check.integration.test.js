@@ -11,8 +11,10 @@ import { randomUUID } from 'node:crypto';
 import { checkIntegrity } from '../../src/backfill/integrity-check.js';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 const FIFTEEN_MIN_MS = 900000;
 
 function kline(openTime, closeTime, closeStr = '1000.00') {

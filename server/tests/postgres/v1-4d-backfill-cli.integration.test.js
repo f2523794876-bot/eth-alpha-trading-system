@@ -7,8 +7,10 @@ import { randomUUID } from 'node:crypto';
 import { runBackfillForInterval, main as backfillMain } from '../../src/backfill/backfill-cli-entry.js';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 
 function makeMockAdapter({ pages, serverTimeMs, calls }) {
   let call = 0;

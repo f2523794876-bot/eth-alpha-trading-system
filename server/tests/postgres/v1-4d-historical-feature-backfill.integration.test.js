@@ -7,10 +7,14 @@ import {normalizeFunding,normalizeKlines} from '../../src/domain/normalize.js';
 import {FEATURE_ALGORITHM_VERSION,FEATURE_SET_VERSION} from '../../src/features/feature-version.js';
 import {runHistoricalFeatureBackfill,validateHistoricalFeatureInputs} from '../../src/features/historical-feature-backfill.js';
 import {findExactFeatureForReplay} from '../../src/validation-replay/replay-generator.js';
+import {isPostgresIntegrationTestAuthorized} from './_pg-integration-gate.js';
 
 const isAllowedTestDatabaseName=name=>name==='eth_alpha_v14d_test'||/^eth_alpha_v14d_test_[a-z0-9_]+$/.test(name)||/^eth_alpha_v14d_round[a-z0-9_]*$/.test(name);
 function validateTestDatabaseUrl(value){if(!value)return{ok:false,errorCode:'TEST_DATABASE_URL_REQUIRED'};try{const parsed=new URL(value),databaseName=decodeURIComponent(parsed.pathname.slice(1)),expectedUser=decodeURIComponent(parsed.username);if(!['postgres:','postgresql:'].includes(parsed.protocol))return{ok:false,errorCode:'TEST_DATABASE_PROTOCOL_REJECTED'};if(!databaseName)return{ok:false,errorCode:'TEST_DATABASE_NAME_REQUIRED'};if(databaseName==='eth_alpha'||!isAllowedTestDatabaseName(databaseName))return{ok:false,errorCode:'TEST_DATABASE_NAME_REJECTED'};if(!expectedUser)return{ok:false,errorCode:'TEST_DATABASE_USER_REQUIRED'};return{ok:true,url:value,databaseName,expectedUser};}catch{return{ok:false,errorCode:'TEST_DATABASE_URL_INVALID'};}}
-const databaseGate=validateTestDatabaseUrl(process.env.TEST_DATABASE_URL),url=databaseGate.ok?databaseGate.url:null,enabled=databaseGate.ok,pgtest=enabled?test:test.skip;
+// Round 3（测试安全加固，Part 3）：本文件既有的validateTestDatabaseUrl/isAllowedTestDatabaseName检查
+// 继续保留、不削弱——这里只是在其基础上额外AND上第二重显式授权开关（ALLOW_POSTGRES_INTEGRATION_TESTS
+// 精确等于'1'且库名精确等于eth_alpha_v14d_test），两者都通过才视为enabled。
+const databaseGate=validateTestDatabaseUrl(process.env.TEST_DATABASE_URL),url=databaseGate.ok?databaseGate.url:null,enabled=databaseGate.ok&&isPostgresIntegrationTestAuthorized(url),pgtest=enabled?test:test.skip;
 const START=Date.parse('2025-02-03T00:00:00.000Z'),END=START+4*3600_000-1,EXEC=Date.parse('2025-03-01T00:00:00.000Z'),SOURCE='binance-spot-rest',ENDPOINT='binance-spot-klines',DATASET=`v1.4d-sha256-${'b'.repeat(64)}`,LEASE_NAME=`historical-feature-fixture-${process.pid}`,HOLDER_ID=`historical-feature-it-${process.pid}`;
 let pool,repo,lease;
 const rawPayloadIds=[];
