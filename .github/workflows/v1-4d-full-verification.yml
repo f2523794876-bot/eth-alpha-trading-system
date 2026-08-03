@@ -159,12 +159,29 @@ jobs:
         run: |
           set -euo pipefail
 
-          git diff --check 9d86a7a9dd480b826d6a8ffd1a68a06fade76e19..HEAD
+          patch_baseline=9d86a7a9dd480b826d6a8ffd1a68a06fade76e19
+          frozen_baseline=dc6e573cdbc5aece7b932ab1cbbbe3daa3623437
+          migration_baseline=9d86a7a9dd480b826d6a8ffd1a68a06fade76e19
+          frozen_files=(
+            V1_4D_DATA_BACKFILL_SPEC.md
+            V1_4D_HISTORICAL_REPLAY_SPEC.md
+            V1_4D_CODEX_IMPLEMENTATION_TASK.md
+            V1_4D_ACCEPTANCE_TESTS.md
+            V1_4D_ARCHITECTURE_REVIEW.md
+          )
+          protected_migrations=(':(glob)server/migrations/00[1-6]_*.sql')
 
-          if git diff --name-only \
-            9d86a7a9dd480b826d6a8ffd1a68a06fade76e19..HEAD \
-            | grep -E '(^|/)(V1_4D_.*\.md|server/migrations/00[1-6]_.*)$'; then
-            echo "::error::Frozen specifications or migrations 001-006 were modified"
+          git diff --check "$patch_baseline..HEAD"
+
+          if ! git diff --quiet "$frozen_baseline..HEAD" -- "${frozen_files[@]}"; then
+            git diff --name-only "$frozen_baseline..HEAD" -- "${frozen_files[@]}"
+            echo "::error::Official frozen specifications were modified"
+            exit 1
+          fi
+
+          if ! git diff --quiet "$migration_baseline..HEAD" -- "${protected_migrations[@]}"; then
+            git diff --name-only "$migration_baseline..HEAD" -- "${protected_migrations[@]}"
+            echo "::error::Migrations 001-006 were modified"
             exit 1
           fi
 

@@ -1,6 +1,6 @@
 # V1_4D_CODEX_IMPLEMENTATION_TASK.md — V1.4D Codex 实施工单（冻结草案）
 
-版本：v1.4d-task-draft-5（多symbol Dataset Manifest契约补充：新增§6实施边界，对应`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`，见变更记录）
+版本：v1.4d-task-draft-4（第三阶段定向修订：dataset_version改为完整SHA-256，新增哈希契约实施阶段核实任务，见变更记录）
 基线：`main@eb89c49f0957617c453ea2c0d149afb55e97dad0`
 角色：本文档是**Codex实施阶段**（未来批准后）的唯一权威工单，定义文件范围、模块划分、构建顺序、复用/禁止复用边界。本文档**本身不是编码**，本轮不执行任何一步，不创建分支/提交/PR。
 
@@ -154,42 +154,6 @@ Codex实现任何字段前，必须先在对应文档中定位其权威定义，
 
 ---
 
-## 6. 多symbol Dataset Manifest 契约实施边界（本轮新增，对应`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`，本轮仍不执行，仅冻结边界）
-
-### 6.1 新增/修改文件范围（实施阶段，本轮不创建/不修改代码）
-
-```
-server/migrations/007_v1_4d_multi_symbol_manifest_contract.up.sql   — 按附录§十一.2逐字实现：新增manifest_contract_version/dataset_type/symbols/dependency_set列与契约版本互斥CHECK约束，symbol列DROP NOT NULL；全程无DML语句。
-server/migrations/007_v1_4d_multi_symbol_manifest_contract.down.sql — 按附录§十一.2逐字实现，**必须**包含回滚前的DO块守卫（存在manifest_contract_version=2行时RAISE EXCEPTION中止回滚），不得省略该守卫直接DROP COLUMN。
-
-server/src/validation-replay/canonical-manifest-content.js — **扩展**（不是替换）：新增契约版本2专属的字段选取/排序/类型纪律实现路径（附录§六16字段清单、§五七元组排序、§三依赖集合排序），由`manifestContractVersion`参数分流；契约版本1既有13字段路径与排序规则**逐字保持不变**，两条路径不得共享可能相互影响的中间状态。
-server/src/validation-replay/dataset-manifest-builder.js   — **扩展**：新增契约版本2构建路径——symbols/dependency_set**必须**从`server/src/features/feature-engine.js`的`FEATURE_BAR_DEPENDENCIES`机械推导（不接受CLI符号输入，见附录§二第3条/§三第3条）；完整性检查扩展为按依赖分组独立执行（附录§八），任一依赖失败即整体拒绝构建；契约版本1路径不变。
-server/src/validation-replay/dataset-manifest-verifier.js  — **扩展**：新增契约版本感知的校验分流（读取`manifest_contract_version`决定后续校验走哪条路径，不满足当前操作所需版本时返回`DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED`）；新增`DATASET_MANIFEST_DEPENDENCY_INCOMPLETE`/`DATASET_MANIFEST_MEMBER_IDENTITY_MISSING`两项判定（附录§九.2错误码总表）；既有`DATASET_MANIFEST_DEPENDENCY_UNGOVERNED`/`DATASET_MANIFEST_MEMBERS_MISSING`/`SOURCE_OUTSIDE_DATASET_MANIFEST`/`SOURCE_NOT_IN_DATASET_MANIFEST`判定逻辑保留，不得弱化。
-server/src/validation-replay/dataset-manifest-cli-entry.js — 新增`--contract-version`**必需**参数（取值`{1,2}`，无默认值）；`--contract-version 2`时`--symbol`/`--intervals`互斥（传入即报`CONFLICTING_CONTRACT_PARAMS`），`--fixed-as-of`变为必需；`--contract-version 1`行为不变。
-server/src/legacy-diagnostics/dataset-manifest-inventory.js — **本轮新增只读工具**：落实附录§十第4条只读识别SQL（`SELECT dataset_version, manifest_contract_version, symbol, symbols, dependency_set, created_at FROM historical_validation.dataset_manifests ORDER BY created_at`），只执行`SELECT`，不写入任何表；**明确禁止**被任何formal Feature Backfill/replay代码路径`import`——只能作为独立诊断脚本手动运行。
-
-server/tests/validation-replay/*.test.js（新增用例覆盖契约版本2路径） — 覆盖R28.1-R28.15/R28.17-R28.18/R28.21/R28.24
-server/tests/postgres/v1-4d-multi-symbol-manifest.integration.test.js（本轮新增，命名延续既有v1-4d-*.integration.test.js惯例） — 覆盖R28.16/R28.19/R28.20/R28.22/R28.23（真实PostgreSQL，含migration 007 up/down/up与并发建manifest场景）
-```
-
-**Feature Backfill依赖治理扩展**（既有`historical-feature-backfill.js validateVerifiedManifest`/`validateInputsWithinManifest`所在文件，实施阶段按实际文件路径定位——本文档§2数据结构唯一来源声明表已列出该模块，不在此重复文件名以免与实际路径不一致）：新增第9.1节要求的契约版本前置校验与`DEPENDENCY_INCOMPLETE`/`MEMBER_IDENTITY_MISSING`判定，既有`DEPENDENCY_UNGOVERNED`/`MEMBERS_MISSING`/`SOURCE_*`判定逻辑不变。
-
-### 6.2 明确禁止（本轮及实施阶段均不做，呼应附录§0/§十三）
-
-- 不修改Forecast算法（`po-state-engine.js`/`threshold-formula.js`/`forecast-contract.js`逐字不变）。
-- 不修改API展示（`server/src/api/server.js`不新增路由，historical_validation内容继续不对外暴露）。
-- 不修改评分/评估逻辑（`outcome-engine.js`不变）。
-- 不执行正式数据流（不运行真实Backfill/Manifest构建/Feature Backfill/Replay/Evaluation/Validation Report）。
-- 不合并main，不变基已冻结的P0-fix提交。
-- 不触碰生产数据库（仅在独立测试/CI数据库执行本节新增集成测试）。
-- 不删除旧Manifest（migration 007 up.sql不含任何DELETE语句；down.sql的守卫DO块正是为防止误删导致的数据丢失而设计，见附录§十一.3）。
-
-### 6.3 构建顺序衔接（在既有§4第11步之后追加第12步）
-
-12. **多symbol契约层**（本轮新增，晚于既有11步全部完成之后）：先完成契约版本1路径130天最小窗口的完整验证（既有第11步），确认链路无误后，方可执行migration 007 + 契约版本2构建/校验路径的独立开发测试；`hash-contract-verification.test.js`需追加对附录§六.4 golden哈希值的断言（R28.21）；契约版本2路径的全部单元/集成测试（本文档§6.1新增测试文件）需在`V1_4D_ACCEPTANCE_TESTS.md` §R28全部24项通过后，才可考虑对180天推荐窗口执行契约版本2的正式构建——**该步骤本身同样需要独立授权，不因本文档冻结而自动获得执行许可**，与既有第11步"红线：以上任一步骤均不得在本轮执行"同一约束延伸适用。
-
----
-
 ## 变更记录
 
 | 版本 | 日期 | 变更 |
@@ -198,4 +162,3 @@ server/tests/postgres/v1-4d-multi-symbol-manifest.integration.test.js（本轮�
 | v1.4d-task-draft-2 | 2026-07-25 | 第三阶段独立复审修订：①表数量订正为七张，新增migration建表顺序（§1.1）；②新增`purge.js`/`cleanup-single-run.js`两个模块任务；③`binance-kline-backfill.js`/`research-availability.js`任务说明中补充P0/P1裁决的具体落地要求（available_at诚实语义、research_availability_rule_version写入）；④构建顺序（§4）从7步扩为9步，纳入purge与清理脚本，推荐窗口数值同步订正为180天、最小窗口订正为130天 |
 | v1.4d-task-draft-3 | 2026-07-26 | 第三阶段补充修订：关闭`dataset_version`内容哈希P1。①表数量**七张→八张**，`dataset_manifests`置于migration建表顺序最前；②新增5个模块任务：`canonical-manifest-content.js`/`dataset-manifest-builder.js`/`dataset-manifest-verifier.js`/`dataset-manifest-cli-entry.js`，`integrity-check.js`任务说明补充"manifest构建必须复用本模块，不得另写一套"；③新增§3.4 Dataset Manifest层职责边界（构建/校验严格分离，回放代码不得隐式建manifest）；④构建顺序（§4）从9步扩为11步，manifest构建/校验层插入回填之后、回放代码之前；⑤`replay-generator.js`任务说明新增"必须先经manifest校验通过"的强制依赖 |
 | v1.4d-task-draft-4 | 2026-07-26 | 第三阶段定向修订：①migration任务明确`dataset_version`改为完整SHA-256（不截断）、`content_hash`须为Postgres生成列；②`canonical-manifest-content.js`任务补充详细契约（字段清单/四级排序含`vintageId`决胜字段/`backfillBatchIds`去重排序/numeric与时间字段类型纪律）；③**新增`hash-contract-verification.test.js`任务**（实施阶段第一步，重新核实`domain/hash.js canonicalJsonHash()`四项契约，若不成立则要求在`canonical-manifest-content.js`内部自建版本化编码，不得修改`domain/hash.js`本身）；④构建顺序§4第3步插入该核实任务为最前置步骤；⑤数据结构来源声明新增canonicalJsonHash核实结论行 |
-| v1.4d-task-draft-5 | 2026-08-03 | 多symbol Dataset Manifest契约补充：新增**§6实施边界**，对应`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`——冻结migration 007（含回滚守卫）、`canonical-manifest-content.js`/`dataset-manifest-builder.js`/`dataset-manifest-verifier.js`/`dataset-manifest-cli-entry.js`的契约版本2扩展范围（均为扩展既有文件，非替换，契约版本1路径逐字不变）、新增只读legacy诊断工具、新增测试文件范围（对应R28全部24项）、明确禁止清单、构建顺序衔接第12步；本轮不创建、不修改任何实际代码文件 |
