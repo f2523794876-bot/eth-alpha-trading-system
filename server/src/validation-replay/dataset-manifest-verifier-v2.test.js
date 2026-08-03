@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { verifyDatasetManifest } from './dataset-manifest-verifier.js';
+import { compareCanonicalV2ManifestMembers } from './dataset-manifest-verifier-v2.js';
 import { authoritativeDependencySet } from './multi-symbol-manifest-contract.js';
 import { canonicalV2LogicalWindow } from './dataset-manifest-v2.js';
 
@@ -23,6 +24,63 @@ const manifest = extra => ({
   ...extra
 });
 const poolFor = row => ({ query: async () => ({ rowCount: row ? 1 : 0, rows: row ? [row] : [] }) });
+
+const canonicalMembers = authoritativeDependencySet().map((dependency, index) => ({
+  symbol: dependency.symbol,
+  intervalName: dependency.interval,
+  marketType: dependency.marketType,
+  source: dependency.source,
+  openTime: FROM + index * 10_000,
+  closeTime: FROM + index * 10_000 + 9_999,
+  revisionNumber: index,
+  vintageId: `vintage-${index}`,
+  rowContentHash: String(index + 1).repeat(64)
+}));
+
+function expectMemberMismatch(storedMembers) {
+  const result = compareCanonicalV2ManifestMembers(storedMembers, canonicalMembers);
+  assert.equal(result.ok, false);
+  assert.equal(result.errorCode, 'DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH');
+}
+
+test('v2 member binding canonicalizes order and binds every frozen identity field', () => {
+  assert.equal(compareCanonicalV2ManifestMembers([...canonicalMembers].reverse(), canonicalMembers).ok, true);
+
+  const mutations = [
+    ['vintageId', 'foreign-vintage'],
+    ['rowContentHash', 'f'.repeat(64)],
+    ['symbol', 'SOLUSDT'],
+    ['intervalName', '5m'],
+    ['marketType', 'futures'],
+    ['source', 'foreign-source'],
+    ['openTime', canonicalMembers[0].openTime + 1],
+    ['closeTime', canonicalMembers[0].closeTime + 1],
+    ['revisionNumber', canonicalMembers[0].revisionNumber + 1],
+    ['unexpectedIdentityField', 'not-frozen']
+  ];
+  for (const [field, value] of mutations) {
+    const stored = canonicalMembers.map(member => ({ ...member }));
+    stored[0][field] = value;
+    expectMemberMismatch(stored);
+  }
+
+  const crossPaired = canonicalMembers.map(member => ({ ...member }));
+  [crossPaired[0].vintageId, crossPaired[1].vintageId] = [crossPaired[1].vintageId, crossPaired[0].vintageId];
+  [crossPaired[0].rowContentHash, crossPaired[1].rowContentHash] = [crossPaired[1].rowContentHash, crossPaired[0].rowContentHash];
+  expectMemberMismatch(crossPaired);
+});
+
+test('v2 member binding rejects duplicate, missing and extra members', () => {
+  expectMemberMismatch([...canonicalMembers, { ...canonicalMembers[0] }]);
+  expectMemberMismatch(canonicalMembers.slice(1));
+  expectMemberMismatch([...canonicalMembers, {
+    ...canonicalMembers[0],
+    openTime: canonicalMembers[0].openTime + 20_000,
+    closeTime: canonicalMembers[0].closeTime + 20_000,
+    vintageId: 'extra-vintage',
+    rowContentHash: 'e'.repeat(64)
+  }]);
+});
 
 test('R28.2/R28.8/R28.9 unknown and legacy contracts fail closed before feature input queries', async () => {
   const unknown = await verifyDatasetManifest({ pool: poolFor(manifest({ manifest_contract_version: 3 })), datasetVersion: VERSION, requiredContractVersion: 2 });

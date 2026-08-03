@@ -1,5 +1,5 @@
 import { canonicalV2LogicalWindow, computeV2ManifestContentForRange, findV2BackfillBatchIds } from './dataset-manifest-v2.js';
-import { authoritativeDependencySet, dependencyLabel, symbolsFromDependencies } from './multi-symbol-manifest-contract.js';
+import { authoritativeDependencySet, dependencyLabel, sortV2Members, symbolsFromDependencies } from './multi-symbol-manifest-contract.js';
 import { canonicalJsonStringify } from '../domain/hash.js';
 
 const toMs = value => value instanceof Date ? value.getTime() : new Date(value).getTime();
@@ -13,6 +13,28 @@ function objectCountsEqual(a, b) {
   const ak = Object.keys(a || {}).sort();
   const bk = Object.keys(b || {}).sort();
   return ak.length === bk.length && ak.every((key, index) => key === bk[index] && Number(a[key]) === Number(b[key]));
+}
+
+export function compareCanonicalV2ManifestMembers(storedMembers, recomputedMembers) {
+  if (!Array.isArray(storedMembers) || !Array.isArray(recomputedMembers)) {
+    return { ok: false, errorCode: 'DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH' };
+  }
+  try {
+    const storedCanonicalMembers = sortV2Members(storedMembers);
+    const recomputedCanonicalMembers = sortV2Members(recomputedMembers);
+    if (storedCanonicalMembers.length !== storedMembers.length || recomputedCanonicalMembers.length !== recomputedMembers.length) {
+      return { ok: false, errorCode: 'DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH' };
+    }
+    if (stable(storedCanonicalMembers) === stable(recomputedCanonicalMembers)) return { ok: true };
+    return { ok: false, errorCode: 'DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH' };
+  } catch (error) {
+    return {
+      ok: false,
+      errorCode: error.code === 'DATASET_MANIFEST_MEMBER_IDENTITY_MISSING'
+        ? error.code
+        : 'DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH'
+    };
+  }
 }
 
 export async function verifyDatasetManifestV2({ pool, datasetVersion, manifest, currentResearchAvailabilityRuleVersion }) {
@@ -76,6 +98,14 @@ export async function verifyDatasetManifestV2({ pool, datasetVersion, manifest, 
     backfillBatchIds: manifest.backfill_batch_ids
   });
   if (recomputed.datasetVersion !== datasetVersion) return blocked('DATASET_CONTENT_HASH_MISMATCH', { datasetVersion, recomputedDatasetVersion: recomputed.datasetVersion });
+  const memberComparison = compareCanonicalV2ManifestMembers(members, recomputed.manifestMembers);
+  if (!memberComparison.ok) {
+    return blocked(memberComparison.errorCode, {
+      datasetVersion,
+      storedMemberCount: members.length,
+      recomputedMemberCount: recomputed.manifestMembers.length
+    });
+  }
   if (recomputed.recordCount !== Number(manifest.record_count) || !objectCountsEqual(recomputed.perDependencyRecordCount, manifest.per_interval_record_count)) {
     return blocked('DATASET_RECORD_COUNT_MISMATCH', { datasetVersion });
   }

@@ -5,9 +5,13 @@ import { randomUUID } from 'node:crypto';
 import { Pool } from 'pg';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { buildDatasetManifest, canonicalV2LogicalWindow } from '../../src/validation-replay/dataset-manifest-builder.js';
+import { computeRowContentHash } from '../../src/validation-replay/canonical-manifest-content.js';
+import { computeV2ManifestContentForRange } from '../../src/validation-replay/dataset-manifest-v2.js';
 import { verifyDatasetManifest } from '../../src/validation-replay/dataset-manifest-verifier.js';
 import { authoritativeDependencySet } from '../../src/validation-replay/multi-symbol-manifest-contract.js';
 import { PostgresRepository } from '../../src/db/postgres.js';
+import { runHistoricalFeatureBackfill } from '../../src/features/historical-feature-backfill.js';
+import { FEATURE_ALGORITHM_VERSION, FEATURE_SET_VERSION } from '../../src/features/feature-version.js';
 import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
 
 const url = process.env.TEST_DATABASE_URL;
@@ -93,6 +97,97 @@ test('R28.1/R28.10/R28.13/R28.14/R28.16/R28.18/R28.22 contract v2 real PostgreSQ
     assert.equal(input.eth4h.length, 1);
     const sqlProbe = await client.query("SELECT count(*)::int count FROM public.market_bars WHERE vintage_id=ANY($1::text[])", [manifest.memberVintageIds]);
     assert.equal(sqlProbe.rows[0].count, manifest.memberVintageIds.length);
+  });
+});
+
+test('R28 manifest member content binding rejects a same-count cross-symbol identity substitution before Feature queries', { skip }, async () => {
+  await withTransaction(async client => {
+    const from = Date.UTC(2025, 1, 1, 0, 0, 0), to = from + 14_400_000, fixedAsOf = to - 1;
+    await seedWindow(client, from, to);
+    const computed = await computeV2ManifestContentForRange({ pool: client, from, to, fixedAsOf });
+
+    const foreignOpen = from - 900_000;
+    await seedDependency(client, 'BTCUSDT', '15m', 900_000, foreignOpen, from);
+    const foreign = (await client.query(
+      `SELECT vintage_id,open::text,high::text,low::text,close::text,volume::text,quote_volume::text
+       FROM public.market_bars
+       WHERE instrument='BTCUSDT' AND interval_name='15m' AND open_time=to_timestamp($1/1000.0)`,
+      [foreignOpen]
+    )).rows[0];
+    assert.ok(foreign?.vintage_id);
+
+    const maliciousMembers = computed.manifestMembers.map(member => ({ ...member }));
+    const target = maliciousMembers.find(member => member.symbol === 'ETHUSDT' && member.intervalName === '15m');
+    assert.ok(target);
+    target.vintageId = foreign.vintage_id;
+    target.rowContentHash = computeRowContentHash({
+      open: foreign.open,
+      high: foreign.high,
+      low: foreign.low,
+      close: foreign.close,
+      volume: foreign.volume,
+      quoteVolume: foreign.quote_volume
+    });
+    assert.equal(maliciousMembers.length, computed.manifestMembers.length);
+
+    const window = canonicalV2LogicalWindow({ from, to, fixedAsOf });
+    await client.query(
+      `INSERT INTO historical_validation.dataset_manifests(
+        dataset_version,manifest_schema_version,manifest_hash_algorithm_version,manifest_contract_version,dataset_type,
+        symbol,symbols,dependency_set,intervals,data_from,data_to,fixed_as_of,logical_window_hash,backfill_batch_ids,
+        source_formal_semantics,research_availability_rule_version,record_count,per_interval_record_count,
+        integrity_check_result,manifest_members)
+       VALUES($1,$2,$3,2,$4,NULL,$5::jsonb,$6::jsonb,$7::jsonb,to_timestamp($8/1000.0),to_timestamp($9/1000.0),
+        to_timestamp($10/1000.0),$11,$12::jsonb,$13,$14,$15,$16::jsonb,$17::jsonb,$18::jsonb)`,
+      [
+        computed.datasetVersion,
+        computed.contentObject.manifestSchemaVersion,
+        computed.contentObject.manifestHashAlgorithmVersion,
+        computed.contentObject.datasetType,
+        JSON.stringify(computed.symbols),
+        JSON.stringify(computed.dependencySet),
+        JSON.stringify([...new Set(computed.dependencySet.map(value => value.interval))].sort()),
+        from,
+        to,
+        fixedAsOf,
+        window.logicalWindowHash,
+        JSON.stringify(computed.backfillBatchIds),
+        computed.contentObject.sourceFormalSemantics,
+        computed.contentObject.researchAvailabilityRuleVersion,
+        computed.recordCount,
+        JSON.stringify(computed.perDependencyRecordCount),
+        JSON.stringify(computed.perDependencyIntegrityCheckResult),
+        JSON.stringify(maliciousMembers)
+      ]
+    );
+
+    const repository = new PostgresRepository(client);
+    let featureInputQueryCount = 0;
+    const realLoadHistoricalFeatureInputs = repository.loadHistoricalFeatureInputs.bind(repository);
+    repository.loadHistoricalFeatureInputs = async args => {
+      featureInputQueryCount += 1;
+      return realLoadHistoricalFeatureInputs(args);
+    };
+    await assert.rejects(
+      runHistoricalFeatureBackfill({
+        repository,
+        options: {
+          symbol: 'ETHUSDT',
+          from: new Date(from).toISOString(),
+          to: new Date(to).toISOString(),
+          interval: '15m',
+          featureVersion: FEATURE_SET_VERSION,
+          algorithmVersion: FEATURE_ALGORITHM_VERSION,
+          datasetVersion: computed.datasetVersion,
+          dryRun: true,
+          batchSize: 10,
+          resumeAfter: null
+        },
+        executionTime: to + 60_000
+      }),
+      error => error.code === 'DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH'
+    );
+    assert.equal(featureInputQueryCount, 0);
   });
 });
 
