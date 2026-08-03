@@ -1,6 +1,6 @@
 # V1_4D_ARCHITECTURE_REVIEW.md — V1.4D 独立架构复审
 
-版本：**v1.4d-review-draft-4**（第三阶段定向修订：关闭dataset_version截断风险P1，核实canonicalJsonHash()契约，补齐排序决胜字段）
+版本：**v1.4d-review-draft-5**（本轮补充说明：标注draft-4结论的适用范围边界，不改写原P0/P1/P2统计或结论，见§6/变更记录）
 基线：`main@eb89c49f0957617c453ea2c0d149afb55e97dad0`
 角色：本文档是对`V1_4D_DATA_BACKFILL_SPEC.md`（draft-4）/`V1_4D_HISTORICAL_REPLAY_SPEC.md`（draft-4）/`V1_4D_CODEX_IMPLEMENTATION_TASK.md`（draft-4）/`V1_4D_ACCEPTANCE_TESTS.md`（draft-4）四份文档的**第三阶段定向复审**，核验本轮用户直接指出的截断P1是否真正关闭、`canonicalJsonHash()`契约核实是否已落实（而非停留在"待确认"）、排序规则是否消除一切并列歧义。
 
@@ -95,6 +95,18 @@
 
 ---
 
+## 6. 本轮补充说明：draft-4结论的适用范围边界（不改写原结论）
+
+draft-4给出的`READY_FOR_CODEX_IMPLEMENTATION`结论，是针对当时四份文档（`V1_4D_DATA_BACKFILL_SPEC.md`/`V1_4D_HISTORICAL_REPLAY_SPEC.md`/`V1_4D_CODEX_IMPLEMENTATION_TASK.md`/`V1_4D_ACCEPTANCE_TESTS.md`均为draft-4）所覆盖的**单symbol Manifest范围**给出的，**该结论本身不改写、不撤销、继续如实保留为历史记录**（第2-5节全部P0/P1/P2统计与追溯矩阵均不变）。
+
+在draft-4之后的执行包1/2实施过程中，实际实施发现P0-3（多symbol依赖治理）在draft-4范围内**未被规范覆盖**——`dataset_manifests`当时的表结构与哈希公式只承认标量`symbol`，无法表达"ETH+BTC同时被同一份Manifest治理"这一需求。提交`6b1f83d`已完成P0-3的SQL级fail-closed治理（`vintage_id = ANY()`），但未获得合法的多symbol契约，**执行包2维持`REQUEST CHANGES`结论**。
+
+`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`（本轮新增）正式关闭这一契约缺口，新增契约版本2（多symbol）Manifest定义，与draft-4的契约版本1（legacy单symbol）并存、不冲突（详见该附录§0.3冲突处理机制）。**本节新增说明的直接结论**：draft-4的`READY_FOR_CODEX_IMPLEMENTATION`结论**仅对契约版本1（单symbol）范围继续有效**；契约版本2（多symbol）范围的架构复审结论待该附录经独立实施授权后、按其冻结的验收测试（`V1_4D_ACCEPTANCE_TESTS.md` §R28）实际验证完成后再给出，**本文档不在本轮预先给出该范围的复审结论**。
+
+**当前实际执行状态（本轮CEO指令给定，非本文档自行推导）**：`EXECUTION_PACKAGE_2 = REQUEST_CHANGES`，`EXECUTION_PACKAGE_3 = NOT_AUTHORIZED`，`GATE_A = NOT_AUTHORIZED`，`MAIN_MERGED = NO`。
+
+---
+
 ## 变更记录
 
 | 版本 | 日期 | 变更 |
@@ -103,3 +115,4 @@
 | v1.4d-review-draft-2 | 2026-07-25 | 第三阶段独立复审：发现并订正120天窗口证明错误（purge缺失），推荐窗口改为180天；统一订正"六张表"为七张；逐项关闭draft-1遗留4项P1；新增物理隔离/backfill边界/CLI契约核对与24行追溯矩阵；结论升级为READY_FOR_CODEX_IMPLEMENTATION（**遗留自相矛盾：第9节写P1=1，第10节仍给出该结论**） |
 | v1.4d-review-draft-3 | 2026-07-26 | 第三阶段补充修订：修正draft-2判定冲突，真正关闭`dataset_version`内容哈希P1（新增`dataset_manifests`表、七张→八张、确定性生成规则、§4.1a八步校验）；自我复审发现2项P2；追溯矩阵新增9行；结论保持READY_FOR_CODEX_IMPLEMENTATION且判定规则真正被满足 |
 | v1.4d-review-draft-4 | 2026-07-26 | 第三阶段定向修订：①关闭用户直接指出的`dataset_version`截断风险（16hex/64-bit→完整64hex SHA-256，采用推荐方案，`content_hash`改为生成列）；②`manifestHashAlgorithmVersion`订正为纳入哈希内容；③`manifest_members`排序补齐`vintageId`决胜字段，`backfillBatchIds`排序规则明确去重+字典序；④**实际读取`domain/hash.js`源码**核实`canonicalJsonHash()`四项契约（不再标记"待确认P2"），核实任务与应对路径写入实施任务与验收测试；⑤追溯矩阵新增8行；⑥第4节按用户要求以明确、无歧义方式重新陈述P0/P1/P2统计，避免"P1=0但括号中仍描述新增问题"的矛盾句式；⑦结论保持READY_FOR_CODEX_IMPLEMENTATION |
+| v1.4d-review-draft-5 | 2026-08-03 | 本轮补充说明（不改写原结论）：新增§6，标注draft-4`READY_FOR_CODEX_IMPLEMENTATION`结论仅适用于契约版本1（单symbol）范围；说明`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`新增契约版本2以关闭P0-3多symbol契约缺口，其独立验收结论待实施授权后另行给出；记录当前执行状态`EXECUTION_PACKAGE_2=REQUEST_CHANGES`/`EXECUTION_PACKAGE_3=NOT_AUTHORIZED`/`GATE_A=NOT_AUTHORIZED`/`MAIN_MERGED=NO` |

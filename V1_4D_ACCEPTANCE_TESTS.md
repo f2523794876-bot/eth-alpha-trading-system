@@ -1,6 +1,6 @@
 # V1_4D_ACCEPTANCE_TESTS.md — V1.4D 验收测试（冻结草案）
 
-版本：v1.4d-tests-draft-4（第三阶段定向修订：新增R27共12条测试，闭环完整SHA-256/排序决胜字段/canonicalJsonHash实施阶段核实，见变更记录）
+版本：v1.4d-tests-draft-5（多symbol Dataset Manifest契约补充：新增R28共24条测试，对照`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`落地，见变更记录）
 基线：`main@eb89c49f0957617c453ea2c0d149afb55e97dad0`
 角色：本文档是 V1.4D（历史数据回填 + 隔离式Walk-forward回放）验收测试的唯一权威清单，供未来Codex实施完成后逐条勾选。**本轮不创建任何测试代码**，只定义测试规范。
 
@@ -258,11 +258,40 @@ ID前缀`R`（Replay/回填）区别于既有`T`系列（V1.4主线），避免�
 | R27.11 | **P0** | 一个`validation_run`已完成部分推进 | 在`--resume`前，人为让R27.5/R27.6/R27.7任一种不一致场景发生 | 执行`--resume` | fail closed，不得因"上次已验证过"跳过（同R26.10逻辑，本条覆盖版本变化类不一致，R26.10覆盖内容篡改类不一致，两者互补） | 自动（故障注入） | V1_4D_HISTORICAL_REPLAY_SPEC.md§4.1a第7步 |
 | R27.12 | **P0** | 同上 | `--dry-run`时发生R27.5/R27.6/R27.7任一种不一致 | 执行 | fail closed，五张业务表零写入（同R26.12逻辑，本条覆盖版本变化类不一致） | 自动 | V1_4D_HISTORICAL_REPLAY_SPEC.md§4.1a第8步 |
 
+## R28. 多symbol Dataset Manifest 契约（本轮新增，对照`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`24项场景逐条落地）
+
+| ID | 严重等级 | 前置条件 | 输入 | 步骤 | 预期结果 | 自动/人工 | 规范条款 |
+|---|---|---|---|---|---|---|---|
+| R28.1 | **P0** | migration 007已应用，BTCUSDT/ETHUSDT 15m/1h/4h（BTC仅15m）均已回填至同一窗口 | `dataset:build-manifest --contract-version 2 --from --to --fixed-as-of` | 执行构建 | 成功产生一条`manifest_contract_version=2`行，`symbols=["BTCUSDT","ETHUSDT"]`，`dependency_set`恰好四条，`record_count`/`per_dependency_record_count`与实际回填行数一致 | 自动（集成） | 附录§二/§三 |
+| R28.2 | **P0** | 已构建一份`manifest_contract_version=1`（仅ETH）的Manifest | 将该Manifest的`dataset_version`传给要求多symbol治理的Feature Backfill正式运行 | 执行 | fail closed，返回`DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED` | 自动 | 附录§九.1第1条/§十第3条 |
+| R28.3 | **P0** | 构造一份`manifest_contract_version=2`候选，`dependency_set`缺少`{BTCUSDT,15m}`（人为构造非法输入模拟builder bug） | 尝试构建/或直接以此manifest执行Feature Backfill | 执行 | fail closed，返回`DATASET_MANIFEST_DEPENDENCY_UNGOVERNED`，`missingDependencies`列出该条目 | 自动 | 附录§三第3条/§九.1第3条 |
+| R28.4 | **P0** | 构造`dependency_set`额外包含`{BTCUSDT,1h}`（未批准的隐式依赖） | 尝试构建 | 执行 | 构建拒绝（不满足"与`FEATURE_BAR_DEPENDENCIES`投影完全相等"要求），不产生该行 | 自动 | 附录§三第3条 |
+| R28.5 | **P0** | 固定一批底层K线数据 | 以两种不同的`dependency_set`枚举顺序（如`[BTC15m,ETH1h,ETH15m,ETH4h]`与`[ETH15m,ETH1h,ETH4h,BTC15m]`）分别构建 | 对比两次`dataset_version` | 完全一致——第三节排序规则消除输入顺序影响 | 自动 | 附录§三第4条/§六 |
+| R28.6 | **P0** | 同上批数据 | 以两种不同的`manifest_members`候选枚举顺序分别构建 | 对比两次`dataset_version` | 完全一致——第五节七元组排序规则消除输入顺序影响 | 自动 | 附录§五第2条/§六 |
+| R28.7 | **P0** | 构造`dependency_set`输入中人为重复一条`{ETHUSDT,15m,spot,binance-spot}` | 构建 | 执行 | 去重后只保留一条，`dataset_version`与不重复输入构建结果一致，且记录WARNING | 自动 | 附录§三第4条 |
+| R28.8 | **P0** | 已存在一条`manifest_contract_version`被测试性构造为`3`（非法值，绕过应用层，直接构造DB行或mock返回） | verifier读取该行 | 执行校验 | fail closed，返回`DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED`；同时验证数据库CHECK约束`dataset_manifests_contract_version_known`本身拒绝任何常规INSERT写入该值 | 自动 | 附录§一第4条 |
+| R28.9 | **P0** | 同R28.2 | 同R28.2 | 同R28.2 | 同R28.2（本条与R28.2为同一场景的两个措辞，验收时可合并勾选，保留双编号以对应用户原始24项清单不遗漏第9项） | 自动 | 附录§九.1第1条/§十第3条 |
+| R28.10 | **P0** | 已成功构建一份契约版本2 Manifest | 用完全相同的`from`/`to`/`fixedAsOf`/底层数据重新执行构建 | 执行 | 幂等返回既有行（`ON CONFLICT(dataset_version) DO NOTHING`），不产生新行，`logical_window_hash`相同 | 自动 | 附录§七第3条 |
+| R28.11 | **P0** | 已成功构建一份契约版本2 Manifest（窗口W） | 保持窗口W不变，人为改变底层`market_bars`内容后重新构建 | 执行 | 拒绝插入，返回`DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT` | 自动（故障注入） | 附录§七第4条 |
+| R28.12 | **P0** | 两个进程同时对同一窗口W发起构建 | 并发执行 | 观察结果 | 恰好一个成功`INSERT`，另一个收到幂等返回或`LOGICAL_WINDOW_CONFLICT`（取决于内容是否相同），不会产生两条同`logical_window_hash`的行 | 自动（集成，并发注入） | 附录§七第6-7条 |
+| R28.13 | **P0** | 构造BTCUSDT 15m多3条、ETHUSDT 15m少3条的场景（模拟净额抵消） | 执行完整性校验 | 检查`per_dependency_integrity_check_result` | 两个依赖分组**分别独立**报告非零异常，整体构建失败；不得因总量净差为0而判定通过 | 自动 | 附录§八第2条 |
+| R28.14 | **P0** | 构造某依赖存在`close_time > fixed_as_of`的K线 | 执行构建 | 执行 | 该行不得计入该依赖成员/计数，若因此导致覆盖不完整则整体构建失败 | 自动 | 附录§四第5条 |
+| R28.15 | **P0** | 构造一条`vintage_id`不在`manifest_members`内的历史K线用于查询 | 以该Manifest执行Feature Backfill输入查询 | 执行 | 该行被排除，返回`SOURCE_NOT_IN_DATASET_MANIFEST`（若被显式请求）或静默不出现在结果集中（若为集合查询） | 自动 | 附录§九.1第4条 |
+| R28.16 | **P0** | `public.market_bars`全表存在大量不属于该Manifest覆盖窗口/依赖的BTC/ETH行 | 以该Manifest执行`loadHistoricalFeatureInputs` | 执行真实PostgreSQL查询 | 只返回`vintage_id`在`manifest.memberVintageIds`内的行，全库其余行不出现在结果集，即使数量上远超预期 | 自动（真实PostgreSQL集成） | 附录§五第6-7条 |
+| R28.17 | P1 | 一次完整的多symbol Feature计算 | 检查产出的血缘/审计记录 | 内容审查 | 同时包含ETH与BTC两个symbol的输入引用、Manifest身份、`dependency_set`、涉及的`vintageId`子集、`fixed_as_of` | 自动+人工复核 | 附录§九.3 |
+| R28.18 | **P0** | — | `--dry-run`执行契约版本2完整校验+计划输出 | 执行 | 9.1全部验证正常执行（只读），`replay_snapshots`等业务表零写入，验证失败时同样零写入 | 自动 | 附录§九.3第4条 |
+| R28.19 | **P0** | 干净测试数据库，仅应用至migration 006 | 依次执行migration 007 up → down → up | 逐步检查 | up成功新增列/约束；down在零契约版本2记录时成功回滚（列/约束消失，`symbol`恢复NOT NULL）；再次up成功恢复到与第一次up后完全一致的schema状态 | 自动（集成，真实PostgreSQL） | 附录§十一 |
+| R28.20 | **P0** | 已应用migration 007并已构建至少一条契约版本2 Manifest | 尝试执行migration 007 down | 执行 | 守卫触发，`RAISE EXCEPTION 'MIGRATION_007_ROLLBACK_BLOCKED...'`，回滚被中止，契约版本2数据与契约版本1数据均保持不变、可继续查询、可继续共存 | 自动（集成） | 附录§十一.3 |
+| R28.21 | **P0** | — | 按附录§六.4完整`manifestContentObject`构造输入 | 用实际`canonicalJsonHash()`计算 | 输出`contentHash`必须逐字符等于附录冻结的golden值`0a0e3225e83ff09c9dcf22c6a87de317cfe94d0b6854b7c8c2f25e20d6bade46` | 自动（单元测试，golden test） | 附录§六.4 |
+| R28.22 | **P0** | 真实隔离PostgreSQL测试库，写入BTC+ETH共计40+条真实K线（部分在治理范围内，部分故意在范围外） | 构建契约版本2 Manifest后执行`loadHistoricalFeatureInputs` | 执行真实查询（非mock） | 只返回治理范围内的行，范围外行(含"全库存在但未被治理"的BTC/ETH行)一律不返回，与既有单symbol场景下的真实PostgreSQL验证方法一致 | 自动（真实PostgreSQL集成） | 附录§五第6-7条 |
+| R28.23 | **P0** | 构建过程在写入`dataset_manifests`前的完整性校验阶段人为触发失败（故障注入） | 执行构建 | 检查事务状态 | 整个事务`ROLLBACK`，不产生部分写入的`dataset_manifests`行，`historical_validation`其余表不受影响 | 自动（故障注入+集成） | 附录§七第7条 |
+| R28.24 | P1 | "服务器历史72/-72"取证任务尚未实际执行 | 检查任何本轮产出文档（含本附录、既有五份文档）对该问题的状态标注 | 全文检索 | 全部标注为`NOT_CONFIRMED`，不存在任何将其描述为"已确认"/"已解决"的表述；本轮不执行任何只读取证查询 | 人工（文档检索）+自动（关键词扫描） | 附录§八第3-4条 |
+
 ---
 
 ## 总数统计（占位，供实施阶段逐条勾选后统计更新）
 
-本轮（第三阶段定向修订后）共冻结 **27个测试类别 / 约103条测试用例**，其中 **P0约58条**，覆盖时间泄漏治理（R4/R5，最高优先级）、生产隔离（R7/R8/R18/R21）、幂等与恢复（R1/R9/R23.7）、命名空间隔离（R10/R25）、可变性分类（R11）、红线字段CHECK（R15/R17.2/R20）、边界处理（R19）、CLI健壮性（R22/R23）、清理顺序（R24）、dataset_version内容哈希确定性与fail-closed（R26，15条）、**完整哈希与排序决胜字段/canonicalJsonHash实施阶段核实（R27，本轮新增，12条）**。
+本轮（多symbol Manifest契约补充后）共冻结 **28个测试类别 / 约127条测试用例**，其中 **P0约79条**，覆盖时间泄漏治理（R4/R5，最高优先级）、生产隔离（R7/R8/R18/R21）、幂等与恢复（R1/R9/R23.7）、命名空间隔离（R10/R25）、可变性分类（R11）、红线字段CHECK（R15/R17.2/R20）、边界处理（R19）、CLI健壮性（R22/R23）、清理顺序（R24）、dataset_version内容哈希确定性与fail-closed（R26，15条）、完整哈希与排序决胜字段/canonicalJsonHash实施阶段核实（R27，12条）、**多symbol Dataset Manifest契约：依赖治理/内容哈希/逻辑窗口/完整性隔离/legacy策略/Migration 007 up-down-up/golden哈希测试向量（R28，本轮新增，24条）**。
 
 ---
 
@@ -274,3 +303,4 @@ ID前缀`R`（Replay/回填）区别于既有`T`系列（V1.4主线），避免�
 | v1.4d-tests-draft-2 | 2026-07-25 | 第三阶段独立复审修订：①R7.1表数量订正为七张+新增R7.1a建表顺序测试；②R9.1订正为"五张业务表"+新增R9.1a/R9.1b；③R11从两条扩展为五条，按§2.0三分类（状态机型/严格只增型/覆盖写例外）分别断言，不再笼统称"不可变"；④新增R19（边界预热损耗）、R20（ActionPermission攻击测试）、R21（schema-qualified/search_path防护）、R22（启动横幅）、R23（CLI fail-closed矩阵，含UTC格式/顺序/split默认/resume一致性）、R24（单run清理顺序）、R25（research_availability_rule_version）共7个新测试类别；⑤总数统计更新为25类别/约75条/P0约33条 |
 | v1.4d-tests-draft-3 | 2026-07-26 | 第三阶段补充修订：关闭`dataset_version`内容哈希P1。①R7.1订正为**八张**表；②R11新增R11.1a（`dataset_manifests`静态扫描）；③R24.1排除项从一张扩为两张（`backfill_batches`+`dataset_manifests`），新增R24.3；④新增**R26共15条测试**，覆盖用户任务五全部15项要求（确定性哈希×5、fail-closed×5、resume/dry-run/mismatch场景×3、manifest不可覆盖×1、provisional数据排除×1）；⑤总数统计更新为26类别/约91条/P0约47条 |
 | v1.4d-tests-draft-4 | 2026-07-26 | 第三阶段定向修订：新增**R27共12条测试**，对照用户本轮8项要求逐条落地——完整哈希不截断验证（R27.1）、批次顺序无关性（R27.2）、成员查询顺序无关性（R27.3）、排序并列决胜字段确定性（R27.4）、哈希算法版本变化必产生不同版本（R27.5）、schema版本变化必产生不同版本（R27.6）、多种不一致场景fail-closed（R27.7）、类型纪律单元测试（R27.8）、canonicalJsonHash实施阶段核实（R27.9/R27.10）、resume/dry-run覆盖版本变化类不一致（R27.11/R27.12）；总数统计更新为27类别/约103条/P0约58条 |
+| v1.4d-tests-draft-5 | 2026-08-03 | 多symbol Dataset Manifest契约补充：新增**R28共24条测试**，对照`V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM.md`全部24项要求场景逐条落地——依赖集合正确性与笛卡尔积禁止（R28.1/R28.3/R28.4/R28.7）、契约版本fail-closed（R28.2/R28.8/R28.9）、排序确定性（R28.5/R28.6）、逻辑窗口幂等/冲突/并发（R28.10-R28.12）、跨依赖抵消禁止（R28.13）、as-of与成员治理边界（R28.14/R28.15）、真实PostgreSQL全库排他性验证（R28.16/R28.22）、血缘完整性（R28.17）、dry-run零写入（R28.18）、Migration 007 up/down/up与回滚守卫（R28.19/R28.20）、golden哈希测试向量（R28.21）、事务回滚（R28.23）、72/-72状态标注核查（R28.24）；总数统计更新为28类别/约127条/P0约79条 |
