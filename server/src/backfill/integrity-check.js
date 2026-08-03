@@ -109,7 +109,7 @@ export async function checkIntegrity(pool, { instrument, marketType = 'spot', in
 
   const result = await pool.query(
     `SELECT open_time, close_time, revision_number
-     FROM market_bars
+     FROM public.market_bars
      WHERE instrument=$1 AND market_type=$2 AND interval_name=$3
        AND open_time>=to_timestamp($4/1000.0) AND open_time<to_timestamp($5/1000.0)
      ORDER BY open_time ASC, revision_number DESC`,

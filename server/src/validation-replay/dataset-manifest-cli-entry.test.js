@@ -9,7 +9,7 @@ import { exitCodeForCliError, DATABASE_FAILURE_EXIT_CODE } from '../db/research-
 
 const CLI_PATH = fileURLToPath(new URL('./dataset-manifest-cli-entry.js', import.meta.url));
 
-const VALID_ARGV = ['--symbol', 'ETHUSDT', '--intervals', '15m', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--as-of', '2026-01-02T00:00:00Z'];
+const VALID_ARGV = ['--contract-version', '1', '--symbol', 'ETHUSDT', '--intervals', '15m', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--as-of', '2026-01-02T00:00:00Z'];
 
 function withDatabaseUrl(value, fn) {
   const original = process.env.DATABASE_URL;
@@ -130,10 +130,22 @@ test('真实子进程：DATABASE_URL指向生产eth_alpha → exit 5', () => {
 
 test('真实子进程：普通业务错误（缺失--intervals，UTC参数本身合法，不触达数据库）→ exit 1，与数据库失败码不同', () => {
   const env = { ...process.env };
-  const result = spawnCli(env, ['--symbol', 'ETHUSDT', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--as-of', '2026-01-02T00:00:00Z']);
+  const result = spawnCli(env, ['--contract-version', '1', '--symbol', 'ETHUSDT', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--as-of', '2026-01-02T00:00:00Z']);
   assert.equal(result.status, 1);
   assert.notEqual(result.status, DATABASE_FAILURE_EXIT_CODE);
   assert.match(result.stderr, /MISSING_REQUIRED_ARG|--symbol and --intervals are required/);
+});
+
+test('contract v2 rejects caller-controlled symbols/intervals before database access', async () => {
+  await assert.rejects(
+    main(['--contract-version', '2', '--symbol', 'ETHUSDT', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--fixed-as-of', '2026-01-01T23:59:59.999Z']),
+    error => error.code === 'CONFLICTING_CONTRACT_PARAMS'
+  );
+});
+
+test('contract version is mandatory and v2 fixed-as-of is mandatory', async () => {
+  await assert.rejects(main(['--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z']), error => error.code === 'MISSING_REQUIRED_ARG');
+  await assert.rejects(main(['--contract-version', '2', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z']), error => error.code === 'AS_OF_REQUIRED');
 });
 
 // Round 3（测试安全加固）：环境隔离回归证明——父进程即使预先设置了危险的DATABASE_URL哨兵（模拟

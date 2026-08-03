@@ -50,7 +50,7 @@ test('formal Backfill and Manifest CLIs require explicit as-of before database a
   let connected=false;const createPgPool=async()=>{connected=true;throw new Error('must not connect');};
   const argv=['--symbol','ETHUSDT','--intervals','15m','--from','2026-08-01T00:00:00Z','--to','2026-08-02T00:00:00Z'];
   await assert.rejects(()=>backfillMain(argv,{createPgPool}),e=>e.code==='AS_OF_REQUIRED');
-  await assert.rejects(()=>manifestMain(argv,{createPgPool}),e=>e.code==='AS_OF_REQUIRED');
+  await assert.rejects(()=>manifestMain(['--contract-version','2','--from','2026-08-01T00:00:00Z','--to','2026-08-02T00:00:00Z'],{createPgPool}),e=>e.code==='AS_OF_REQUIRED');
   assert.equal(connected,false);
 });
 

@@ -23,24 +23,34 @@ export function parseArgs(argv) {
 
 export async function main(argv = process.argv.slice(2), { createPgPool: createPgPoolOverride = createPgPool } = {}) {
   const args = parseArgs(argv);
-  const symbol = args.symbol;
-  const intervals = String(args.intervals || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (args['contract-version'] === undefined || args['contract-version'] === true) throw Object.assign(new Error('--contract-version is required'), { code: 'MISSING_REQUIRED_ARG' });
+  const contractVersion = Number(args['contract-version']);
+  if (![1, 2].includes(contractVersion)) throw Object.assign(new Error('--contract-version must be 1 or 2'), { code: 'DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED' });
   const from = parseUtc(args.from, '--from');
   const to = parseUtc(args.to, '--to');
-  if (args['as-of'] === undefined || args['as-of'] === true) throw Object.assign(new Error('--as-of is required'), { code: 'AS_OF_REQUIRED' });
-  const fixedAsOf = parseUtc(args['as-of'], '--as-of');
-  if (!symbol || !intervals.length) throw Object.assign(new Error('--symbol and --intervals are required'), { code: 'MISSING_REQUIRED_ARG' });
+  let buildOptions;
+  if (contractVersion === 2) {
+    if (args.symbol !== undefined || args.symbols !== undefined || args.intervals !== undefined) throw Object.assign(new Error('contract version 2 does not accept --symbol/--symbols/--intervals'), { code: 'CONFLICTING_CONTRACT_PARAMS' });
+    if (args['fixed-as-of'] === undefined || args['fixed-as-of'] === true) throw Object.assign(new Error('--fixed-as-of is required for contract version 2'), { code: 'AS_OF_REQUIRED' });
+    buildOptions = { contractVersion, from, to, fixedAsOf: parseUtc(args['fixed-as-of'], '--fixed-as-of'), dryRun: args['dry-run'] === true };
+  } else {
+    const symbol = args.symbol;
+    const intervals = String(args.intervals || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!symbol || !intervals.length) throw Object.assign(new Error('--symbol and --intervals are required for contract version 1'), { code: 'MISSING_REQUIRED_ARG' });
+    const asOf = args['fixed-as-of'] ?? args['as-of'];
+    buildOptions = { contractVersion, symbol, intervals, from, to, fixedAsOf: asOf && asOf !== true ? parseUtc(asOf, '--fixed-as-of') : to - 1, dryRun: args['dry-run'] === true };
+  }
 
   const config = loadConfig();
   const pool = await createGuardedResearchPgPool(config, { createPgPool: createPgPoolOverride });
   try {
-    const result = await buildDatasetManifest({ pool, symbol, intervals, from, to, fixedAsOf });
+    const result = await buildDatasetManifest({ pool, ...buildOptions });
     if (result.status === 'REJECTED') {
       console.error('dataset manifest build REJECTED', { errorCode: result.errorCode, interval: result.interval, integrity: result.integrity });
       process.exitCode = 1;
       return result;
     }
-    console.info('dataset manifest build SUCCEEDED', { datasetVersion: result.datasetVersion, recordCount: result.recordCount, inserted: result.inserted, fixedAsOf: new Date(result.fixedAsOf).toISOString(), groupStatistics: result.groupStatistics });
+    console.info(`dataset manifest build ${result.status}`, { datasetVersion: result.datasetVersion, manifestContractVersion: contractVersion, recordCount: result.recordCount, inserted: result.inserted, fixedAsOf: new Date(result.fixedAsOf).toISOString(), groupStatistics: result.groupStatistics });
     if (result.warnings?.length) console.warn('dataset manifest build warnings', result.warnings);
     return result;
   } finally {

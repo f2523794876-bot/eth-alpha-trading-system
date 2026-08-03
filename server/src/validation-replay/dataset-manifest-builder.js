@@ -11,6 +11,9 @@
 import { checkIntegrity, toManifestIntegrityCheckResult } from '../backfill/integrity-check.js';
 import { buildCanonicalManifestContent, computeDatasetVersion } from './canonical-manifest-content.js';
 import { canonicalJsonHash } from '../domain/hash.js';
+import { buildDatasetManifestV2, canonicalV2LogicalWindow, computeV2ManifestContentForRange } from './dataset-manifest-v2.js';
+
+export { canonicalV2LogicalWindow, computeV2ManifestContentForRange };
 
 export const RESEARCH_AVAILABILITY_RULE_VERSION = 'v1.4d-research-availability-1';
 
@@ -19,7 +22,7 @@ async function loadIntervalRows(pool, { symbol, marketType, interval, from, to }
     `SELECT interval_name, open_time, vintage_id, revision_number,
             open::text AS open, high::text AS high, low::text AS low, close::text AS close,
             volume::text AS volume, quote_volume::text AS quote_volume
-     FROM market_bars
+     FROM public.market_bars
      WHERE instrument=$1 AND market_type=$2 AND interval_name=$3
        AND open_time>=to_timestamp($4/1000.0) AND open_time<to_timestamp($5/1000.0)`,
     [symbol, marketType, interval, from, to]
@@ -54,6 +57,7 @@ export async function findOverlappingBackfillBatchIds(pool, { symbol, intervals,
 // 若省略（构建路径），现场查询与请求区间重叠的批次作为溯源信息。
 export function canonicalManifestLogicalWindow({ fixedAsOf, from, to, symbols, intervals, marketType = 'spot', datasetType = 'MARKET_BARS' }) {
   const identity = Object.freeze({
+    contractVersion: 1,
     datasetType,
     fixedAsOf,
     from,
@@ -151,10 +155,10 @@ async function persistGovernedManifest(pool, { datasetVersion, contentObject, sy
     try {
       inserted = await client.query(
         `INSERT INTO historical_validation.dataset_manifests(
-       dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals,
+       dataset_version, manifest_schema_version, manifest_hash_algorithm_version, manifest_contract_version, dataset_type, symbol, intervals,
        data_from, data_to, fixed_as_of, logical_window_hash, backfill_batch_ids, source_formal_semantics, research_availability_rule_version,
        record_count, per_interval_record_count, integrity_check_result, manifest_members
-     ) VALUES ($1,$2,$3,$4,$5::jsonb,to_timestamp($6/1000.0),to_timestamp($7/1000.0),to_timestamp($8/1000.0),$9,$10::jsonb,$11,$12,$13,$14::jsonb,$15::jsonb,$16::jsonb)`,
+     ) VALUES ($1,$2,$3,1,'MARKET_BARS',$4,$5::jsonb,to_timestamp($6/1000.0),to_timestamp($7/1000.0),to_timestamp($8/1000.0),$9,$10::jsonb,$11,$12,$13,$14::jsonb,$15::jsonb,$16::jsonb)`,
         [datasetVersion, contentObject.manifestSchemaVersion, contentObject.manifestHashAlgorithmVersion, symbol,
           JSON.stringify(sortedIntervals), from, to, fixedAsOf, logicalWindowHash, JSON.stringify(backfillBatchIds),
           contentObject.sourceFormalSemantics, contentObject.researchAvailabilityRuleVersion, recordCount,
@@ -173,7 +177,14 @@ async function persistGovernedManifest(pool, { datasetVersion, contentObject, sy
   finally { client.release(); }
 }
 
-export async function buildDatasetManifest({ pool, symbol, intervals, from, to, fixedAsOf = to - 1, marketType = 'spot' }) {
+export async function buildDatasetManifest({ pool, contractVersion = 1, symbol, intervals, from, to, fixedAsOf, marketType = 'spot', dryRun = false }) {
+  if (contractVersion === 2) {
+    if (symbol !== undefined || intervals !== undefined) throw Object.assign(new Error('contract version 2 derives dependencies from FEATURE_BAR_DEPENDENCIES'), { code: 'CONFLICTING_CONTRACT_PARAMS' });
+    if (!Number.isSafeInteger(fixedAsOf)) throw Object.assign(new Error('contract version 2 requires an explicit fixed as-of'), { code: 'AS_OF_REQUIRED' });
+    return buildDatasetManifestV2({ pool, from, to, fixedAsOf, dryRun });
+  }
+  if (contractVersion !== 1) throw Object.assign(new Error(`Unsupported manifest contract version: ${contractVersion}`), { code: 'DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED' });
+  fixedAsOf ??= to - 1;
   const computed = await computeManifestContentForRange({ pool, symbol, intervals, from, to, fixedAsOf, marketType });
   const { contentObject, manifestMembers, backfillBatchIds, intervals: sortedIntervals, recordCount, perIntervalRecordCount, datasetVersion, duplicateBackfillBatchIdsRemoved } = computed;
   const warnings = [];
@@ -190,10 +201,10 @@ export async function buildDatasetManifest({ pool, symbol, intervals, from, to, 
   }
 
   const { identity: logicalWindowIdentity, logicalWindowHash } = canonicalManifestLogicalWindow({ fixedAsOf, from, to, symbols: [symbol], intervals: sortedIntervals, marketType });
-  const inserted = await persistGovernedManifest(pool, { datasetVersion, contentObject, symbol, sortedIntervals, from, to, fixedAsOf, backfillBatchIds, recordCount, perIntervalRecordCount, manifestMembers, logicalWindowHash });
+  const inserted = dryRun ? false : await persistGovernedManifest(pool, { datasetVersion, contentObject, symbol, sortedIntervals, from, to, fixedAsOf, backfillBatchIds, recordCount, perIntervalRecordCount, manifestMembers, logicalWindowHash });
 
   return {
-    status: 'SUCCEEDED',
+    status: dryRun ? 'DRY_RUN' : 'SUCCEEDED',
     datasetVersion,
     recordCount,
     perIntervalRecordCount,

@@ -8,6 +8,7 @@
 // 因此只要调用方在resume/dry-run时都重新调用一次本函数，第7/8步的"不得跳过"要求自然满足。
 
 import { computeManifestContentForRange, findOverlappingBackfillBatchIds, RESEARCH_AVAILABILITY_RULE_VERSION } from './dataset-manifest-builder.js';
+import { verifyDatasetManifestV2 } from './dataset-manifest-verifier-v2.js';
 
 function toEpochMs(value) {
   return value instanceof Date ? value.getTime() : new Date(value).getTime();
@@ -31,13 +32,18 @@ function perIntervalRecordCountEqual(a, b) {
 }
 
 // dataset_version: 待验证的声明（不可信输入，见§4.1a红线）。
-export async function verifyDatasetManifest({ pool, datasetVersion, marketType = 'spot', currentResearchAvailabilityRuleVersion = RESEARCH_AVAILABILITY_RULE_VERSION }) {
+export async function verifyDatasetManifest({ pool, datasetVersion, marketType = 'spot', requiredContractVersion, currentResearchAvailabilityRuleVersion = RESEARCH_AVAILABILITY_RULE_VERSION }) {
   // 第1步：manifest必须存在。
   const manifestResult = await pool.query('SELECT * FROM historical_validation.dataset_manifests WHERE dataset_version=$1', [datasetVersion]);
   if (!manifestResult.rowCount) {
     return { ok: false, errorCode: 'DATASET_MANIFEST_NOT_FOUND', datasetVersion };
   }
   const manifest = manifestResult.rows[0];
+  const contractVersion = Number(manifest.manifest_contract_version);
+  if (![1, 2].includes(contractVersion) || (requiredContractVersion !== undefined && contractVersion !== requiredContractVersion)) {
+    return { ok: false, errorCode: 'DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED', datasetVersion, manifestContractVersion: manifest.manifest_contract_version, requiredContractVersion };
+  }
+  if (contractVersion === 2) return verifyDatasetManifestV2({ pool, datasetVersion, manifest, currentResearchAvailabilityRuleVersion });
   const symbol = manifest.symbol;
   const intervals = manifest.intervals;
   const from = toEpochMs(manifest.data_from);

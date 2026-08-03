@@ -327,10 +327,10 @@ test('R11.4-validation_runs-SUCCEEDED：即使manifest的research_availability_r
     // record_count等其余字段全部自洽正确的manifest（同R26.8手法：模拟规则版本升级后的历史run）。
     await client.query(
       `INSERT INTO historical_validation.dataset_manifests(
-         dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals,
+         dataset_version, manifest_schema_version, manifest_hash_algorithm_version, manifest_contract_version, dataset_type, symbol, intervals,
          data_from, data_to, backfill_batch_ids, source_formal_semantics, research_availability_rule_version,
          record_count, per_interval_record_count, integrity_check_result, manifest_members
-       ) VALUES ($1,$2,$3,'ETHUSDT',$4::jsonb,to_timestamp($5/1000.0),to_timestamp($6/1000.0),$7::jsonb,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb)`,
+       ) VALUES ($1,$2,$3,1,'MARKET_BARS','ETHUSDT',$4::jsonb,to_timestamp($5/1000.0),to_timestamp($6/1000.0),$7::jsonb,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb)`,
       [
         computed.datasetVersion, computed.contentObject.manifestSchemaVersion, computed.contentObject.manifestHashAlgorithmVersion,
         JSON.stringify(computed.intervals), from, to, JSON.stringify(computed.backfillBatchIds), computed.contentObject.sourceFormalSemantics,
@@ -368,10 +368,10 @@ test('R11.4-validation_runs-SUCCEEDED：即使manifest行本身record_count与�
     // manifest-builder实现bug产生的"行内自相矛盾"场景。
     await client.query(
       `INSERT INTO historical_validation.dataset_manifests(
-         dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals,
+         dataset_version, manifest_schema_version, manifest_hash_algorithm_version, manifest_contract_version, dataset_type, symbol, intervals,
          data_from, data_to, backfill_batch_ids, source_formal_semantics, research_availability_rule_version,
          record_count, per_interval_record_count, integrity_check_result, manifest_members
-       ) VALUES ($1,$2,$3,'ETHUSDT',$4::jsonb,to_timestamp($5/1000.0),to_timestamp($6/1000.0),$7::jsonb,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb)`,
+       ) VALUES ($1,$2,$3,1,'MARKET_BARS','ETHUSDT',$4::jsonb,to_timestamp($5/1000.0),to_timestamp($6/1000.0),$7::jsonb,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb)`,
       [
         computed.datasetVersion, computed.contentObject.manifestSchemaVersion, computed.contentObject.manifestHashAlgorithmVersion,
         JSON.stringify(computed.intervals), from, to, JSON.stringify(computed.backfillBatchIds), computed.contentObject.sourceFormalSemantics,

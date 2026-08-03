@@ -92,3 +92,34 @@ test('R27.10：循环引用 fail closed', () => {
 test('契约整体：结论——canonicalJsonHash()满足V1_4D_HISTORICAL_REPLAY_SPEC.md §2.9.4冻结的四项契约，可继续复用，不新建第二套哈希/规范化实现', () => {
   assert.ok(true);
 });
+
+test('R28.21 contract v2完整golden vector逐字符匹配冻结SHA-256', () => {
+  const zero = { gapCount: 0, duplicateCount: 0, outOfOrderCount: 0 };
+  const value = {
+    manifestSchemaVersion: 'v1.4d-manifest-schema-2',
+    manifestHashAlgorithmVersion: 'v1.4d-manifest-hash-1',
+    manifestContractVersion: 2,
+    datasetType: 'MARKET_BARS',
+    symbols: ['BTCUSDT', 'ETHUSDT'],
+    dependencySet: [
+      { symbol: 'BTCUSDT', interval: '15m', marketType: 'spot', source: 'binance-spot' },
+      { symbol: 'ETHUSDT', interval: '15m', marketType: 'spot', source: 'binance-spot' },
+      { symbol: 'ETHUSDT', interval: '1h', marketType: 'spot', source: 'binance-spot' },
+      { symbol: 'ETHUSDT', interval: '4h', marketType: 'spot', source: 'binance-spot' }
+    ],
+    dataFrom: '2026-01-25T23:45:00.000Z',
+    dataTo: '2026-01-26T00:15:00.000Z',
+    fixedAsOf: '2026-01-26T00:14:59.999Z',
+    backfillBatchIds: ['11111111-1111-4111-8111-111111111111'],
+    manifestMembers: [
+      { symbol: 'BTCUSDT', intervalName: '15m', marketType: 'spot', source: 'binance-spot', openTime: 1769384700000, closeTime: 1769386499999, revisionNumber: 0, vintageId: 'BTCUSDT-spot-15m-1769384700000-0', rowContentHash: 'b28be94d41ccfdbda1f661302639db8ef888de3f4b7038c4276965f4f174cf5a' },
+      { symbol: 'ETHUSDT', intervalName: '15m', marketType: 'spot', source: 'binance-spot', openTime: 1769384700000, closeTime: 1769386499999, revisionNumber: 0, vintageId: 'ETHUSDT-spot-15m-1769384700000-0', rowContentHash: 'e1294238b443a8ac43e14d9dd00b42a154fe1650ad51b7fb34790c7fb5dec3c2' }
+    ],
+    sourceFormalSemantics: 'market_bars:formal:spot',
+    researchAvailabilityRuleVersion: 'v1.4d-research-availability-1',
+    recordCount: 2,
+    perDependencyRecordCount: { 'BTCUSDT:15m': 1, 'ETHUSDT:15m': 1, 'ETHUSDT:1h': 0, 'ETHUSDT:4h': 0 },
+    perDependencyIntegrityCheckResult: { 'BTCUSDT:15m': zero, 'ETHUSDT:15m': zero, 'ETHUSDT:1h': zero, 'ETHUSDT:4h': zero }
+  };
+  assert.equal(canonicalJsonHash(value), '0a0e3225e83ff09c9dcf22c6a87de317cfe94d0b6854b7c8c2f25e20d6bade46');
+});

@@ -3,6 +3,14 @@
 // 本模块不重新实现JSON规范化/哈希算法本身（V1_4D_CODEX_IMPLEMENTATION_TASK.md 对应任务红线）。
 
 import { canonicalJsonHash } from '../domain/hash.js';
+import {
+  MANIFEST_CONTRACT_VERSION,
+  MANIFEST_DATASET_TYPE,
+  MANIFEST_SCHEMA_VERSION,
+  assertAuthoritativeDependencySet,
+  sortV2Members,
+  symbolsFromDependencies
+} from './multi-symbol-manifest-contract.js';
 
 const INTERVAL_RANK = Object.freeze({ '15m': 0, '1h': 1, '4h': 2 });
 
@@ -62,7 +70,7 @@ function sortManifestMembers(members) {
 // manifestMemberRows: 未排序、未去重的候选行数组，每项包含
 // {intervalName, openTime(number,ms), vintageId, revisionNumber(number), open/high/low/close/volume/quoteVolume(string)}。
 // 调用方(dataset-manifest-builder.js)负责查询market_bars得到这些候选行，本函数只负责排序与哈希内容对象构造。
-export function buildCanonicalManifestContent({
+function buildCanonicalManifestContentV1({
   manifestSchemaVersion = 'v1.4d-manifest-schema-1',
   manifestHashAlgorithmVersion = 'v1.4d-manifest-hash-1',
   symbol,
@@ -112,6 +120,108 @@ export function buildCanonicalManifestContent({
   };
 
   return { contentObject, manifestMembers, backfillBatchIds: sortedBackfillBatchIds, intervals: sortedIntervals, recordCount, duplicateBackfillBatchIdsRemoved };
+}
+
+function buildCanonicalManifestContentV2({
+  manifestSchemaVersion = MANIFEST_SCHEMA_VERSION,
+  manifestHashAlgorithmVersion = 'v1.4d-manifest-hash-1',
+  manifestContractVersion = MANIFEST_CONTRACT_VERSION,
+  datasetType = MANIFEST_DATASET_TYPE,
+  dependencySet,
+  dataFrom,
+  dataTo,
+  fixedAsOf,
+  backfillBatchIds,
+  manifestMemberRows,
+  sourceFormalSemantics = 'market_bars:formal:spot',
+  researchAvailabilityRuleVersion,
+  perDependencyRecordCount,
+  perDependencyIntegrityCheckResult
+}) {
+  if (manifestContractVersion !== 2 || manifestSchemaVersion !== MANIFEST_SCHEMA_VERSION || datasetType !== MANIFEST_DATASET_TYPE) {
+    throw Object.assign(new Error('Manifest contract/schema/dataset type combination is unsupported'), { code: 'DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED' });
+  }
+  for (const [name, value] of [['dataFrom', dataFrom], ['dataTo', dataTo], ['fixedAsOf', fixedAsOf]]) {
+    if (typeof value !== 'string' || Number.isNaN(Date.parse(value)) || new Date(value).toISOString() !== value) throw typeDisciplineError(name, 'a normalized ISO8601 string');
+  }
+  const { dependencySet: normalizedDependencies, duplicatesRemoved: duplicateDependenciesRemoved } = assertAuthoritativeDependencySet(dependencySet);
+  const expectedDependencyKeys = normalizedDependencies.map(value => `${value.symbol}:${value.interval}`).sort();
+  for (const [fieldName, value] of [['perDependencyRecordCount', perDependencyRecordCount], ['perDependencyIntegrityCheckResult', perDependencyIntegrityCheckResult]]) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(expectedDependencyKeys)) {
+      throw Object.assign(new Error(`${fieldName} must cover the exact dependency set`), { code: 'DATASET_MANIFEST_DEPENDENCY_INCOMPLETE', fieldName });
+    }
+  }
+  for (const key of expectedDependencyKeys) {
+    if (!Number.isSafeInteger(perDependencyRecordCount[key]) || perDependencyRecordCount[key] < 0) {
+      throw Object.assign(new Error(`Invalid per-dependency record count for ${key}`), { code: 'DATASET_MANIFEST_DEPENDENCY_INCOMPLETE', dependency: key });
+    }
+    const integrity = perDependencyIntegrityCheckResult[key];
+    if (!integrity || JSON.stringify(Object.keys(integrity).sort()) !== JSON.stringify(['duplicateCount', 'gapCount', 'outOfOrderCount']) ||
+      !Object.values(integrity).every(value => Number.isSafeInteger(value) && value >= 0)) {
+      throw Object.assign(new Error(`Invalid per-dependency integrity result for ${key}`), { code: 'DATASET_MANIFEST_DEPENDENCY_INCOMPLETE', dependency: key });
+    }
+  }
+  const rawBackfillBatchIdCount = backfillBatchIds.length;
+  const sortedBackfillBatchIds = sortBackfillBatchIds(backfillBatchIds);
+  const membersWithHash = manifestMemberRows.map(row => ({
+    symbol: row.symbol,
+    intervalName: row.intervalName,
+    marketType: row.marketType,
+    source: row.source,
+    openTime: row.openTime,
+    closeTime: row.closeTime,
+    revisionNumber: row.revisionNumber,
+    vintageId: row.vintageId,
+    rowContentHash: row.rowContentHash || computeRowContentHash(row)
+  }));
+  const approvedMemberGroups = new Set(normalizedDependencies.map(value => `${value.symbol}\0${value.interval}\0${value.marketType}\0${value.source}`));
+  for (const member of membersWithHash) {
+    if (!approvedMemberGroups.has(`${member.symbol}\0${member.intervalName}\0${member.marketType}\0${member.source}`)) {
+      throw Object.assign(new Error('Manifest member belongs to an ungoverned dependency'), { code: 'DATASET_MANIFEST_DEPENDENCY_UNGOVERNED', member });
+    }
+  }
+  const manifestMembers = sortV2Members(membersWithHash);
+  const contentObject = {
+    manifestSchemaVersion,
+    manifestHashAlgorithmVersion,
+    manifestContractVersion,
+    datasetType,
+    symbols: symbolsFromDependencies(normalizedDependencies),
+    dependencySet: normalizedDependencies,
+    dataFrom,
+    dataTo,
+    fixedAsOf,
+    backfillBatchIds: sortedBackfillBatchIds,
+    manifestMembers,
+    sourceFormalSemantics,
+    researchAvailabilityRuleVersion,
+    recordCount: manifestMembers.length,
+    perDependencyRecordCount,
+    perDependencyIntegrityCheckResult
+  };
+  return {
+    contentObject,
+    manifestMembers,
+    backfillBatchIds: sortedBackfillBatchIds,
+    symbols: contentObject.symbols,
+    dependencySet: normalizedDependencies,
+    recordCount: manifestMembers.length,
+    duplicateBackfillBatchIdsRemoved: rawBackfillBatchIdCount - sortedBackfillBatchIds.length,
+    duplicateDependenciesRemoved,
+    duplicateManifestMembersRemoved: manifestMemberRows.length - manifestMembers.length
+  };
+}
+
+export function buildCanonicalManifestContent(args) {
+  const version = args.manifestContractVersion ?? 1;
+  if (version === 1) return buildCanonicalManifestContentV1(args);
+  if (version === 2) {
+    const allowed = ['manifestSchemaVersion', 'manifestHashAlgorithmVersion', 'manifestContractVersion', 'datasetType', 'dependencySet', 'dataFrom', 'dataTo', 'fixedAsOf', 'backfillBatchIds', 'manifestMemberRows', 'sourceFormalSemantics', 'researchAvailabilityRuleVersion', 'perDependencyRecordCount', 'perDependencyIntegrityCheckResult'];
+    const unknown = Object.keys(args).filter(key => !allowed.includes(key));
+    if (unknown.length) throw Object.assign(new Error('Unknown contract version 2 manifest field'), { code: 'MANIFEST_CONTRACT_UNKNOWN_FIELD', unknownFields: unknown.sort() });
+    return buildCanonicalManifestContentV2(args);
+  }
+  throw Object.assign(new Error(`Unsupported manifest contract version: ${version}`), { code: 'DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED' });
 }
 
 // §2.9.0：dataset_version = `v1.4d-sha256-${完整64位十六进制contentHash}`，不做任何截断。
