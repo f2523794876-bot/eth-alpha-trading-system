@@ -8,7 +8,7 @@ import { exitCodeForCliError, DATABASE_FAILURE_EXIT_CODE } from '../../src/db/re
 
 const CLI_PATH = fileURLToPath(new URL('../../src/backfill/backfill-cli-entry.js', import.meta.url));
 
-const VALID_ARGV = ['--symbol', 'ETHUSDT', '--intervals', '15m', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z'];
+const VALID_ARGV = ['--symbol', 'ETHUSDT', '--intervals', '15m', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--as-of', '2026-01-02T00:00:00Z'];
 
 function withDatabaseUrl(value, fn) {
   const original = process.env.DATABASE_URL;
@@ -153,7 +153,7 @@ test('真实子进程：DATABASE_URL指向生产eth_alpha → exit 5', () => {
 
 test('真实子进程：普通业务错误（RESUME_INTERVALS_CONFLICT，不触达数据库）→ exit 1，与数据库失败码不同', () => {
   const env = { ...process.env };
-  const result = spawnCli(env, ['--symbol', 'ETHUSDT', '--intervals', '15m,4h', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--resume', 'abc']);
+  const result = spawnCli(env, ['--symbol', 'ETHUSDT', '--intervals', '15m,4h', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--as-of', '2026-01-02T00:00:00Z', '--resume', 'abc']);
   assert.equal(result.status, 1);
   assert.notEqual(result.status, DATABASE_FAILURE_EXIT_CODE);
   assert.match(result.stderr, /RESUME_INTERVALS_CONFLICT/);

@@ -10,6 +10,7 @@
 
 import { checkIntegrity, toManifestIntegrityCheckResult } from '../backfill/integrity-check.js';
 import { buildCanonicalManifestContent, computeDatasetVersion } from './canonical-manifest-content.js';
+import { canonicalJsonHash } from '../domain/hash.js';
 
 export const RESEARCH_AVAILABILITY_RULE_VERSION = 'v1.4d-research-availability-1';
 
@@ -51,19 +52,65 @@ export async function findOverlappingBackfillBatchIds(pool, { symbol, intervals,
 // from/to: epoch毫秒（UTC）。intervals: 如 ['15m','1h','4h']。
 // backfillBatchIds: 若调用方传入（校验路径——使用manifest行已记录的值，见§4.1a第2步），直接采用；
 // 若省略（构建路径），现场查询与请求区间重叠的批次作为溯源信息。
-export async function computeManifestContentForRange({ pool, symbol, intervals, from, to, marketType = 'spot', backfillBatchIds }) {
+export function canonicalManifestLogicalWindow({ fixedAsOf, from, to, symbols, intervals, marketType = 'spot', datasetType = 'MARKET_BARS' }) {
+  const identity = Object.freeze({
+    datasetType,
+    fixedAsOf,
+    from,
+    to,
+    symbols: [...new Set(symbols)].sort(),
+    intervals: [...new Set(intervals)].sort(),
+    sourceFormalSemantics: `market_bars:formal:${marketType}`
+  });
+  return Object.freeze({ identity, logicalWindowHash: canonicalJsonHash(identity) });
+}
+
+export function validateManifestGroupStatistics(groupStatistics) {
+  const mismatches = Object.values(groupStatistics).filter(group =>
+    !group.countMatches || group.actualRecordCount !== group.expectedRecordCount ||
+    group.firstActualOpenTime !== group.firstExpectedOpenTime || group.lastActualOpenTime !== group.lastExpectedOpenTime
+  );
+  return Object.freeze({ ok: mismatches.length === 0, mismatches });
+}
+
+export function resolveManifestLogicalWindow(existingDatasetVersions, candidateDatasetVersion) {
+  const unique = [...new Set(existingDatasetVersions)];
+  if (!unique.length) return 'INSERT';
+  if (unique.length === 1 && unique[0] === candidateDatasetVersion) return 'IDEMPOTENT';
+  throw Object.assign(new Error('A different manifest already governs this logical window'), {
+    code: 'DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT', existingDatasetVersions: unique, candidateDatasetVersion
+  });
+}
+
+export async function computeManifestContentForRange({ pool, symbol, intervals, from, to, fixedAsOf = to - 1, marketType = 'spot', backfillBatchIds }) {
   const perIntervalRecordCount = {};
   let aggregateGapCount = 0, aggregateDuplicateCount = 0, aggregateOutOfOrderCount = 0;
   const manifestMemberRows = [];
+  const groupStatistics = {};
 
   for (const interval of intervals) {
-    const integrity = await checkIntegrity(pool, { instrument: symbol, marketType, interval, from, to });
+    const integrity = await checkIntegrity(pool, { instrument: symbol, marketType, interval, from, to, asOf: fixedAsOf });
+    if (integrity.effectiveTo !== to) {
+      throw Object.assign(new Error(`${symbol} ${interval} requested range extends beyond fixed as-of`), {
+        code: 'MANIFEST_RANGE_EXCEEDS_AS_OF', symbol, interval, fixedAsOf, requestedTo: to, effectiveTo: integrity.effectiveTo
+      });
+    }
     aggregateGapCount += integrity.gapCount;
     aggregateDuplicateCount += integrity.duplicateCount;
     aggregateOutOfOrderCount += integrity.outOfOrderCount;
 
     const rows = await loadIntervalRows(pool, { symbol, marketType, interval, from, to });
     perIntervalRecordCount[interval] = rows.length;
+    groupStatistics[`${symbol}:${interval}`] = Object.freeze({
+      symbol, interval,
+      firstExpectedOpenTime: integrity.firstExpectedOpenTime,
+      lastExpectedOpenTime: integrity.lastExpectedOpenTime,
+      firstActualOpenTime: integrity.firstActualOpenTime,
+      lastActualOpenTime: integrity.lastActualOpenTime,
+      expectedRecordCount: integrity.expectedBarCount,
+      actualRecordCount: integrity.distinctRowCount,
+      countMatches: integrity.countMatches
+    });
     manifestMemberRows.push(...rows);
   }
 
@@ -88,17 +135,53 @@ export async function computeManifestContentForRange({ pool, symbol, intervals, 
 
   const datasetVersion = computeDatasetVersion(built.contentObject);
 
-  return { ...built, perIntervalRecordCount, datasetVersion };
+  return { ...built, perIntervalRecordCount, datasetVersion, fixedAsOf, groupStatistics };
 }
 
-export async function buildDatasetManifest({ pool, symbol, intervals, from, to, marketType = 'spot' }) {
-  const computed = await computeManifestContentForRange({ pool, symbol, intervals, from, to, marketType });
+async function persistGovernedManifest(pool, { datasetVersion, contentObject, symbol, sortedIntervals, from, to, fixedAsOf, backfillBatchIds, recordCount, perIntervalRecordCount, manifestMembers, logicalWindowHash }) {
+  const execute = async client => {
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`dataset-manifest:${logicalWindowHash}`]);
+    const existing = await client.query(
+      `SELECT dataset_version FROM historical_validation.dataset_manifests WHERE logical_window_hash=$1`,
+      [logicalWindowHash]
+    );
+    const resolution = resolveManifestLogicalWindow(existing.rows.map(row => row.dataset_version), datasetVersion);
+    if (resolution === 'IDEMPOTENT') return false;
+    let inserted;
+    try {
+      inserted = await client.query(
+        `INSERT INTO historical_validation.dataset_manifests(
+       dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals,
+       data_from, data_to, fixed_as_of, logical_window_hash, backfill_batch_ids, source_formal_semantics, research_availability_rule_version,
+       record_count, per_interval_record_count, integrity_check_result, manifest_members
+     ) VALUES ($1,$2,$3,$4,$5::jsonb,to_timestamp($6/1000.0),to_timestamp($7/1000.0),to_timestamp($8/1000.0),$9,$10::jsonb,$11,$12,$13,$14::jsonb,$15::jsonb,$16::jsonb)`,
+        [datasetVersion, contentObject.manifestSchemaVersion, contentObject.manifestHashAlgorithmVersion, symbol,
+          JSON.stringify(sortedIntervals), from, to, fixedAsOf, logicalWindowHash, JSON.stringify(backfillBatchIds),
+          contentObject.sourceFormalSemantics, contentObject.researchAvailabilityRuleVersion, recordCount,
+          JSON.stringify(perIntervalRecordCount), JSON.stringify(contentObject.integrityCheckResult), JSON.stringify(manifestMembers)]
+      );
+    } catch (error) {
+      if (error.code === '23505') throw Object.assign(new Error('Concurrent or cross-window manifest identity conflict'), { code: 'DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT', causeCode: error.code, logicalWindowHash, candidateDatasetVersion: datasetVersion });
+      throw error;
+    }
+    return inserted.rowCount > 0;
+  };
+  if (typeof pool.connect !== 'function') return execute(pool);
+  const client = await pool.connect();
+  try { await client.query('BEGIN'); const inserted = await execute(client); await client.query('COMMIT'); return inserted; }
+  catch (error) { await client.query('ROLLBACK'); throw error; }
+  finally { client.release(); }
+}
+
+export async function buildDatasetManifest({ pool, symbol, intervals, from, to, fixedAsOf = to - 1, marketType = 'spot' }) {
+  const computed = await computeManifestContentForRange({ pool, symbol, intervals, from, to, fixedAsOf, marketType });
   const { contentObject, manifestMembers, backfillBatchIds, intervals: sortedIntervals, recordCount, perIntervalRecordCount, datasetVersion, duplicateBackfillBatchIdsRemoved } = computed;
   const warnings = [];
 
   const integrity = contentObject.integrityCheckResult;
-  if (integrity.gapCount > 0 || integrity.duplicateCount > 0 || integrity.outOfOrderCount > 0) {
-    return { status: 'REJECTED', errorCode: 'INTEGRITY_CHECK_FAILED', integrity };
+  const groupValidation = validateManifestGroupStatistics(computed.groupStatistics);
+  if (integrity.gapCount > 0 || integrity.duplicateCount > 0 || integrity.outOfOrderCount > 0 || !groupValidation.ok) {
+    return { status: 'REJECTED', errorCode: 'INTEGRITY_CHECK_FAILED', integrity, groupStatistics: computed.groupStatistics };
   }
 
   // §2.9.2第1条：backfillBatchIds去重不应发生（DISTINCT查询已去重），若发生记一条WARNING，不阻断构建。
@@ -106,30 +189,8 @@ export async function buildDatasetManifest({ pool, symbol, intervals, from, to, 
     warnings.push(`duplicate backfillBatchIds removed: ${duplicateBackfillBatchIdsRemoved}`);
   }
 
-  const insertResult = await pool.query(
-    `INSERT INTO historical_validation.dataset_manifests(
-       dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals,
-       data_from, data_to, backfill_batch_ids, source_formal_semantics, research_availability_rule_version,
-       record_count, per_interval_record_count, integrity_check_result, manifest_members
-     ) VALUES ($1,$2,$3,$4,$5::jsonb,to_timestamp($6/1000.0),to_timestamp($7/1000.0),$8::jsonb,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb)
-     ON CONFLICT (dataset_version) DO NOTHING`,
-    [
-      datasetVersion,
-      contentObject.manifestSchemaVersion,
-      contentObject.manifestHashAlgorithmVersion,
-      symbol,
-      JSON.stringify(sortedIntervals),
-      from,
-      to,
-      JSON.stringify(backfillBatchIds),
-      contentObject.sourceFormalSemantics,
-      contentObject.researchAvailabilityRuleVersion,
-      recordCount,
-      JSON.stringify(perIntervalRecordCount),
-      JSON.stringify(contentObject.integrityCheckResult),
-      JSON.stringify(manifestMembers)
-    ]
-  );
+  const { identity: logicalWindowIdentity, logicalWindowHash } = canonicalManifestLogicalWindow({ fixedAsOf, from, to, symbols: [symbol], intervals: sortedIntervals, marketType });
+  const inserted = await persistGovernedManifest(pool, { datasetVersion, contentObject, symbol, sortedIntervals, from, to, fixedAsOf, backfillBatchIds, recordCount, perIntervalRecordCount, manifestMembers, logicalWindowHash });
 
   return {
     status: 'SUCCEEDED',
@@ -137,7 +198,11 @@ export async function buildDatasetManifest({ pool, symbol, intervals, from, to, 
     recordCount,
     perIntervalRecordCount,
     integrityCheckResult: contentObject.integrityCheckResult,
-    inserted: insertResult.rowCount > 0,
+    inserted,
+    fixedAsOf,
+    logicalWindowIdentity,
+    logicalWindowHash,
+    groupStatistics: computed.groupStatistics,
     warnings
   };
 }

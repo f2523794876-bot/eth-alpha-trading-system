@@ -16,28 +16,45 @@
 
 import { INTERVAL_MS } from '../domain/constants.js';
 
-// 对指定 (instrument, marketType, interval, [from,to)) 范围内的 formal K线做严格的
-// 步长/重复/顺序/边界覆盖检测，返回 gapCount/duplicateCount/outOfOrderCount 三项结果与明细。
-export async function checkIntegrity(pool, { instrument, marketType = 'spot', interval, from, to }) {
+export function computeIntegrityBoundary({ from, to, asOf, interval }) {
   const stepMs = INTERVAL_MS[interval];
   if (!stepMs) throw Object.assign(new Error(`Invalid interval: ${interval}`), { code: 'INVALID_INTERVAL' });
   if (!(Number.isSafeInteger(from) && Number.isSafeInteger(to) && from < to)) {
     throw Object.assign(new Error(`Invalid integrity check range: from=${from}, to=${to}`), { code: 'INVALID_INTEGRITY_RANGE' });
   }
+  if (from % stepMs !== 0 || to % stepMs !== 0) {
+    throw Object.assign(new Error(`Integrity range must align to ${interval} UTC buckets`), { code: 'UNALIGNED_INTEGRITY_RANGE', interval, from, to });
+  }
+  const fixedAsOf = asOf ?? to - 1;
+  if (!Number.isSafeInteger(fixedAsOf)) {
+    throw Object.assign(new Error(`Invalid fixed as-of: ${fixedAsOf}`), { code: 'INVALID_AS_OF' });
+  }
+  // Binance close_time is bucket end minus 1ms. This is the first bucket boundary
+  // strictly after every candle which is closed at or before fixedAsOf.
+  const asOfExclusiveBoundary = Math.floor((fixedAsOf + 1) / stepMs) * stepMs;
+  const effectiveTo = Math.min(to, asOfExclusiveBoundary);
+  if (effectiveTo <= from) {
+    throw Object.assign(new Error('The requested range contains no candle closed by fixed as-of'), { code: 'EMPTY_AS_OF_RANGE', interval, from, to, fixedAsOf });
+  }
+  const expectedBarCount = (effectiveTo - from) / stepMs;
+  return Object.freeze({
+    interval,
+    stepMs,
+    requestedFrom: from,
+    requestedTo: to,
+    fixedAsOf,
+    effectiveFrom: from,
+    effectiveTo,
+    firstExpectedOpenTime: from,
+    lastExpectedOpenTime: effectiveTo - stepMs,
+    lastAllowedCloseTime: effectiveTo - 1,
+    expectedBarCount
+  });
+}
 
-  const result = await pool.query(
-    `SELECT open_time, close_time, revision_number
-     FROM market_bars
-     WHERE instrument=$1 AND market_type=$2 AND interval_name=$3
-       AND open_time>=to_timestamp($4/1000.0) AND open_time<to_timestamp($5/1000.0)
-     ORDER BY open_time ASC, revision_number DESC`,
-    [instrument, marketType, interval, from, to]
-  );
-
-  const rows = result.rows;
+export function inspectIntegrityRows(rows, boundary) {
+  const { effectiveFrom: from, effectiveTo: to, stepMs, expectedBarCount } = boundary;
   const toMs = v => (v instanceof Date ? v.getTime() : new Date(v).getTime());
-
-  // 去重：同一 open_time 只取最高 revision（与生产 bar-path-locator.js 的既有DISTINCT ON模式一致，不重新发明）。
   const seen = new Map();
   let duplicateCount = 0;
   for (const row of rows) {
@@ -45,8 +62,6 @@ export async function checkIntegrity(pool, { instrument, marketType = 'spot', in
     if (seen.has(key)) duplicateCount += 1; else seen.set(key, row);
   }
   const distinctRows = [...seen.values()].sort((a, b) => toMs(a.open_time) - toMs(b.open_time));
-
-  // 每根bar自身的开收盘对齐校验（与gap检测正交，未收盘/跨步长错位的bar本身就是数据问题，不论gap）。
   let outOfOrderCount = 0;
   const outOfOrderDetails = [];
   for (const row of distinctRows) {
@@ -55,9 +70,6 @@ export async function checkIntegrity(pool, { instrument, marketType = 'spot', in
     if (closeMs <= openMs) { outOfOrderCount += 1; outOfOrderDetails.push({ openTime: openMs, closeTime: closeMs, reason: 'CLOSE_NOT_AFTER_OPEN' }); }
     else if (closeMs - openMs + 1 !== stepMs) { outOfOrderCount += 1; outOfOrderDetails.push({ openTime: openMs, closeTime: closeMs, reason: 'INTERVAL_MISALIGNED' }); }
   }
-
-  // 统一的边界感知gap扫描：把[from,to)按stepMs展开为完整期望位置序列，逐位核对是否存在。
-  const expectedBarCount = Math.round((to - from) / stepMs);
   const presentOpenTimes = new Set(distinctRows.map(row => toMs(row.open_time)));
   let gapCount = 0;
   const gapDetails = [];
@@ -71,28 +83,39 @@ export async function checkIntegrity(pool, { instrument, marketType = 'spot', in
     runStart = null; runLength = 0;
   };
   for (let openTime = from; openTime < to; openTime += stepMs) {
-    if (presentOpenTimes.has(openTime)) {
-      flushRun(openTime);
-    } else {
-      if (runStart === null) runStart = openTime;
-      runLength += 1;
-    }
+    if (presentOpenTimes.has(openTime)) flushRun(openTime);
+    else { if (runStart === null) runStart = openTime; runLength += 1; }
   }
-  flushRun(null); // 若缺口一直延续到to（含整个区间为空的EMPTY_RESULT特例），在此处收尾
-
+  flushRun(null);
   return {
+    ...boundary,
     rowCount: rows.length,
     distinctRowCount: distinctRows.length,
-    expectedBarCount,
+    actualBarCount: distinctRows.length,
+    firstActualOpenTime: distinctRows.length ? toMs(distinctRows[0].open_time) : null,
+    lastActualOpenTime: distinctRows.length ? toMs(distinctRows.at(-1).open_time) : null,
     emptyResult: distinctRows.length === 0,
     firstBarMissing: !presentOpenTimes.has(from),
     lastBarMissing: !presentOpenTimes.has(to - stepMs),
-    gapCount,
-    duplicateCount,
-    outOfOrderCount,
-    gapDetails,
-    outOfOrderDetails
+    gapCount, duplicateCount, outOfOrderCount, gapDetails, outOfOrderDetails,
+    countMatches: distinctRows.length === expectedBarCount
   };
+}
+
+// 对指定 (instrument, marketType, interval, [from,to)) 范围内的 formal K线做严格的
+// 步长/重复/顺序/边界覆盖检测，返回 gapCount/duplicateCount/outOfOrderCount 三项结果与明细。
+export async function checkIntegrity(pool, { instrument, marketType = 'spot', interval, from, to, asOf }) {
+  const boundary = computeIntegrityBoundary({ from, to, asOf, interval });
+
+  const result = await pool.query(
+    `SELECT open_time, close_time, revision_number
+     FROM market_bars
+     WHERE instrument=$1 AND market_type=$2 AND interval_name=$3
+       AND open_time>=to_timestamp($4/1000.0) AND open_time<to_timestamp($5/1000.0)
+     ORDER BY open_time ASC, revision_number DESC`,
+    [instrument, marketType, interval, boundary.effectiveFrom, boundary.effectiveTo]
+  );
+  return inspectIntegrityRows(result.rows, boundary);
 }
 
 // §2.8 integrity_check_result 冻结形状：{gapCount, duplicateCount, outOfOrderCount}——
