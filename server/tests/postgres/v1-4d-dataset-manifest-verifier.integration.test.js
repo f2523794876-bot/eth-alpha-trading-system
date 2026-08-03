@@ -7,8 +7,10 @@ import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { buildDatasetManifest, computeManifestContentForRange } from '../../src/validation-replay/dataset-manifest-builder.js';
 import { verifyDatasetManifest } from '../../src/validation-replay/dataset-manifest-verifier.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 
 function makeMockAdapter({ pages, serverTimeMs }) {
   let call = 0;

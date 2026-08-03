@@ -12,7 +12,9 @@ import { FeatureEngine } from '../../src/features/feature-engine.js';
 import { ForecastGenerator, LEASE_NAME as GENERATOR_LEASE } from '../../src/forecast/generator-service.js';
 import { OutcomeEvaluator, LEASE_NAME as EVALUATOR_LEASE } from '../../src/outcome/evaluator-service.js';
 
-const url = process.env.TEST_DATABASE_URL, enabled = Boolean(url), pgtest = enabled ? test : test.skip;
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
+const url = process.env.TEST_DATABASE_URL, enabled = isPostgresIntegrationTestAuthorized(url), pgtest = enabled ? test : test.skip;
 const FIFTEEN_MIN_MS = 900000, FOUR_HOUR_MS = 14400000;
 const END = 1_767_311_999_999; // P1-2修复：referenceBar须精确落在4H/UTC自然日边界，此值同时满足两者
 let pool, repo, seedLease, featureLease;

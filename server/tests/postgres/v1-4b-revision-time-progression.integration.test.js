@@ -6,8 +6,10 @@ import { runMigrations } from '../../src/db/migrate.js';
 import { normalizeKlines, normalizeFunding, normalizeOpenInterest, normalizeLongShort, normalizeTakerFlow } from '../../src/domain/normalize.js';
 import { sha256 } from '../../src/domain/hash.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const url = process.env.TEST_DATABASE_URL;
-const enabled = Boolean(url);
+const enabled = isPostgresIntegrationTestAuthorized(url);
 const pgtest = enabled ? test : test.skip;
 const BASE = 1_830_000_000_000;
 const ADVANCE_MS = 3 * 3_600_000; // real wall-clock progression between original capture and a later revision

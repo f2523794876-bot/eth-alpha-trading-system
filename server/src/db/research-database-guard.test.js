@@ -254,3 +254,46 @@ test('createGuardedResearchPgPool（P2-B）：query()本身抛出未分类异常
     (e) => e === originalError
   );
 });
+
+// Round 3（测试安全加固，Part 2）：补充此前独立复审标记为"代码结构上安全但缺少显式回归测试"的两个
+// 边缘路径，只补测试，不改动createGuardedResearchPgPool本身的实现——本次复核确认既有实现已经满足
+// 这两条要求（createPgPool()调用在try块之外，其自身抛错时不会进入引用pool的catch块；
+// identity.rows?.[0]?.database的可选链在rows为空数组时安全求值为undefined，与目标库名比较不相等，
+// 走DATABASE_TARGET_REJECTED的既有fail-closed路径）。
+test('createGuardedResearchPgPool（边缘补充）：createPgPool()自身抛出的错误必须原样传播，不得尝试对不存在的pool调用end()，也不得产生任何二次/包装错误', async () => {
+  const originalError = Object.assign(new Error('ECONNREFUSED: connection refused'), { code: 'ECONNREFUSED' });
+  let endCalled = false;
+  const createPgPool = async () => {
+    // 用一个会记录end()调用次数、但根本不会被返回给调用方的"影子pool"来证明：即使某个实现细节
+    // 意外持有了一个pool引用，也绝不会有代码路径调用其end()——因为createPgPool()本身在返回前就
+    // 已经抛出，调用方（createGuardedResearchPgPool）在await这一行就直接向上传播异常，
+    // 根本没有机会拿到、也没有变量绑定到任何pool对象。
+    throw originalError;
+  };
+  await assert.rejects(
+    createGuardedResearchPgPool({ databaseUrl: 'postgresql://u:p@localhost:5432/eth_alpha_v14d_test' }, { createPgPool }),
+    (e) => e === originalError && e.code === 'ECONNREFUSED'
+  );
+  assert.equal(endCalled, false, 'createPgPool()自身抛错时，不存在可供调用end()的pool，因此end()一定未被调用');
+});
+
+test('createGuardedResearchPgPool（边缘补充）：current_database()查询成功返回但rows为空数组时，必须fail-closed为DATABASE_TARGET_REJECTED，且尝试关闭已建立的连接；pool.end()此时若失败，仍不得覆盖原始的DATABASE_TARGET_REJECTED', async () => {
+  const pool = {
+    calls: { query: 0, end: 0 },
+    async query() {
+      this.calls.query += 1;
+      return { rows: [] }; // 空rows：identity.rows?.[0]?.database 求值为undefined
+    },
+    async end() {
+      this.calls.end += 1;
+      throw new Error('SECONDARY_CLEANUP_FAILURE：连接池关闭本身失败，属于次要问题');
+    }
+  };
+  const createPgPool = async () => pool;
+  await assert.rejects(
+    createGuardedResearchPgPool({ databaseUrl: 'postgresql://u:p@localhost:5432/eth_alpha_v14d_test' }, { createPgPool }),
+    (e) => e.code === 'DATABASE_TARGET_REJECTED' && e.declaredDatabaseName === 'eth_alpha_v14d_test' && e.actualDatabaseName === undefined
+  );
+  assert.equal(pool.calls.query, 1, 'rows为空也只应该执行一次身份核验查询，不得重试或发起其他查询');
+  assert.equal(pool.calls.end, 1, '即使rows为空，已建立的连接仍必须被尝试关闭一次');
+});

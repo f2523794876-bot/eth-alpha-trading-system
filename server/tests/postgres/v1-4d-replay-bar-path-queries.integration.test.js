@@ -15,9 +15,11 @@ import {
   computeFourHourAtr14ForReplay, computeConsecutiveBreakoutBarsForReplay
 } from '../../src/validation-replay/replay-bar-path-queries.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 const FIFTEEN_MIN_MS = 900000;
 const FOUR_HOUR_MS = 14400000;
 

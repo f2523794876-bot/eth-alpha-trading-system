@@ -7,8 +7,9 @@ import {normalizeKlines,normalizeFunding,normalizeOpenInterest,normalizeLongShor
 import {canonicalJsonHash} from '../../src/domain/hash.js';
 import {FeatureEngine} from '../../src/features/feature-engine.js';
 import {FeatureGeneratorService} from '../../src/features/generator-service.js';
+import {isPostgresIntegrationTestAuthorized} from './_pg-integration-gate.js';
 
-const url=process.env.TEST_DATABASE_URL,enabled=Boolean(url),pgtest=enabled?test:test.skip,END=1_784_400_000_000;
+const url=process.env.TEST_DATABASE_URL,enabled=isPostgresIntegrationTestAuthorized(url),pgtest=enabled?test:test.skip,END=1_784_400_000_000;
 let pool,repo,lease;
 const response=(body,receivedAt=END)=>({body,requestId:randomUUID(),status:200,headers:{},startedAt:receivedAt-1,receivedAt});
 async function seedBars(instrument,interval,step,marketType='spot'){

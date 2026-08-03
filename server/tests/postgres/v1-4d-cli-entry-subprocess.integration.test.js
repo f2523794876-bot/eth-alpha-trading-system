@@ -16,9 +16,11 @@ import { randomUUID } from 'node:crypto';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { buildDatasetManifest } from '../../src/validation-replay/dataset-manifest-builder.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const execFileAsync = promisify(execFile);
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_ENTRY_PATH = path.resolve(__dirname, '../../src/validation-replay/cli-entry.js');

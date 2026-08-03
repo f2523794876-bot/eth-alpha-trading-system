@@ -349,13 +349,18 @@ test('exitCodeForCliError：本CLI实际会抛出的三个数据库保护错误�
 // 真实子进程级别验证：不经任何mock，直接spawn真实CLI文件，核对操作系统层面观察到的实际exit code。
 // 三种数据库保护场景均使用完整合法的FULL_NEW_TASK_ARGS越过DB连接之前的所有参数校验（含
 // validateCliArgsBeforeDbAccess），只在数据库保护阶段失败，耗时应为毫秒级，不会真正访问网络或数据库。
+// Round 3（测试安全加固）：spawnCli不得在内部对env做任何隐式合并——此前`{...process.env, ...env}`的
+// 写法会让调用方对`env`副本执行的`delete env.DATABASE_URL`形同虚设，导致"DATABASE_URL缺失"场景在
+// 宿主进程本身已设置DATABASE_URL的环境下会静默把真实DATABASE_URL泄漏给子进程。修复：spawnCli改为
+// 直接透传调用方给定的完整env对象给spawnSync，不再做任何二次合并。
 function spawnCli(env, argv) {
-  return spawnSync(process.execPath, [CLI_PATH, ...argv], { encoding: 'utf8', env: { ...process.env, ...env } });
+  return spawnSync(process.execPath, [CLI_PATH, ...argv], { encoding: 'utf8', env });
 }
 
 test('真实子进程：DATABASE_URL缺失 → exit 5，且STARTUP_BANNER仍先于失败打印（banner顺序红线不受影响）', () => {
   const env = { ...process.env };
   delete env.DATABASE_URL;
+  assert.equal(env.DATABASE_URL, undefined, '子进程env对象本身必须确实不含DATABASE_URL这个key');
   const result = spawnCli(env, VALID_ARGV);
   assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
   assert.match(result.stderr, /DATABASE_URL_REQUIRED/);
@@ -363,21 +368,45 @@ test('真实子进程：DATABASE_URL缺失 → exit 5，且STARTUP_BANNER仍先�
 });
 
 test('真实子进程：DATABASE_URL格式非法 → exit 5', () => {
-  const result = spawnCli({ DATABASE_URL: 'not-a-url' }, VALID_ARGV);
+  const env = { ...process.env, DATABASE_URL: 'not-a-url' };
+  const result = spawnCli(env, VALID_ARGV);
   assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
   assert.match(result.stderr, /DATABASE_URL_INVALID/);
 });
 
 test('真实子进程：DATABASE_URL指向生产eth_alpha → exit 5', () => {
-  const result = spawnCli({ DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/eth_alpha' }, VALID_ARGV);
+  const env = { ...process.env, DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/eth_alpha' };
+  const result = spawnCli(env, VALID_ARGV);
   assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
   assert.match(result.stderr, /DATABASE_TARGET_REJECTED/);
   assert.doesNotMatch(result.stderr, /u:p@127\.0\.0\.1/, '不得在stderr中泄漏连接串/用户名/密码');
 });
 
 test('真实子进程：普通业务错误（--resume未带值，INVALID_RESUME_ID，先于DB阶段被拒绝）→ exit 1，与数据库失败码不同', () => {
-  const result = spawnCli({}, ['--resume']);
+  const env = { ...process.env };
+  const result = spawnCli(env, ['--resume']);
   assert.equal(result.status, 1);
   assert.notEqual(result.status, DATABASE_FAILURE_EXIT_CODE);
   assert.match(result.stderr, /INVALID_RESUME_ID/);
+});
+
+// Round 3（测试安全加固）：环境隔离回归证明——父进程即使预先设置了危险的DATABASE_URL哨兵（模拟
+// 复审指出的风险场景，指向生产eth_alpha），"DATABASE_URL缺失"子进程构造仍必须真正拿不到任何
+// DATABASE_URL，得到与父进程环境无关的DATABASE_URL_REQUIRED/exit 5，且stderr不得包含哨兵凭据。
+test('真实子进程（环境隔离回归）：父进程即使预先设置危险的DATABASE_URL哨兵（指向生产eth_alpha），"DATABASE_URL缺失"子进程仍必须得到DATABASE_URL_REQUIRED/exit 5，且不泄漏哨兵凭据', () => {
+  const SENTINEL = 'postgresql://sentinel_user:sentinel_pw@127.0.0.1:5432/eth_alpha';
+  const originalDatabaseUrl = process.env.DATABASE_URL;
+  process.env.DATABASE_URL = SENTINEL;
+  try {
+    const env = { ...process.env };
+    delete env.DATABASE_URL;
+    assert.equal(env.DATABASE_URL, undefined, '子进程env对象本身必须确实不含DATABASE_URL这个key，即使父进程process.env当前确实设置了它');
+    const result = spawnCli(env, VALID_ARGV);
+    assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
+    assert.match(result.stderr, /DATABASE_URL_REQUIRED/);
+    assert.doesNotMatch(result.stderr, /sentinel_user|sentinel_pw|sentinel_user:sentinel_pw@127\.0\.0\.1/, '哨兵连接串的用户名/密码/authority不得出现在stderr');
+  } finally {
+    if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDatabaseUrl;
+  }
 });

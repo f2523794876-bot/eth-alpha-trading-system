@@ -6,8 +6,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Pool } from 'pg';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 
 // V1_4D_HISTORICAL_REPLAY_SPEC.md §三.0冻结的建表顺序（先被引用者先建）。
 const EXPECTED_TABLES_IN_BUILD_ORDER = Object.freeze([

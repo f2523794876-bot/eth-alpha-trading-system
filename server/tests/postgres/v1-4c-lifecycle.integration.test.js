@@ -24,7 +24,9 @@ import { OutcomeEvaluator, LEASE_NAME as EVALUATOR_LEASE } from '../../src/outco
 import { startStagesWithRollback, stopStagesInOrder, createIdempotentCloser } from '../../src/lifecycle.js';
 import { bootstrap } from '../../src/index.js';
 
-const url = process.env.TEST_DATABASE_URL, enabled = Boolean(url), pgtest = enabled ? test : test.skip;
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
+const url = process.env.TEST_DATABASE_URL, enabled = isPostgresIntegrationTestAuthorized(url), pgtest = enabled ? test : test.skip;
 let pool;
 const COLLECTOR_LEASE = 'primary-collector';
 

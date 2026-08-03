@@ -8,8 +8,10 @@ import { canonicalJsonHash } from '../../src/domain/hash.js';
 import { sha256 } from '../../src/domain/hash.js';
 import { normalizeFunding, normalizeLongShort, normalizeOpenInterest, normalizeTakerFlow } from '../../src/domain/normalize.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const url=process.env.TEST_DATABASE_URL;
-const enabled=Boolean(url);
+const enabled=isPostgresIntegrationTestAuthorized(url);
 const pgtest=enabled?test:test.skip;
 const NOW=1_784_000_000_000, OPEN=NOW-1_800_000;
 let pool,repo,lease,collector;

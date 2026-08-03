@@ -11,8 +11,10 @@ import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { computeFourHourAtr14ForReplay, locatePathForEvaluationForReplay } from '../../src/validation-replay/replay-bar-path-queries.js';
 import { computeFourHourAtr14, locatePathForEvaluation } from '../../src/forecast/bar-path-locator.js';
 
+import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
+
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
-const skip = !TEST_DATABASE_URL;
+const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
 const FOUR_HOUR_MS = 14400000;
 const FIFTEEN_MIN_MS = 900000;
 
