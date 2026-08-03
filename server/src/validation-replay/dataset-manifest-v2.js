@@ -146,6 +146,45 @@ export function validateV2ManifestGroups(groups) {
   return { ok: mismatches.length === 0, mismatches };
 }
 
+function isPgPool(connection) {
+  return connection &&
+    typeof connection.connect === 'function' &&
+    typeof connection.query === 'function' &&
+    Number.isInteger(connection.totalCount) &&
+    Number.isInteger(connection.idleCount) &&
+    Number.isInteger(connection.waitingCount);
+}
+
+// An externally supplied Client/PoolClient remains caller-owned, including its
+// surrounding transaction. Only a pg.Pool checkout is owned and released here.
+export async function withManifestPersistenceConnection(connection, work) {
+  if (!connection || typeof connection.query !== 'function') {
+    throw Object.assign(new Error('A PostgreSQL Pool or connected Client is required'), { code: 'DATABASE_CONNECTION_REQUIRED' });
+  }
+  if (!isPgPool(connection)) return work(connection);
+
+  const client = await connection.connect();
+  let transactionStarted = false;
+  try {
+    await client.query('BEGIN');
+    transactionStarted = true;
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    if (transactionStarted) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackError) {
+        if (error && (typeof error === 'object' || typeof error === 'function')) error.rollbackError = rollbackError;
+      }
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function persist(pool, computed, window) {
   const execute = async client => {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`dataset-manifest:${window.logicalWindowHash}`]);
@@ -180,19 +219,7 @@ async function persist(pool, computed, window) {
       throw error;
     }
   };
-  if (typeof pool.connect !== 'function') return execute(pool);
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await execute(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
+  return withManifestPersistenceConnection(pool, execute);
 }
 
 export async function buildDatasetManifestV2({ pool, from, to, fixedAsOf, dryRun = false }) {
