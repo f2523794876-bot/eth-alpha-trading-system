@@ -8,6 +8,7 @@
 // 因此只要调用方在resume/dry-run时都重新调用一次本函数，第7/8步的"不得跳过"要求自然满足。
 
 import { computeManifestContentForRange, findOverlappingBackfillBatchIds, RESEARCH_AVAILABILITY_RULE_VERSION } from './dataset-manifest-builder.js';
+import { verifyDatasetManifestV2 } from './dataset-manifest-verifier-v2.js';
 
 function toEpochMs(value) {
   return value instanceof Date ? value.getTime() : new Date(value).getTime();
@@ -31,24 +32,55 @@ function perIntervalRecordCountEqual(a, b) {
 }
 
 // dataset_version: 待验证的声明（不可信输入，见§4.1a红线）。
-export async function verifyDatasetManifest({ pool, datasetVersion, marketType = 'spot', currentResearchAvailabilityRuleVersion = RESEARCH_AVAILABILITY_RULE_VERSION }) {
+export async function verifyDatasetManifest({ pool, datasetVersion, marketType = 'spot', requiredContractVersion, currentResearchAvailabilityRuleVersion = RESEARCH_AVAILABILITY_RULE_VERSION }) {
   // 第1步：manifest必须存在。
   const manifestResult = await pool.query('SELECT * FROM historical_validation.dataset_manifests WHERE dataset_version=$1', [datasetVersion]);
   if (!manifestResult.rowCount) {
     return { ok: false, errorCode: 'DATASET_MANIFEST_NOT_FOUND', datasetVersion };
   }
   const manifest = manifestResult.rows[0];
+  const contractVersion = Number(manifest.manifest_contract_version);
+  if (![1, 2].includes(contractVersion) || (requiredContractVersion !== undefined && contractVersion !== requiredContractVersion)) {
+    return { ok: false, errorCode: 'DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED', datasetVersion, manifestContractVersion: manifest.manifest_contract_version, requiredContractVersion };
+  }
+  if (contractVersion === 2) return verifyDatasetManifestV2({ pool, datasetVersion, manifest, currentResearchAvailabilityRuleVersion });
   const symbol = manifest.symbol;
   const intervals = manifest.intervals;
   const from = toEpochMs(manifest.data_from);
   const to = toEpochMs(manifest.data_to);
   const manifestBackfillBatchIds = manifest.backfill_batch_ids;
+  const fixedAsOf = manifest.fixed_as_of ? toEpochMs(manifest.fixed_as_of) : to - 1;
+
+  // Legacy manifests created before migration 006 have no logical_window_hash.
+  // Infer their fixed as-of as data_to-1ms and still reject an ambiguous window;
+  // this protects Feature Backfill without mutating or deleting either old row.
+  const sameWindow = await pool.query(
+    `SELECT dataset_version FROM historical_validation.dataset_manifests
+     WHERE symbol=$1 AND data_from=$2 AND data_to=$3 AND intervals=$4::jsonb
+       AND source_formal_semantics=$5
+       AND COALESCE(fixed_as_of, data_to - interval '1 millisecond')=to_timestamp($6/1000.0)
+     ORDER BY dataset_version`,
+    [symbol, manifest.data_from, manifest.data_to, JSON.stringify(intervals), manifest.source_formal_semantics, fixedAsOf]
+  );
+  if (sameWindow.rowCount !== 1 || sameWindow.rows[0].dataset_version !== datasetVersion) {
+    return { ok: false, errorCode: 'DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT', datasetVersion, conflictingDatasetVersions: sameWindow.rows.map(row => row.dataset_version) };
+  }
+
+  if (manifest.logical_window_hash) {
+    const conflicts = await pool.query(
+      `SELECT dataset_version FROM historical_validation.dataset_manifests WHERE logical_window_hash=$1 ORDER BY dataset_version`,
+      [manifest.logical_window_hash]
+    );
+    if (conflicts.rowCount !== 1 || conflicts.rows[0].dataset_version !== datasetVersion) {
+      return { ok: false, errorCode: 'DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT', datasetVersion, conflictingDatasetVersions: conflicts.rows.map(row => row.dataset_version) };
+    }
+  }
 
   // 第2步：用manifest记录的symbol/intervals/data_from/data_to/backfill_batch_ids，
   // 对public.market_bars重新执行与manifest构建时完全相同的查询与§2.9规范化序列化，
   // 复用 dataset-manifest-builder.js 的 computeManifestContentForRange()——不得另写第二套判定。
   const recomputed = await computeManifestContentForRange({
-    pool, symbol, intervals, from, to, marketType,
+    pool, symbol, intervals, from, to, fixedAsOf, marketType,
     backfillBatchIds: manifestBackfillBatchIds
   });
 

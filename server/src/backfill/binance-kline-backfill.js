@@ -9,6 +9,7 @@ import { validateKlineRow } from '../domain/normalize.js';
 import { sha256 } from '../domain/hash.js';
 import { measureServerTime } from '../collector/time-guard.js';
 import { INTERVAL_MS, SCHEMA_VERSION, NORMALIZER_VERSION } from '../domain/constants.js';
+import { computeIntegrityBoundary, inspectIntegrityRows } from './integrity-check.js';
 
 const MARKET_BAR_COLUMNS = Object.freeze([
   'source_id','endpoint_id','instrument','market_type','interval_name','open_time','close_time',
@@ -43,7 +44,8 @@ async function insertRawPayload(pool, { sourceId, endpointId, fetchedAt, httpSta
 export async function backfillInterval({
   pool, adapter, symbol, interval, marketType = 'spot',
   sourceId = 'binance-spot-rest', endpointId = 'binance-spot-klines',
-  startTime, endTime, backfillBatchId, now = Date.now, onProgress
+  startTime, endTime, fixedAsOf, requestedTo, backfillBatchId,
+  dryRun = false, now = Date.now, onProgress
 }) {
   if (!INTERVAL_MS[interval]) throw Object.assign(new Error(`Invalid interval: ${interval}`), { code: 'INVALID_INTERVAL' });
   if (!(Number.isSafeInteger(startTime) && Number.isSafeInteger(endTime) && startTime <= endTime)) {
@@ -53,27 +55,34 @@ export async function backfillInterval({
   // §2.4：回填任务启动前必须校时，fail closed。
   const serverTime = await measureServerTime(adapter, { now });
   if (!serverTime.ok) return { status: 'BLOCKED', reason: serverTime.reason || 'SERVER_TIME_UNAVAILABLE' };
-  const asOfMs = serverTime.sourceServerTime;
+  // The formal CLI always supplies fixedAsOf. The fallback is retained only for
+  // existing internal fixture callers; an explicitly supplied value is immutable.
+  const effectiveFixedAsOf = fixedAsOf ?? serverTime.sourceServerTime;
+  const effectiveRequestedTo = requestedTo ?? (Math.floor(endTime / INTERVAL_MS[interval]) * INTERVAL_MS[interval] + INTERVAL_MS[interval]);
+  const boundary = computeIntegrityBoundary({ from: startTime, to: effectiveRequestedTo, asOf: effectiveFixedAsOf, interval });
+  const requestEndTime = Math.min(endTime, boundary.lastExpectedOpenTime);
 
   let cursor = startTime;
   let rowsInserted = 0;
   let rowsDeduped = 0;
   let rowsRejected = 0;
   let lastCompletedOpenTime = null;
+  const dryRunRows = [];
 
-  while (cursor <= endTime) {
-    const response = await adapter.spotKlines(symbol, interval, { startTime: cursor, endTime, limit: PAGE_LIMIT });
+  while (cursor <= requestEndTime) {
+    const response = await adapter.spotKlines(symbol, interval, { startTime: cursor, endTime: requestEndTime, limit: PAGE_LIMIT });
     const rows = Array.isArray(response.body) ? response.body : [];
     if (!rows.length) break;
 
     // §2.8：回填任务实际执行的真实系统时间——available_at/fetched_at 均取此值，不取 close_time。
     const fetchedAtMs = now();
-    const rawPayloadId = await insertRawPayload(pool, {
+    const rawPayloadId = dryRun ? null : await insertRawPayload(pool, {
       sourceId, endpointId, fetchedAt: fetchedAtMs, httpStatus: response.status,
       headers: response.headers, payload: rows, schemaVersion: 'binance-kline-v1', requestId: response.requestId
     });
 
     let previousOpenTime = null;
+    let pageLastCompletedOpenTime = null;
     for (const row of rows) {
       const errors = validateKlineRow(row, interval);
       const [openTime, open, high, low, close, volume, closeTime, quoteVolume, tradeCount, takerBuyBaseVolume, takerBuyQuoteVolume] = row;
@@ -81,7 +90,14 @@ export async function backfillInterval({
       previousOpenTime = openTime;
       if (errors.length) { rowsRejected += 1; continue; }
       // §2.5：仅接受已收盘K线——最后一页可能包含尚未收盘的当前K线，必须过滤丢弃。
-      if (closeTime > asOfMs) continue;
+      if (openTime < boundary.effectiveFrom || openTime >= boundary.effectiveTo || closeTime > effectiveFixedAsOf) continue;
+      pageLastCompletedOpenTime = openTime;
+
+      if (dryRun) {
+        dryRunRows.push({ open_time: new Date(openTime), close_time: new Date(closeTime), revision_number: 0 });
+        rowsInserted += 1;
+        continue;
+      }
 
       const vintageId = vintageIdFor(symbol, marketType, interval, closeTime);
       const contentHash = sha256({ openTime, closeTime, open, high, low, close, volume, quoteVolume });
@@ -101,8 +117,12 @@ export async function backfillInterval({
       if (result.rowCount) rowsInserted += 1; else rowsDeduped += 1;
     }
 
-    lastCompletedOpenTime = rows[rows.length - 1][0];
-    if (backfillBatchId) {
+    if (pageLastCompletedOpenTime === null) {
+      if (rows.length >= PAGE_LIMIT) throw Object.assign(new Error('Backfill page contained no eligible candle within fixed as-of'), { code: 'BACKFILL_PAGE_NO_ELIGIBLE_PROGRESS', cursor, fixedAsOf: effectiveFixedAsOf });
+      break;
+    }
+    lastCompletedOpenTime = pageLastCompletedOpenTime;
+    if (backfillBatchId && !dryRun) {
       await pool.query(
         `UPDATE historical_validation.backfill_batches
          SET last_completed_open_time=to_timestamp($1/1000.0), rows_inserted=$2, rows_deduped=$3
@@ -130,5 +150,10 @@ export async function backfillInterval({
     cursor = nextCursor;
   }
 
-  return { status: 'SUCCEEDED', rowsInserted, rowsDeduped, rowsRejected, lastCompletedOpenTime };
+  return {
+    status: dryRun ? 'DRY_RUN' : 'SUCCEEDED', dryRun, rowsInserted, rowsDeduped, rowsRejected, lastCompletedOpenTime,
+    fixedAsOf: effectiveFixedAsOf, fixedAsOfUtc: new Date(effectiveFixedAsOf).toISOString(),
+    boundary,
+    ...(dryRun ? { integrity: inspectIntegrityRows(dryRunRows, boundary) } : {})
+  };
 }

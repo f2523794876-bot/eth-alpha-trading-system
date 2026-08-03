@@ -132,10 +132,10 @@ async function seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTim
 async function seedValidationRun(client, { validationRunId, from, to }) {
   await client.query(
     `INSERT INTO historical_validation.dataset_manifests(
-       dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals, data_from, data_to,
+       dataset_version, manifest_schema_version, manifest_hash_algorithm_version, manifest_contract_version, dataset_type, symbol, intervals, data_from, data_to,
        backfill_batch_ids, source_formal_semantics, research_availability_rule_version, record_count, per_interval_record_count,
        integrity_check_result, manifest_members
-     ) VALUES($1,'v1.4d-manifest-schema-1','v1.4d-manifest-hash-1','ETHUSDT','["15m","4h"]'::jsonb,to_timestamp($2/1000.0),to_timestamp($3/1000.0),
+     ) VALUES($1,'v1.4d-manifest-schema-1','v1.4d-manifest-hash-1',1,'MARKET_BARS','ETHUSDT','["15m","4h"]'::jsonb,to_timestamp($2/1000.0),to_timestamp($3/1000.0),
        '[]'::jsonb,'market_bars:formal:spot',$4,0,'{}'::jsonb,'{"gapCount":0,"duplicateCount":0,"outOfOrderCount":0}'::jsonb,'[]'::jsonb)
      ON CONFLICT(dataset_version) DO NOTHING`,
     [DATASET_VERSION, from, to, RESEARCH_AVAILABILITY_RULE_VERSION]

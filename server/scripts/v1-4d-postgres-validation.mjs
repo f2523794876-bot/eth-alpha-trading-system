@@ -173,7 +173,7 @@ try {
   await runMigrations(pool, 'up');
   const migrationResult = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
   results.migrations = migrationResult.rows.map(row => row.version);
-  const expectedMigrations = ['001', '002', '003', '004', '005'];
+  const expectedMigrations = ['001', '002', '003', '004', '005', '006', '007'];
   if (JSON.stringify(results.migrations) !== JSON.stringify(expectedMigrations)) {
     throw new Error(`migration set mismatch: ${JSON.stringify(results.migrations)}`);
   }

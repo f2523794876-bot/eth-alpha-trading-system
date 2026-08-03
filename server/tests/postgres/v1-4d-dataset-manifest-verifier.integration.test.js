@@ -155,10 +155,10 @@ test('R26.6：manifest行record_count列与其自身content_hash内在不一致�
     // 真实、正确、自洽的计算结果，唯独record_count列故意写入错误值——这正是R26.6要求的构造方式。
     await client.query(
       `INSERT INTO historical_validation.dataset_manifests(
-         dataset_version, manifest_schema_version, manifest_hash_algorithm_version, symbol, intervals,
+         dataset_version, manifest_schema_version, manifest_hash_algorithm_version, manifest_contract_version, dataset_type, symbol, intervals,
          data_from, data_to, backfill_batch_ids, source_formal_semantics, research_availability_rule_version,
          record_count, per_interval_record_count, integrity_check_result, manifest_members
-       ) VALUES ($1,$2,$3,$4,$5::jsonb,to_timestamp($6/1000.0),to_timestamp($7/1000.0),$8::jsonb,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb)`,
+       ) VALUES ($1,$2,$3,1,'MARKET_BARS',$4,$5::jsonb,to_timestamp($6/1000.0),to_timestamp($7/1000.0),$8::jsonb,$9,$10,$11,$12::jsonb,$13::jsonb,$14::jsonb)`,
       [
         correctDatasetVersion,
         computed.contentObject.manifestSchemaVersion,

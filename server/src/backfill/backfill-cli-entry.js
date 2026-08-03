@@ -11,7 +11,8 @@ import { createGuardedResearchPgPool, exitCodeForCliError } from '../db/research
 import { PublicHttpClient } from '../http/client.js';
 import { BinancePublicAdapter } from '../sources/binance.js';
 import { backfillInterval } from './binance-kline-backfill.js';
-import { checkIntegrity } from './integrity-check.js';
+import { checkIntegrity, computeIntegrityBoundary } from './integrity-check.js';
+import { INTERVAL_MS } from '../domain/constants.js';
 
 const UTC_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
 
@@ -43,7 +44,7 @@ export function parseUtc(value, label) {
 // 是针对原(symbol,interval,range)算出来的，套到不同symbol/interval/range上会产生错误的续跑起点）。
 // 拒绝必须发生在任何market_bars写入（backfillInterval调用）之前——本函数在此处提前return/throw，
 // 不会走到下面的backfillInterval()。
-function assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTime, backfillBatchId }) {
+export function assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTime, fixedAsOf, backfillBatchId }) {
   if (batch.symbol !== symbol || batch.interval_name !== interval) {
     throw Object.assign(
       new Error(`--resume batch ${backfillBatchId} was recorded for (symbol=${batch.symbol}, interval=${batch.interval_name}), not (symbol=${symbol}, interval=${interval}); refusing to resume across a mismatched symbol/interval`),
@@ -58,18 +59,32 @@ function assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTi
       { code: 'BACKFILL_RESUME_RANGE_MISMATCH' }
     );
   }
+  const batchAsOfMs = new Date(batch.fixed_as_of).getTime();
+  if (batchAsOfMs !== fixedAsOf) {
+    throw Object.assign(new Error(`--resume batch ${backfillBatchId} has a different fixed as-of`), {
+      code: 'BACKFILL_RESUME_AS_OF_MISMATCH', expectedAsOf: batchAsOfMs, actualAsOf: fixedAsOf
+    });
+  }
 }
 
 // §2.12：回填前基线记录 + 回填后完整性校验；任一失败则整批标记 ATTENTION_REQUIRED，不自动重试覆盖。
-export async function runBackfillForInterval({ pool, adapter, symbol, interval, startTime, endTime, resumeBatchId, now = Date.now }) {
+export async function runBackfillForInterval({ pool, adapter, symbol, interval, startTime, endTime, fixedAsOf, resumeBatchId, dryRun = false, now = Date.now }) {
+  if (!Number.isSafeInteger(fixedAsOf)) throw Object.assign(new Error('--as-of is required'), { code: 'AS_OF_REQUIRED' });
+  const boundary = computeIntegrityBoundary({ from: startTime, to: endTime, asOf: fixedAsOf, interval });
   let backfillBatchId = resumeBatchId;
   let resumeFrom = startTime;
+
+  if (dryRun) {
+    if (resumeBatchId) throw Object.assign(new Error('--dry-run cannot mutate or resume an existing audit batch'), { code: 'DRY_RUN_RESUME_CONFLICT' });
+    const result = await backfillInterval({ pool, adapter, symbol, interval, startTime, endTime: boundary.lastExpectedOpenTime, requestedTo: endTime, fixedAsOf, dryRun: true, now });
+    return { backfillBatchId: null, ...result, audit: { persisted: false, fixedAsOf: new Date(fixedAsOf).toISOString() } };
+  }
 
   if (backfillBatchId) {
     const existing = await pool.query('SELECT * FROM historical_validation.backfill_batches WHERE backfill_batch_id=$1', [backfillBatchId]);
     if (!existing.rowCount) throw Object.assign(new Error(`Unknown backfill_batch_id: ${backfillBatchId}`), { code: 'BACKFILL_BATCH_NOT_FOUND' });
     const batch = existing.rows[0];
-    assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTime, backfillBatchId });
+    assertResumeBatchCompatible(batch, { symbol, interval, startTime, endTime, fixedAsOf, backfillBatchId });
     // R11.4修复：--resume只能作用于真正仍处于RUNNING（进程中途被杀死、从未走到finalize）的批次。
     // 此前对已到达任一终态（SUCCEEDED/FAILED/ATTENTION_REQUIRED）的批次重新--resume，会把该行静默
     // 改回RUNNING并重写finished_at，破坏终态不可变红线（R11.4）；ATTENTION_REQUIRED批次尤其不得被
@@ -81,7 +96,7 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
         { code: 'BACKFILL_RESUME_ALREADY_TERMINAL', currentStatus: batch.status }
       );
     }
-    if (batch.last_completed_open_time) resumeFrom = new Date(batch.last_completed_open_time).getTime() + 1;
+    if (batch.last_completed_open_time) resumeFrom = new Date(batch.last_completed_open_time).getTime() + INTERVAL_MS[interval];
     // 防御性条件更新：仅在status确实仍为RUNNING时才生效，防止上面的检查与此处之间出现竞态窗口下的
     // 二次覆盖；受影响行数不为1时fail-closed，不得假装继续。
     const runningGuard = await pool.query(`UPDATE historical_validation.backfill_batches SET status='RUNNING' WHERE backfill_batch_id=$1 AND status='RUNNING'`, [backfillBatchId]);
@@ -91,14 +106,14 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
   } else {
     backfillBatchId = randomUUID();
     await pool.query(
-      `INSERT INTO historical_validation.backfill_batches(backfill_batch_id,symbol,interval_name,requested_start_utc,requested_end_utc,status,started_at)
-       VALUES($1,$2,$3,to_timestamp($4/1000.0),to_timestamp($5/1000.0),'RUNNING',now())`,
-      [backfillBatchId, symbol, interval, startTime, endTime]
+      `INSERT INTO historical_validation.backfill_batches(backfill_batch_id,symbol,interval_name,requested_start_utc,requested_end_utc,fixed_as_of,status,started_at)
+       VALUES($1,$2,$3,to_timestamp($4/1000.0),to_timestamp($5/1000.0),to_timestamp($6/1000.0),'RUNNING',now())`,
+      [backfillBatchId, symbol, interval, startTime, endTime, fixedAsOf]
     );
   }
 
   try {
-    const result = await backfillInterval({ pool, adapter, symbol, interval, startTime: resumeFrom, endTime, backfillBatchId, now });
+    const result = await backfillInterval({ pool, adapter, symbol, interval, startTime: resumeFrom, endTime: boundary.lastExpectedOpenTime, requestedTo: endTime, fixedAsOf, backfillBatchId, now });
     if (result.status === 'BLOCKED') {
       const failGuard = await pool.query(`UPDATE historical_validation.backfill_batches SET status='FAILED', error_code=$2, finished_at=now() WHERE backfill_batch_id=$1 AND status='RUNNING'`, [backfillBatchId, result.reason]);
       if (failGuard.rowCount !== 1) {
@@ -108,7 +123,7 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
     }
 
     // §2.12 回填后完整性校验：对整个请求区间（含本次之前已完成的部分）重新检测。
-    const integrity = await checkIntegrity(pool, { instrument: symbol, interval, from: startTime, to: endTime });
+    const integrity = await checkIntegrity(pool, { instrument: symbol, interval, from: startTime, to: endTime, asOf: fixedAsOf });
     if (integrity.gapCount > 0 || integrity.duplicateCount > 0 || integrity.outOfOrderCount > 0) {
       const attentionGuard = await pool.query(
         `UPDATE historical_validation.backfill_batches SET status='ATTENTION_REQUIRED', error_code='INTEGRITY_CHECK_FAILED', finished_at=now() WHERE backfill_batch_id=$1 AND status='RUNNING'`,
@@ -124,7 +139,7 @@ export async function runBackfillForInterval({ pool, adapter, symbol, interval, 
     if (successGuard.rowCount !== 1) {
       throw Object.assign(new Error(`backfill_batch_id ${backfillBatchId} status changed concurrently while recording SUCCEEDED result`), { code: 'BACKFILL_BATCH_STATE_CONFLICT' });
     }
-    return { backfillBatchId, status: 'SUCCEEDED', ...result, integrity };
+    return { backfillBatchId, status: 'SUCCEEDED', ...result, integrity, audit: { persisted: true, fixedAsOf: new Date(fixedAsOf).toISOString() } };
   } catch (error) {
     // BACKFILL_BATCH_STATE_CONFLICT已经证明该行不再处于RUNNING（上面某个防御性条件更新0行命中），
     // 该行本身未被本次调用触碰，不需要（也不应该）再尝试标记FAILED——避免对一个已经处于其它终态的行
@@ -147,6 +162,8 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
   const intervals = String(args.intervals || '').split(',').map(s => s.trim()).filter(Boolean);
   const startTime = parseUtc(args.from, '--from');
   const endTime = parseUtc(args.to, '--to');
+  if (args['as-of'] === undefined || args['as-of'] === true) throw Object.assign(new Error('--as-of is required'), { code: 'AS_OF_REQUIRED' });
+  const fixedAsOf = parseUtc(args['as-of'], '--as-of');
   if (!symbol || !intervals.length) throw Object.assign(new Error('--symbol and --intervals are required'), { code: 'MISSING_REQUIRED_ARG' });
 
   // P1-6修复（独立复审）：V1_4D_DATA_BACKFILL_SPEC.md§2.11只定义了"单个--resume续跑同一(symbol,interval)"
@@ -169,7 +186,7 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
   try {
     const results = [];
     for (const interval of intervals) {
-      const result = await runBackfillForInterval({ pool, adapter, symbol, interval, startTime, endTime, resumeBatchId: args.resume });
+      const result = await runBackfillForInterval({ pool, adapter, symbol, interval, startTime, endTime, fixedAsOf, resumeBatchId: args.resume, dryRun: args['dry-run'] === true });
       results.push({ interval, ...result });
       console.info('backfill interval complete', { interval, status: result.status, backfillBatchId: result.backfillBatchId });
     }
