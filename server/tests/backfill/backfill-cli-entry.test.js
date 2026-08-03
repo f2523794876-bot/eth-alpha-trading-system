@@ -1,7 +1,12 @@
 // R5：CLI参数与UTC时间格式fail-closed校验（静态单元测试，不需要数据库）。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { parseArgs, parseUtc, main } from '../../src/backfill/backfill-cli-entry.js';
+import { exitCodeForCliError, DATABASE_FAILURE_EXIT_CODE } from '../../src/db/research-database-guard.js';
+
+const CLI_PATH = fileURLToPath(new URL('../../src/backfill/backfill-cli-entry.js', import.meta.url));
 
 const VALID_ARGV = ['--symbol', 'ETHUSDT', '--intervals', '15m', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z'];
 
@@ -93,4 +98,52 @@ test('main()：DATABASE_URL声明eth_alpha_v14d_test但真实连接后current_da
     assert.equal(pool.calls.query, 1, '只应该执行一次身份核验查询，不得有任何业务查询');
     assert.equal(pool.calls.end, 1, '身份不符时必须关闭连接');
   });
+});
+
+// Round 2（P1闭环）：三个数据库保护错误必须映射为独立、稳定、非零的DATABASE_FAILURE_EXIT_CODE，
+// 与普通业务失败（此处用既有的RESUME_INTERVALS_CONFLICT代表）保持的默认exit 1可区分。
+test('exitCodeForCliError：本CLI实际会抛出的三个数据库保护错误码映射到DATABASE_FAILURE_EXIT_CODE，非DB错误保持默认exit 1', () => {
+  for (const code of ['DATABASE_URL_REQUIRED', 'DATABASE_URL_INVALID', 'DATABASE_TARGET_REJECTED']) {
+    assert.equal(exitCodeForCliError({ code }), DATABASE_FAILURE_EXIT_CODE);
+  }
+  for (const code of ['RESUME_INTERVALS_CONFLICT', 'MISSING_REQUIRED_ARG', 'BACKFILL_RESUME_ALREADY_TERMINAL', undefined]) {
+    assert.equal(exitCodeForCliError({ code }), 1);
+  }
+  assert.notEqual(DATABASE_FAILURE_EXIT_CODE, 1, 'DB失败码必须与普通业务失败码不同');
+});
+
+// 真实子进程级别验证：不经任何mock，直接spawn真实CLI文件，核对操作系统层面观察到的实际exit code——
+// 这是比"调用main()后检查thrown error"更强的证据，证明顶层`main().catch(...)`确实调用了
+// exitCodeForCliError并把结果真正赋给了process.exitCode。三种数据库保护场景均在触达任何网络/DB
+// 连接之前失败，耗时应为毫秒级，不会真正访问网络或数据库。
+function spawnCli(env, argv) {
+  return spawnSync(process.execPath, [CLI_PATH, ...argv], { encoding: 'utf8', env: { ...process.env, ...env } });
+}
+
+test('真实子进程：DATABASE_URL缺失 → exit 5', () => {
+  const env = { ...process.env };
+  delete env.DATABASE_URL;
+  const result = spawnCli(env, VALID_ARGV);
+  assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /DATABASE_URL_REQUIRED/);
+});
+
+test('真实子进程：DATABASE_URL格式非法 → exit 5', () => {
+  const result = spawnCli({ DATABASE_URL: 'not-a-url' }, VALID_ARGV);
+  assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /DATABASE_URL_INVALID/);
+});
+
+test('真实子进程：DATABASE_URL指向生产eth_alpha → exit 5', () => {
+  const result = spawnCli({ DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/eth_alpha' }, VALID_ARGV);
+  assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /DATABASE_TARGET_REJECTED/);
+  assert.doesNotMatch(result.stderr, /u:p@127\.0\.0\.1/, '不得在stderr中泄漏连接串/用户名/密码');
+});
+
+test('真实子进程：普通业务错误（RESUME_INTERVALS_CONFLICT，不触达数据库）→ exit 1，与数据库失败码不同', () => {
+  const result = spawnCli({}, ['--symbol', 'ETHUSDT', '--intervals', '15m,4h', '--from', '2026-01-01T00:00:00Z', '--to', '2026-01-02T00:00:00Z', '--resume', 'abc']);
+  assert.equal(result.status, 1);
+  assert.notEqual(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /RESUME_INTERVALS_CONFLICT/);
 });

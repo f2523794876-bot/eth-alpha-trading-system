@@ -4,7 +4,7 @@
 
 import { loadConfig } from '../config.js';
 import { createPgPool } from '../db/postgres.js';
-import { createGuardedResearchPgPool } from '../db/research-database-guard.js';
+import { createGuardedResearchPgPool, exitCodeForCliError } from '../db/research-database-guard.js';
 import { parseUtc } from '../backfill/backfill-cli-entry.js';
 import { buildDatasetManifest } from './dataset-manifest-builder.js';
 
@@ -47,5 +47,5 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch(error => { console.error('dataset manifest build failed', { code: error.code || error.message }); process.exitCode = 1; });
+  main().catch(error => { console.error('dataset manifest build failed', { code: error.code || error.message }); process.exitCode = exitCodeForCliError(error); });
 }

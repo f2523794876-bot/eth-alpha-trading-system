@@ -7,7 +7,7 @@
 import { randomUUID } from 'node:crypto';
 import { loadConfig } from '../config.js';
 import { createPgPool } from '../db/postgres.js';
-import { createGuardedResearchPgPool } from '../db/research-database-guard.js';
+import { createGuardedResearchPgPool, exitCodeForCliError } from '../db/research-database-guard.js';
 import { PublicHttpClient } from '../http/client.js';
 import { BinancePublicAdapter } from '../sources/binance.js';
 import { backfillInterval } from './binance-kline-backfill.js';
@@ -180,5 +180,5 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch(error => { console.error('backfill failed', { code: error.code || error.message }); process.exitCode = 1; });
+  main().catch(error => { console.error('backfill failed', { code: error.code || error.message }); process.exitCode = exitCodeForCliError(error); });
 }

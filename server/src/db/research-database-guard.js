@@ -13,6 +13,28 @@
 
 export const RESEARCH_DATABASE_NAME = 'eth_alpha_v14d_test';
 
+// Round 2（独立复审P1闭环）：统一的数据库失败退出码，供backfill-cli-entry.js/dataset-manifest-cli-entry.js/
+// validation-replay/cli-entry.js三个CLI的顶层错误处理复用，取代此前"任意错误一律exit 1"的做法——
+// 三个数据库保护错误必须与普通业务失败/网络失败/参数失败/冲突失败可区分。数值5与
+// server/src/features/historical-feature-backfill.js既有的HISTORICAL_BACKFILL_EXIT.DATABASE_FAILURE
+// 保持一致（该CLI已验证过这三个错误码与此数值的映射关系），不新发明一套数值语义。
+// 已核实：三个CLI此前均无任何测试断言过"失败必须精确等于exit 1"这一具体数值契约（只断言过非零/
+// 断言过thrown error的.code），因此引入5不构成对外公开契约的破坏性变更。
+export const DATABASE_FAILURE_EXIT_CODE = 5;
+
+const DATABASE_GUARD_ERROR_CODES = new Set(['DATABASE_URL_REQUIRED', 'DATABASE_URL_INVALID', 'DATABASE_TARGET_REJECTED']);
+
+export function isDatabaseGuardErrorCode(code) {
+  return DATABASE_GUARD_ERROR_CODES.has(code);
+}
+
+// 供三个CLI顶层catch统一调用：数据库保护错误返回独立、稳定的DATABASE_FAILURE_EXIT_CODE，
+// 其余任何错误（未识别错误、业务失败、参数失败、冲突等）保持调用方传入的defaultExitCode不变
+// （三个CLI原有行为均为1，此处不改变默认值，只新增对数据库保护错误的特殊分类）。
+export function exitCodeForCliError(error, { defaultExitCode = 1 } = {}) {
+  return isDatabaseGuardErrorCode(error?.code) ? DATABASE_FAILURE_EXIT_CODE : defaultExitCode;
+}
+
 // 仅根据连接串声明的库名做格式与身份校验，不发起任何网络/数据库连接。
 export function parseResearchDatabaseTarget(databaseUrl) {
   if (!databaseUrl) {
@@ -50,7 +72,14 @@ export async function createGuardedResearchPgPool(config, { createPgPool }) {
     }
     return pool;
   } catch (error) {
-    await pool.end();
+    // Round 2（P2-B闭环）：pool.end()本身若失败，绝不能替换掉更有诊断价值的原始安全错误
+    // （如DATABASE_TARGET_REJECTED）——清理失败是次要问题，吞掉即可，调用方始终应该看到
+    // 触发本次拒绝的真实原因，而不是一个无关的连接池关闭异常。
+    try {
+      await pool.end();
+    } catch {
+      // 清理失败不覆盖原始错误，故意留空。
+    }
     throw error;
   }
 }

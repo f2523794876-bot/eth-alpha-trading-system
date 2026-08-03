@@ -1,11 +1,16 @@
 // cli-entry.js 纯逻辑单元测试（不连接数据库）：参数解析/切分比例/顺序校验/resume一致性/节奏点枚举。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   parseArgs, parseSplitRatio, computeSplitBoundaries, validateSplitOrder, validateReplayRange,
   checkResumeParamConsistency, enumerateRhythmPoints, STARTUP_BANNER,
   validateEffectiveOptions, validateCliArgsBeforeDbAccess, main
 } from './cli-entry.js';
+import { exitCodeForCliError, DATABASE_FAILURE_EXIT_CODE } from '../db/research-database-guard.js';
+
+const CLI_PATH = fileURLToPath(new URL('./cli-entry.js', import.meta.url));
 
 const DAY_MS = 86400000;
 
@@ -327,4 +332,52 @@ test('main()：URL声明eth_alpha_v14d_test但current_database()返回其他库�
     assert.equal(calls.query, 1);
     assert.equal(calls.end, 1);
   });
+});
+
+// Round 2（P1闭环）：三个数据库保护错误必须映射为独立、稳定、非零的DATABASE_FAILURE_EXIT_CODE，
+// 与普通业务失败（此处用INVALID_RESUME_ID代表）保持的默认exit 1可区分。
+test('exitCodeForCliError：本CLI实际会抛出的三个数据库保护错误码映射到DATABASE_FAILURE_EXIT_CODE，非DB错误保持默认exit 1', () => {
+  for (const code of ['DATABASE_URL_REQUIRED', 'DATABASE_URL_INVALID', 'DATABASE_TARGET_REJECTED']) {
+    assert.equal(exitCodeForCliError({ code }), DATABASE_FAILURE_EXIT_CODE);
+  }
+  for (const code of ['MISSING_REQUIRED_ARG', 'INVALID_RESUME_ID', 'CONFLICTING_SPLIT_PARAMS', 'RESUME_PARAM_MISMATCH', 'INVALID_REPLAY_RANGE', undefined]) {
+    assert.equal(exitCodeForCliError({ code }), 1);
+  }
+  assert.notEqual(DATABASE_FAILURE_EXIT_CODE, 1);
+});
+
+// 真实子进程级别验证：不经任何mock，直接spawn真实CLI文件，核对操作系统层面观察到的实际exit code。
+// 三种数据库保护场景均使用完整合法的FULL_NEW_TASK_ARGS越过DB连接之前的所有参数校验（含
+// validateCliArgsBeforeDbAccess），只在数据库保护阶段失败，耗时应为毫秒级，不会真正访问网络或数据库。
+function spawnCli(env, argv) {
+  return spawnSync(process.execPath, [CLI_PATH, ...argv], { encoding: 'utf8', env: { ...process.env, ...env } });
+}
+
+test('真实子进程：DATABASE_URL缺失 → exit 5，且STARTUP_BANNER仍先于失败打印（banner顺序红线不受影响）', () => {
+  const env = { ...process.env };
+  delete env.DATABASE_URL;
+  const result = spawnCli(env, VALID_ARGV);
+  assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /DATABASE_URL_REQUIRED/);
+  assert.match(result.stdout, /HISTORICAL RESEARCH ONLY/);
+});
+
+test('真实子进程：DATABASE_URL格式非法 → exit 5', () => {
+  const result = spawnCli({ DATABASE_URL: 'not-a-url' }, VALID_ARGV);
+  assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /DATABASE_URL_INVALID/);
+});
+
+test('真实子进程：DATABASE_URL指向生产eth_alpha → exit 5', () => {
+  const result = spawnCli({ DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/eth_alpha' }, VALID_ARGV);
+  assert.equal(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /DATABASE_TARGET_REJECTED/);
+  assert.doesNotMatch(result.stderr, /u:p@127\.0\.0\.1/, '不得在stderr中泄漏连接串/用户名/密码');
+});
+
+test('真实子进程：普通业务错误（--resume未带值，INVALID_RESUME_ID，先于DB阶段被拒绝）→ exit 1，与数据库失败码不同', () => {
+  const result = spawnCli({}, ['--resume']);
+  assert.equal(result.status, 1);
+  assert.notEqual(result.status, DATABASE_FAILURE_EXIT_CODE);
+  assert.match(result.stderr, /INVALID_RESUME_ID/);
 });
