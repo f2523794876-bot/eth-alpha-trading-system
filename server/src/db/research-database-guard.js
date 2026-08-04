@@ -12,27 +12,61 @@
 //   - 校验失败时，连接（如果已经建立）必须被关闭，不得泄漏。
 
 export const RESEARCH_DATABASE_NAME = 'eth_alpha_v14d_test';
+export const ALLOWED_RESEARCH_DATABASE_IDENTITIES = Object.freeze(['research', 'test']);
+export const RESEARCH_DATABASE_IDENTITY_ENV = 'V14D_DATABASE_IDENTITY';
 
 // Round 2（独立复审P1闭环）：统一的数据库失败退出码，供backfill-cli-entry.js/dataset-manifest-cli-entry.js/
-// validation-replay/cli-entry.js三个CLI的顶层错误处理复用，取代此前"任意错误一律exit 1"的做法——
-// 三个数据库保护错误必须与普通业务失败/网络失败/参数失败/冲突失败可区分。数值5与
+// validation-replay/cli-entry.js及manifest inventory CLI的顶层错误处理复用，取代此前"任意错误一律exit 1"的做法——
+// 数据库保护错误必须与普通业务失败/网络失败/参数失败/冲突失败可区分。数值5与
 // server/src/features/historical-feature-backfill.js既有的HISTORICAL_BACKFILL_EXIT.DATABASE_FAILURE
-// 保持一致（该CLI已验证过这三个错误码与此数值的映射关系），不新发明一套数值语义。
-// 已核实：三个CLI此前均无任何测试断言过"失败必须精确等于exit 1"这一具体数值契约（只断言过非零/
+// 保持一致，不新发明一套数值语义。
+// 已核实：既有CLI此前均无任何测试断言过"失败必须精确等于exit 1"这一具体数值契约（只断言过非零/
 // 断言过thrown error的.code），因此引入5不构成对外公开契约的破坏性变更。
 export const DATABASE_FAILURE_EXIT_CODE = 5;
 
-const DATABASE_GUARD_ERROR_CODES = new Set(['DATABASE_URL_REQUIRED', 'DATABASE_URL_INVALID', 'DATABASE_TARGET_REJECTED']);
+const DATABASE_GUARD_ERROR_CODES = new Set([
+  'DATABASE_URL_REQUIRED',
+  'DATABASE_URL_INVALID',
+  'DATABASE_TARGET_REJECTED',
+  'DATABASE_IDENTITY_REQUIRED',
+  'DATABASE_IDENTITY_REJECTED',
+  'DATABASE_IDENTITY_CONFLICT'
+]);
 
 export function isDatabaseGuardErrorCode(code) {
   return DATABASE_GUARD_ERROR_CODES.has(code);
 }
 
-// 供三个CLI顶层catch统一调用：数据库保护错误返回独立、稳定的DATABASE_FAILURE_EXIT_CODE，
+// 供CLI顶层catch统一调用：数据库保护错误返回独立、稳定的DATABASE_FAILURE_EXIT_CODE，
 // 其余任何错误（未识别错误、业务失败、参数失败、冲突等）保持调用方传入的defaultExitCode不变
-// （三个CLI原有行为均为1，此处不改变默认值，只新增对数据库保护错误的特殊分类）。
+// （既有CLI原有行为均为1，此处不改变默认值，只新增对数据库保护错误的特殊分类）。
 export function exitCodeForCliError(error, { defaultExitCode = 1 } = {}) {
   return isDatabaseGuardErrorCode(error?.code) ? DATABASE_FAILURE_EXIT_CODE : defaultExitCode;
+}
+
+// 只供需要显式运行身份的研究/诊断CLI调用。普通生产进程的NODE_ENV不是数据库授权凭据，
+// 因此这里要求调用方传入独立的V1.4D数据库身份配置，且只接受封闭枚举值。
+// production是一个已知但与研究库目标冲突的身份；任意其他值则是未知身份。
+export function assertExplicitResearchDatabaseIdentity(value) {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw Object.assign(new Error(`${RESEARCH_DATABASE_IDENTITY_ENV} is required`), {
+      code: 'DATABASE_IDENTITY_REQUIRED'
+    });
+  }
+  const identity = value.trim().toLowerCase();
+  if (identity === 'production') {
+    throw Object.assign(new Error('Production database identity conflicts with research-only operation'), {
+      code: 'DATABASE_IDENTITY_CONFLICT',
+      databaseIdentity: identity
+    });
+  }
+  if (!ALLOWED_RESEARCH_DATABASE_IDENTITIES.includes(identity)) {
+    throw Object.assign(new Error('Database identity is not authorized for research-only operation'), {
+      code: 'DATABASE_IDENTITY_REJECTED',
+      databaseIdentity: identity
+    });
+  }
+  return identity;
 }
 
 // 仅根据连接串声明的库名做格式与身份校验，不发起任何网络/数据库连接。

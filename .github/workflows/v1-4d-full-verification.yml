@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - codex/v1.4d-multi-symbol-manifest-implementation
+      - codex/v1.4d-deferred-p2-cleanup
 
 permissions:
   contents: read
@@ -116,14 +117,17 @@ jobs:
         working-directory: server
         run: |
           node --test \
-            tests/postgres/v1-4d-multi-symbol-manifest.integration.test.js
+            tests/postgres/v1-4d-multi-symbol-manifest.integration.test.js \
+            tests/postgres/v1-4d-manifest-inventory-guard.integration.test.js
 
       - name: Run validation replay and legacy diagnostics
         working-directory: server
         run: |
           node --test \
             src/validation-replay/*.test.js \
-            src/legacy-diagnostics/*.test.js
+            src/legacy-diagnostics/*.test.js \
+            src/db/research-database-guard.test.js \
+            scripts/v1-4d-manifest-inventory.test.mjs
 
       - name: Run Historical Feature Backfill tests
         working-directory: server
