@@ -1,6 +1,6 @@
 # V1_4D_180D_FORMAL_RESEARCH_PLAN.md — V1.4D 180天正式历史研究执行方案
 
-版本：v1.4d-180d-plan-draft-2（第一轮定向修复：补充Historical Feature Backfill必需阶段，修正resume/字段映射/status枚举/运行时资源核验/evaluation-version resume表述，见变更记录）
+版本：v1.4d-180d-plan-draft-3（第二轮定向修复：修正Phase 2/4/4.5/5数据库连接环境变量路由描述，见变更记录）
 基线：`main@4a30a69dae4a6f8da15a5e130f68e37da1d0c17d`
 状态：**PLAN ONLY — 本文档本轮未执行，未写入任何数据库，未修改任何生产代码/冻结文档/Migration**
 角色：本文档是V1.4D「180天正式历史研究」的唯一执行方案，供未来独立CEO授权后按本文档逐阶段执行；本文档本身不构成该授权。
@@ -134,20 +134,29 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
 
 ## D. 分阶段执行流程
 
-**红线（贯穿全部阶段）**：全部命令均以**命令模板**形式给出，本轮**不执行**任何一条；`--symbol`/`--from`/`--to`等尖括号占位符在真正执行时由操作者按§B/§C规则代入真实值，不得由本文档预先编造。所有阶段均通过`createGuardedResearchPgPool`/`assertExplicitResearchDatabaseIdentity`路由，**只能**对准`research-database-guard.js`硬编码的`RESEARCH_DATABASE_NAME`（当前为`eth_alpha_v14d_test`），且必须显式设置`V14D_DATABASE_IDENTITY=research`或`test`环境变量，否则fail-closed（`DATABASE_IDENTITY_REQUIRED`/`DATABASE_TARGET_REJECTED`）。
+**红线（贯穿全部阶段）**：全部命令均以**命令模板**形式给出，本轮**不执行**任何一条；`--symbol`/`--from`/`--to`等尖括号占位符在真正执行时由操作者按§B/§C规则代入真实值，不得由本文档预先编造。
+
+**数据库连接路由与身份保护（本轮修正NEW-P1-1，逐一原文核对`server/src/backfill/backfill-cli-entry.js`/`server/src/validation-replay/dataset-manifest-cli-entry.js`/`server/src/validation-replay/cli-entry.js`/`server/src/features/historical-feature-backfill-cli.js`/`server/src/config.js`/`server/src/db/research-database-guard.js`/`server/scripts/v1-4d-manifest-inventory.mjs`及各自测试后确认）**：
+
+- `backfill:market-bars`（Phase 2/4，`backfill-cli-entry.js`）、`dataset:build-manifest`（Phase 4，`dataset-manifest-cli-entry.js`）、`validation:walk-forward`（Phase 5，`cli-entry.js`）三者均调用`loadConfig()`（`config.js`第13行`databaseUrl: process.env.DATABASE_URL || ''`），**只读`DATABASE_URL`**，命令前缀必须使用`DATABASE_URL=<research_db_url>`。
+- `features:backfill-historical`（Phase 4.5，`historical-feature-backfill-cli.js`）**不经过**`loadConfig()`，直接构造`{databaseUrl: env.TEST_DATABASE_URL, dbSsl:false}`，**只读`TEST_DATABASE_URL`、不接受`DATABASE_URL`回退**（`historical-feature-backfill-cli.js`第12行原文核对，回归测试`server/tests/features/historical-feature-backfill.test.js`第36-81行逐条断言此契约），命令前缀必须使用`TEST_DATABASE_URL=<research_db_url>`。
+- 上述四个正式流程CLI**均不导入、不调用**`assertExplicitResearchDatabaseIdentity`，**均不读取**`V14D_DATABASE_IDENTITY`环境变量（全仓`grep`确认零命中）。该函数与该环境变量**只被**独立诊断脚本`server/scripts/v1-4d-manifest-inventory.mjs`使用（第5/24行`assertExplicitResearchDatabaseIdentity(env[INVENTORY_DATABASE_IDENTITY_ENV])`），**该脚本不属于本方案Phase 0-9流程的任何一步**，不得把它的契约套用到上述四个CLI的命令模板或Go/No-Go条件中。
+- 四个正式流程CLI真正依赖的数据库身份保护统一来自`research-database-guard.js`的`createGuardedResearchPgPool()`，包含两层校验：①建立连接前，`parseResearchDatabaseTarget(databaseUrl)`只解析连接串声明的库名，要求精确等于硬编码的`RESEARCH_DATABASE_NAME`（当前为`eth_alpha_v14d_test`），否则`DATABASE_URL_REQUIRED`/`DATABASE_URL_INVALID`/`DATABASE_TARGET_REJECTED`；②建立连接后，执行`SELECT current_database()`二次核验，不一致同样`DATABASE_TARGET_REJECTED`并关闭连接。该两层保护与是否设置`V14D_DATABASE_IDENTITY`**无关**，无论该变量是否存在都会生效。
+- 任何阶段开始前，操作者仍必须独立确认所用命令实际解析出的数据库主机/端口/库名精确等于允许的研究数据库，并确认该阶段实际执行后`current_database()`二次核验确已通过——**"对应环境变量已设置"不等同于"数据库身份已验证"**，真正的验证结果以`createGuardedResearchPgPool`的返回/抛出为准。
 
 ### Phase 0：环境与基线核验
 
 - **输入**：无（只读查询）
+- **说明（本轮修正NEW-P1-1，避免与CLI环境变量契约混淆）**：`$RESEARCH_DB_URL`是本文档Phase 0/3/7中仅供人工`psql`只读核查使用的**独立**shell变量名，与`npm run`命令实际读取的`DATABASE_URL`（Phase 2/4/5）/`TEST_DATABASE_URL`（Phase 4.5）没有代码层面的绑定关系；操作者应将其设置为与Phase 2/4/4.5/5即将使用的同一个研究数据库连接串取值相同，但变量名本身不需要、也不应该与任何CLI的`process.env`读取名一致。
 - **命令模板**：
   ```
   git rev-parse HEAD   # 确认锁定main SHA
   git status --short   # 确认工作树干净
-  psql "$TEST_DATABASE_URL" -c "SELECT current_database();"
-  psql "$TEST_DATABASE_URL" -c "SELECT version FROM schema_migrations ORDER BY version;"
-  psql "$TEST_DATABASE_URL" -c "SELECT count(*) FROM historical_validation.dataset_manifests;"
-  psql "$TEST_DATABASE_URL" -c "SELECT count(*) FROM historical_validation.validation_runs;"
-  psql "$TEST_DATABASE_URL" -c "SELECT pg_database_size(current_database());"
+  psql "$RESEARCH_DB_URL" -c "SELECT current_database();"
+  psql "$RESEARCH_DB_URL" -c "SELECT version FROM schema_migrations ORDER BY version;"
+  psql "$RESEARCH_DB_URL" -c "SELECT count(*) FROM historical_validation.dataset_manifests;"
+  psql "$RESEARCH_DB_URL" -c "SELECT count(*) FROM historical_validation.validation_runs;"
+  psql "$RESEARCH_DB_URL" -c "SELECT pg_database_size(current_database());"
   df -h   # 磁盘剩余空间
   ```
 - **前置条件**：无
@@ -173,9 +182,9 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
 - **输入**：Phase 1配置清单
 - **命令模板**：
   ```
-  V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url> \
+  DATABASE_URL=<research_db_url> \
     npm run backfill:market-bars -- --symbol ETHUSDT --intervals 15m,1h,4h --from <backfillFrom> --to <researchTo> --as-of <researchTo-1ms> --dry-run
-  V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url> \
+  DATABASE_URL=<research_db_url> \
     npm run backfill:market-bars -- --symbol BTCUSDT --intervals 15m --from <backfillFrom> --to <researchTo> --as-of <researchTo-1ms> --dry-run
   ```
 - **前置条件**：Phase 1完成
@@ -190,8 +199,8 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
 - **输入**：Phase 2确认的当前`market_bars`覆盖状态
 - **命令模板**：
   ```
-  psql "$TEST_DATABASE_URL" -c "SELECT interval_name, min(open_time), max(open_time), count(*) FROM public.market_bars WHERE instrument='ETHUSDT' AND market_type='spot' GROUP BY interval_name;"
-  psql "$TEST_DATABASE_URL" -c "SELECT interval_name, min(open_time), max(open_time), count(*) FROM public.market_bars WHERE instrument='BTCUSDT' AND market_type='spot' GROUP BY interval_name;"
+  psql "$RESEARCH_DB_URL" -c "SELECT interval_name, min(open_time), max(open_time), count(*) FROM public.market_bars WHERE instrument='ETHUSDT' AND market_type='spot' GROUP BY interval_name;"
+  psql "$RESEARCH_DB_URL" -c "SELECT interval_name, min(open_time), max(open_time), count(*) FROM public.market_bars WHERE instrument='BTCUSDT' AND market_type='spot' GROUP BY interval_name;"
   ```
 - **前置条件**：Phase 2通过
 - **输出**：当前已有数据范围与本次需回填范围`[backfillFrom, researchTo)`的差集（决定实际需要拉取的分页数量）
@@ -206,13 +215,13 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
 - **命令模板**：
   ```
   # 4个依赖各自独立回填（真实执行，非dry-run）
-  V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url> \
+  DATABASE_URL=<research_db_url> \
     npm run backfill:market-bars -- --symbol ETHUSDT --intervals 15m,1h,4h --from <backfillFrom> --to <researchTo> --as-of <researchTo-1ms>
-  V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url> \
+  DATABASE_URL=<research_db_url> \
     npm run backfill:market-bars -- --symbol BTCUSDT --intervals 15m --from <backfillFrom> --to <researchTo> --as-of <researchTo-1ms>
 
   # 契约版本2多symbol Manifest构建（注意：manifest的--from与回填的--from相同，均为backfillFrom）
-  V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url> \
+  DATABASE_URL=<research_db_url> \
     npm run dataset:build-manifest -- --contract-version 2 --from <backfillFrom> --to <researchTo> --fixed-as-of <researchTo-1ms>
   ```
 - **前置条件**：Phase 3确认待回填范围；`AS_OF_REQUIRED`等参数齐全
@@ -227,7 +236,7 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
   ```
   **正确做法**：只对失败的那一个interval单独resume，**不得**携带其余已成功的周期；`--from`/`--to`/`--as-of`/`--symbol`/该interval必须与该interval原始批次记录完全一致（`assertResumeBatchCompatible`校验），例如若ETHUSDT的`1h`周期失败（其对应批次ID为`<1h_backfill_batch_id>`）：
   ```
-  V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url> \
+  DATABASE_URL=<research_db_url> \
     npm run backfill:market-bars -- \
     --symbol ETHUSDT \
     --intervals 1h \
@@ -259,7 +268,7 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
   - `--symbol`/`--interval`当前**只接受**`ETHUSDT`/`15m`（`validateHistoricalBackfillOptions`第17-18行），其他值返回`INVALID_SYMBOL`/`INVALID_INTERVAL`。
   - `--dataset-version`必须匹配`HISTORICAL_DATASET_VERSION_PATTERN=/^v1\.4d-sha256-[a-f0-9]{64}$/`（同文件第7/23行），即Phase 4产出的**同一个**契约版本2`dataset_version`字符串。
   - `--batch-size`默认**25**（`historical-feature-backfill-cli.js`第6行`parseHistoricalBackfillArgs`已冻结默认值，本方案直接引用，不重复列为CEO决策），允许范围`[1,1000]`（`validateHistoricalBackfillOptions`第24行）——纯运维分批参数，不改变研究结果，见§K.2 `PRE_EXECUTION_OPERATIONAL_DECISION_REQUIRED`第1项。
-  - 本CLI**只读**`env.TEST_DATABASE_URL`（不接受`DATABASE_URL`回退）；本轮原文核对`historical-feature-backfill-cli.js`确认其**不**调用`assertExplicitResearchDatabaseIdentity`——与Phase 4/Phase 5使用的CLI不同，本阶段**不需要**设置`V14D_DATABASE_IDENTITY`环境变量，但仍受`createGuardedResearchPgPool`的目标库名声明+连接后`current_database()`双重核验保护（只能对准`eth_alpha_v14d_test`）。
+  - 本CLI**只读**`env.TEST_DATABASE_URL`（不接受`DATABASE_URL`回退，`historical-feature-backfill-cli.js`第12行原文核对）；本轮修正（NEW-P1-1）：**Phase 2/Phase 4/Phase 4.5/Phase 5全部四个正式流程CLI均不调用`assertExplicitResearchDatabaseIdentity`、均不读取`V14D_DATABASE_IDENTITY`**（该函数/环境变量只被独立诊断脚本`server/scripts/v1-4d-manifest-inventory.mjs`使用，与本方案Phase 0-9流程无关），并非"Phase 4.5是例外、Phase 4/5需要它"；四者的**唯一**差异是数据库连接串来源的环境变量名不同——Phase 2/4/5的CLI经`loadConfig()`读取`DATABASE_URL`，本阶段（Phase 4.5）直接读取`TEST_DATABASE_URL`。无论读取哪个环境变量，全部四个CLI都统一受`createGuardedResearchPgPool`的目标库名声明（`parseResearchDatabaseTarget`）+连接后`current_database()`二次核验双重保护，只能对准`eth_alpha_v14d_test`。
 - **输出**：`public.feature_records`新增行；`public.feature_generation_runs`一条审计行（`runId`，非dry-run时）。
 - **数据库写入边界（红线：不得描述为只读）**：**是，写入**——本阶段写入**生产**`public.feature_records`表（`server/migrations/003_v1_4b_feature_engine.up.sql`第33行定义，`UNIQUE(symbol,target_interval,target_bar_close_time,feature_set_version,revision_number)`；不属于`historical_validation`schema，是与实时特征生成共享的同一张表，二者按`target_bar_close_time`落在不同的时间区间天然不冲突）；同时写入`public.feature_generation_runs`。
 - **通过条件**：`runHistoricalFeatureBackfill`返回`status:'SUCCEEDED'`，`summary.blockedPoints===0`且`summary.failedPoints===0`。
@@ -300,7 +309,7 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
 - **前置条件**：Phase 4的Manifest已`SUCCEEDED`；**Phase 4.5已`SUCCEEDED`且`public.feature_records`覆盖`[researchFrom,researchTo)`全部24h节奏点（见Phase 4.5核验查询模板）**；`validateReplayRange`要求执行时刻的真实UTC时间 ≥ `researchTo + 72h`
 - **命令模板**：
   ```
-  V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url> \
+  DATABASE_URL=<research_db_url> \
     npm run validation:walk-forward -- \
     --symbol ETHUSDT --from <researchFrom> --to <researchTo> --horizons 24h,72h \
     --algorithm-version v1.4c-server-po-rule-1 \
@@ -333,8 +342,8 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
 - **输入**：Phase 5/6完成后的`validation_run_id`
 - **命令模板**：报告在`runWalkForward`内部`!dryRun`分支自动调用`buildValidationReports`并写入`validation_reports`（见`cli-entry.js`），**不是**独立CLI命令；审计产物通过只读SQL提取：
   ```
-  psql "$TEST_DATABASE_URL" -c "SELECT * FROM historical_validation.validation_reports WHERE validation_run_id='<id>';"
-  psql "$TEST_DATABASE_URL" -c "SELECT * FROM historical_validation.validation_runs WHERE validation_run_id='<id>';"
+  psql "$RESEARCH_DB_URL" -c "SELECT * FROM historical_validation.validation_reports WHERE validation_run_id='<id>';"
+  psql "$RESEARCH_DB_URL" -c "SELECT * FROM historical_validation.validation_runs WHERE validation_run_id='<id>';"
   ```
 - **前置条件**：Phase 5/6非dry-run且`SUCCEEDED`
 - **输出**：每个`(horizon,report_scope)`组合一份`validation_reports`行（24h/72h × ALL/TRAIN/VALIDATION/TEST，共8份）
@@ -382,7 +391,7 @@ Binance现货公开REST，按`(symbol,interval)`独立分页拉取，`ON CONFLIC
 7. Phase 0确认磁盘/连接数余量充足（§C.6）。
 8. 不存在P0/P1（本文档§1已确认此刻为NONE；正式执行前须重新核实，因main可能已推进）。
 9. **正式研究获得单独CEO授权**（`FORMAL_180_DAY_RESEARCH_AUTHORIZED`由NO改为YES，须独立于本方案文档的批准动作）。
-10. `V14D_DATABASE_IDENTITY`/`TEST_DATABASE_URL`环境变量已正确设置且已通过Phase 0验证指向`eth_alpha_v14d_test`。
+10. **数据库连接环境变量已按各CLI真实契约设置，且已通过Phase 0/连接后二次核验确认目标库精确为`eth_alpha_v14d_test`**（本轮修正NEW-P1-1，`V14D_DATABASE_IDENTITY`与本条无关，见§D开头说明）：`backfill:market-bars`/`dataset:build-manifest`/`validation:walk-forward`（Phase 2/4/5）经`loadConfig()`只读`DATABASE_URL`；`features:backfill-historical`（Phase 4.5）只读`TEST_DATABASE_URL`（不接受`DATABASE_URL`回退）。**变量已设置**只是前提，真正的通过条件是`createGuardedResearchPgPool`在建连前的库名声明校验与建连后`SELECT current_database()`二次核验均已实际通过（而非仅凭变量存在即视为已验证）。
 
 ### E.2 Phase 5（历史回放）开始前额外新增（本轮修复，对应P0-1）
 
@@ -527,3 +536,4 @@ AUTOMATIC_TRADING_AUTHORIZED = NO
 |---|---|---|
 | v1.4d-180d-plan-draft-1 | 2026-08-04 | 初稿：基于`main@4a30a69`只读现状核查（CLI入口、依赖矩阵、resume/checkpoint、dry-run、完整性检测、报告字段等均取自当前代码原文），制定180天正式历史研究九阶段执行方案、冻结契约、Go/No-Go门禁、偏差防护与产物清单；标记全部未冻结项为`PRE_EXECUTION_DECISION_REQUIRED`，不擅自发明数值；本轮未执行任何研究、未写入数据库 |
 | v1.4d-180d-plan-draft-2 | 2026-08-04 | 第一轮定向修复（独立终审发现1项P0/1项P1/4项新增P2后的修复）：①**修复P0-1**——新增"Phase 4.5：Historical Feature Backfill"必需阶段（`features:backfill-historical`/`historical-feature-backfill-cli.js`，写入生产`public.feature_records`，Phase 5的`findExactFeatureForReplay`唯一数据来源），本轮原文核对`--feature-version`（`FEATURE_SET_VERSION='v1.4b-unified-1'`）与本阶段专属`--algorithm-version`（`FEATURE_ALGORITHM_VERSION='v1.4b-feature-engine-1'`，**与Phase 5的`--algorithm-version='v1.4c-server-po-rule-1'`是不同维度、不得混淆**）三方（代码常量/注释/既有测试）一致，无冲突；同步更新§1现状核查表、§E Go/No-Go（新增E.2五条）、§C.7交叉引用、Phase 5通过/阻塞条件（新增`FEATURE_RECORD_MISSING`须为0）、§F中止恢复（新增feature backfill幂等/resume行为）、§I产物清单（新增`feature_records`/`feature_generation_runs`）、Phase 8独立复核（新增feature覆盖核验）；②**修复P1-1**——更正Phase 4"失败后恢复"，明确`--resume`只能配合单一`--intervals`使用（`RESUME_INTERVALS_CONFLICT`），补充禁止示例与正确单周期恢复示例；③**修复P2-1**——更正§I"数据完整性报告"行`integrity_check_result`/`per_interval_record_count`与`perDependencyIntegrityCheckResult`/`perDependencyRecordCount`的字段映射（此前写反）；④**修复P2-2**——更正§1"失败状态/blocked reasons"行，区分`validation_runs.status`的schema允许值{RUNNING,SUCCEEDED,FAILED,PARTIAL}与当前代码实际只产生的{RUNNING,SUCCEEDED,FAILED}；⑤**修复P2-3**——新增§E.3运行时间与资源预算12项，全部标记`ENVIRONMENT_VALIDATION_REQUIRED`，不发明具体数值；⑥**修复P2-4**——重写Phase 6，精确复述`checkResumeVersionConsistency`三态规则（无历史记录时可自由指定/已有恰好一个记录时必须一致/已有多个记录时一律拒绝），明确排除"任何时候都能挂载新evaluation-version"的误读；⑦新增§K执行前决策清单汇总，区分`PRE_EXECUTION_DECISION_REQUIRED`（含本轮新增第7项`FEATURE_RECORD_MISSING`阈值）与`PRE_EXECUTION_OPERATIONAL_DECISION_REQUIRED`（`--batch-size`引用代码真实默认值25、`--resume-after`策略、运行时间资源预算）；⑧修正两处此前遗留的错误章节引用（"§三.12/§三.13"改为实际存在的"§C.6/§E.3"）；本轮未处理三个仓库既有P2，未修改生产代码/测试/五份冻结文档/Migration/Closure Report/Addendum/workflow，未执行任何回填/Feature Backfill/回放/研究，未连接任何数据库 |
+| v1.4d-180d-plan-draft-3 | 2026-08-04 | 第二轮定向修复（独立二轮复审发现NEW-P1-1后的修复，仅修正数据库连接环境变量路由描述，不改动已闭环的原1项P0/1项P1/4项P2实质内容）：本轮原文重新核对`server/src/backfill/backfill-cli-entry.js`/`server/src/validation-replay/dataset-manifest-cli-entry.js`/`server/src/validation-replay/cli-entry.js`/`server/src/features/historical-feature-backfill-cli.js`/`server/src/config.js`/`server/src/db/research-database-guard.js`/`server/scripts/v1-4d-manifest-inventory.mjs`及各自测试，确认：`backfill:market-bars`/`dataset:build-manifest`/`validation:walk-forward`（Phase 2/4/5）均经`loadConfig()`只读`DATABASE_URL`；`features:backfill-historical`（Phase 4.5）只读`TEST_DATABASE_URL`（不接受`DATABASE_URL`回退）；`assertExplicitResearchDatabaseIdentity`/`V14D_DATABASE_IDENTITY`**只被**独立诊断脚本`v1-4d-manifest-inventory.mjs`使用，与Phase 2/4/4.5/5四个正式流程CLI**均无关**。据此：①修正§D开头红线声明，删除"所有阶段均通过`assertExplicitResearchDatabaseIdentity`路由、必须设置`V14D_DATABASE_IDENTITY`"的错误全称断言，改为按CLI真实契约分别说明数据库URL环境变量来源与`createGuardedResearchPgPool`两层保护（库名声明校验+连接后`current_database()`二次核验）；②Phase 2/4（含Phase4"正确做法"resume示例）/Phase 5命令模板统一将`V14D_DATABASE_IDENTITY=research TEST_DATABASE_URL=<research_db_url>`改为`DATABASE_URL=<research_db_url>`（7处）；③Phase 4.5命令模板保持`TEST_DATABASE_URL=<research_db_url>`不变（与其真实代码契约一致）；④重写Phase 4.5"红线"对比措辞，不再声称"与Phase4/Phase5使用的CLI不同"，改为准确陈述四个CLI均不使用`V14D_DATABASE_IDENTITY`，唯一差异是数据库URL环境变量名不同；⑤重写§E.1第10条，删除对`V14D_DATABASE_IDENTITY`的误引用，改为按Phase分别列出真实环境变量并强调"变量已设置"不等同于"身份已验证"；⑥Phase 0/3/7的人工`psql`只读核查命令统一改用独立shell变量`$RESEARCH_DB_URL`（原`$TEST_DATABASE_URL`），并在Phase 0新增说明该变量与CLI内部读取的`DATABASE_URL`/`TEST_DATABASE_URL`无代码绑定关系，避免混淆；⑦全文重新grep`DATABASE_URL`/`TEST_DATABASE_URL`/`V14D_DATABASE_IDENTITY`/`assertExplicitResearchDatabaseIdentity`/`createGuardedResearchPgPool`确认修改后全文一致、无残留错误命令。本轮**未改动**Phase 4.5的位置、脚本名与参数、`feature-version`/`algorithm-version`/`dataset_version`绑定、`requiredContractVersion=2`、`feature_records`写入边界、`FEATURE_RECORD_MISSING`门禁与零有效样本阻断条件、单周期resume规则、字段映射、`PARTIAL`状态说明、§E.3十二项运行时资源核验、evaluation-version三态恢复规则、§K全部7+3项决策清单、130/180/365天窗口定义、全部授权状态字段（仍为NO/NOT_STARTED）；本轮未处理三个仓库既有P2，未修改生产代码/测试/五份冻结文档/Migration/Closure Report/Addendum/workflow，未执行任何回填/Feature Backfill/回放/研究，未连接任何数据库 |
