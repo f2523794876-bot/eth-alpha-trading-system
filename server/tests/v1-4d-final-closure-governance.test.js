@@ -86,3 +86,22 @@ test('R28 workflow覆盖所有main目标PR且保留现有阻断性保护', () =>
   assert.doesNotMatch(workflow, /V1_4D_MULTI_SYMBOL_MANIFEST_ADDENDUM\.md/);
   assert.match(workflow, /server\/migrations\/00\[1-6\]_\*\.sql/);
 });
+
+test('Closure Report严格区分130天smoke test、180天正式研究与365天可选升级', () => {
+  const report = read('V1_4D_CLOSURE_REPORT.md');
+
+  assert.match(
+    report,
+    /130天为不推荐的严格最低窗口，仅用于pipeline smoke test，不满足正式历史研究要求；365天仅是可选的长周期稳健性升级窗口。/
+  );
+  assert.match(report, /180天推荐窗口的正式历史研究/);
+  assert.match(report, /FORMAL_180_DAY_RESEARCH_STATUS = NOT_STARTED/);
+  assert.match(report, /FORMAL_180_DAY_RESEARCH_AUTHORIZED = NO/);
+  assert.match(report, /V1_5_AUTHORIZED = NO/);
+  assert.match(report, /PRODUCTION_DEPLOYMENT_AUTHORIZED = NO/);
+  assert.match(report, /AUTOMATIC_TRADING_AUTHORIZED = NO/);
+
+  assert.doesNotMatch(report, /130天正式历史研究/);
+  assert.doesNotMatch(report, /130天推荐窗口/);
+  assert.doesNotMatch(report, /正式(?:历史)?研究[^。\n]{0,24}130天/);
+});
