@@ -26,9 +26,9 @@
 |---|---|---|
 | `V1_4D_HISTORICAL_REPLAY_SPEC.md`（draft-4） | **是**——§2.8`dataset_manifests`表定义、§2.9`dataset_version`哈希绑定字段清单、§4.0/§4.1 CLI契约、§4.1a八步校验流程均建立在"一个manifest=一个symbol"假设上；此外该文档draft-4文本本身**尚未反映**migration 006已新增的`fixed_as_of`/`logical_window_hash`列（该列是在draft-4冻结之后、执行包1/2的P0修复轮次中直接加到代码里的，未回填进本文档文本——这是本附录动笔前就已存在的文档-代码漂移，不在本附录处理范围，本附录第五节仅如实引用该现状，不重新定义这两个字段本身的既有语义） | **本附录对上述条款具有明确的、限定范围的优先权**：凡本附录第二~十节对同一概念给出了新定义（`manifest_contract_version`、`symbols`、`dependency_set`、多symbol版本的内容哈希/逻辑窗口哈希/成员身份/校验流程），以本附录为准；`V1_4D_HISTORICAL_REPLAY_SPEC.md`draft-4原文对**契约版本1（legacy单symbol）**manifest的全部定义（哈希算法、CLI、八步校验、可变性分类等）**继续完全有效、不被修改、不被本附录废止**——本附录是"新增一个可与旧契约版本并存的新版本"，不是"替换旧版本" |
 | `V1_4D_DATA_BACKFILL_SPEC.md`（draft-4） | 否——该文档§2.10已明确声明"`dataset_version`/`dataset_manifests`结构唯一权威定义已迁移至`V1_4D_HISTORICAL_REPLAY_SPEC.md`，本文档不重复定义"，本身不含与本附录冲突的结构性条款；其§2.1"15m/1h/4h必须同步补齐"的回填范围表述与本附录§四冻结的依赖矩阵（ETHUSDT 15m/1h/4h）完全一致，无需修改；该文档未提及BTCUSDT回填范围，本附录第四节补充冻结"BTCUSDT 15m必须与ETHUSDT三周期共享同一`--from`/`--to`回填窗口"这一新增要求（原文档未来若需要执行BTCUSDT回填，直接适用本附录第四节，不需要现在修改该文档正文——按"不为了形式修改冻结文件"的要求，本轮不改动该文件） | 无需修改，交叉引用生效 |
-| `V1_4D_ACCEPTANCE_TESTS.md`（draft-4） | 否（结构性）——新增验收项作为独立新章节`R28`追加，不修改任何既有R1-R27条款 | 本轮新增`R28`章节（见本附录第十三节与该文档同步更新） |
-| `V1_4D_CODEX_IMPLEMENTATION_TASK.md`（draft-4） | 否（结构性）——新增实施边界作为独立新章节追加，不修改任何既有§1-§5条款；唯一需要注意的是该文档§1.1对`dataset-manifest-builder.js`/`dataset-manifest-verifier.js`/`canonical-manifest-content.js`的既有任务描述是"单symbol契约"版本，本附录新增章节明确这些文件的任务范围**扩展**为"同时支持契约版本1与2"，不是"替换为只支持版本2" | 本轮新增独立章节（见本附录第十四节与该文档同步更新） |
-| `V1_4D_ARCHITECTURE_REVIEW.md`（draft-4） | **是**——该文档结论`READY_FOR_CODEX_IMPLEMENTATION`是针对draft-4版本的四份文档（不含多symbol契约）给出的，若不加说明，容易被误读为"当前全部范围（含多symbol治理）已可实施" | 本轮在该文档追加一条changelog说明性记录（不改写其P0/P1/P2统计或结论本身，那是针对原范围的历史结论，如实保留），明确该结论的适用范围边界，并指出当前实际执行状态是`EXECUTION_PACKAGE_2 = REQUEST_CHANGES`（本次CEO指令给定，见本附录末尾状态块），需要本附录与后续独立实施授权共同满足后才能对多symbol范围重新给出结论 |
+| `V1_4D_ACCEPTANCE_TESTS.md`（draft-4） | 否（结构性）——R28是本附录及后续实施治理记录承载的新增验收范围，不修改任何既有R1-R27条款 | draft-4正文保持逐字冻结；R28映射仅记录在本附录第十二节和实现测试中，未回写该冻结文档 |
+| `V1_4D_CODEX_IMPLEMENTATION_TASK.md`（draft-4） | 否（结构性）——该文档§1.1对`dataset-manifest-builder.js`/`dataset-manifest-verifier.js`/`canonical-manifest-content.js`的任务描述继续保留其冻结时的单symbol范围 | draft-4正文保持逐字冻结；契约版本2的实施边界由本附录第十三节及后续实施治理记录承载，未回写该冻结文档 |
+| `V1_4D_ARCHITECTURE_REVIEW.md`（draft-4） | 否（文本不变）——其`READY_FOR_CODEX_IMPLEMENTATION`结论只适用于原draft-4范围，不自动覆盖后续多symbol治理 | draft-4正文保持逐字冻结；多symbol范围的架构裁决与实施状态由本附录及后续独立复审记录承载，未追加或追溯修改该冻结文档 |
 
 ### 0.4 术语约定
 
@@ -524,9 +524,9 @@ npm run dataset:build-manifest -- \
 
 ---
 
-## 十二、验收测试新增总纲（详见`V1_4D_ACCEPTANCE_TESTS.md` §R28）
+## 十二、验收测试新增总纲（R28由本附录及实现测试承载）
 
-本附录要求的24项验收场景已作为独立新章节`R28`追加到`V1_4D_ACCEPTANCE_TESTS.md`（与既有R1-R27并列，不修改任何既有条款），完整表格见该文档。本节仅列出场景到条款的映射索引，避免同一内容在两份文档重复维护：
+本附录要求的24项验收场景以`R28`编号记录在本节，并由后续实现测试与治理记录落实。它们**没有**追加或回写到`V1_4D_ACCEPTANCE_TESTS.md`；该draft-4正式冻结文档继续逐字保持原样。本节列出场景到条款的映射索引：
 
 | 场景 | 对应R28 ID | 对应本附录条款 |
 |---|---|---|
@@ -557,23 +557,23 @@ npm run dataset:build-manifest -- \
 
 ---
 
-## 十三、实施边界（详见`V1_4D_CODEX_IMPLEMENTATION_TASK.md` 新增章节）
+## 十三、实施边界（由本附录及后续实施治理记录承载）
 
-本附录要求的Codex后续实施包边界（schema/migration、repository层、Manifest builder/verifier扩展、CLI、Backfill适配、Feature Backfill适配、血缘/审计、dry-run、legacy只读诊断、单元测试、PostgreSQL集成测试、回归测试、服务器只读取证命令）已作为独立新章节追加到`V1_4D_CODEX_IMPLEMENTATION_TASK.md`，明确禁止：修改Forecast算法、修改API展示、修改评分逻辑、执行正式数据流、合并main、触碰生产数据库、删除旧Manifest。完整清单见该文档，不在本文档重复。
+本附录要求的Codex后续实施包边界（schema/migration、repository层、Manifest builder/verifier扩展、CLI、Backfill适配、Feature Backfill适配、血缘/审计、dry-run、legacy只读诊断、单元测试、PostgreSQL集成测试、回归测试、服务器只读取证命令）由本附录及后续实施治理记录承载。它们**没有**作为新章节追加或回写到`V1_4D_CODEX_IMPLEMENTATION_TASK.md`；该draft-4正式冻结文档继续逐字保持原样。
 
 ---
 
 ## 十四、一致性自检（本附录发布前自查，十项）
 
 1. **本附录是否与draft-4五份文件任一条款冲突？** 是，与`V1_4D_HISTORICAL_REPLAY_SPEC.md`存在预期内的、范围受限的冲突（见§0.3），已通过"新增契约版本2、不修改契约版本1既有条款"的方式化解，不存在未声明的隐藏冲突。
-2. **全部冲突是否已通过显式的"附录优先级与范围"机制解决？** 是，见§0.3表格，逐文档列出冲突有无、化解方式；`V1_4D_ARCHITECTURE_REVIEW.md`的历史结论适用范围边界已明确标注（不改写原结论本身）。
+2. **全部冲突是否已通过显式的"附录优先级与范围"机制解决？** 是，见§0.3表格，逐文档列出冲突有无、化解方式；`V1_4D_ARCHITECTURE_REVIEW.md`的历史结论适用范围边界仅在本附录中说明，未回写或追溯修改该draft-4冻结文档。
 3. **`symbol`/`symbols`双重语义是否仍然存在？** 否——第一节/第二节已通过契约版本互斥CHECK约束（`dataset_manifests_contract_v1_shape`/`v2_shape`）从数据库层面结构性禁止同一行同时携带`symbol`与`symbols`的非NULL值，不存在"两个字段都有值、可能冲突"的状态。
 4. **依赖集合是否错误使用了笛卡尔积？** 否——第三节`dependency_set`显式列出四条真实依赖，且第三节第3条要求其与`FEATURE_BAR_DEPENDENCIES`在`{symbol,interval,marketType}`投影下**完全相等**（非超集），`symbols`/`intervals`两个独立集合的存在**不产生**任何笛卡尔积推断路径（第三节第2条已明确指出这正是`dependency_set`需要独立存在的原因）。
 5. **内容哈希是否可能被两种不同（但均符合规范）的实现给出不同结果？** 否——第六节已冻结精确的16字段清单、逐字段排序规则（含`vintageId`最终决胜）、caller侧类型纪律，并提供了基于**实际生产`canonicalJsonHash()`函数**计算得到的完整worked example与golden哈希值（第六节6.4），任何遵循本附录字段清单与排序规则的正确实现都必须复现该golden值，偏差即说明实现有误而非规范有歧义。
 6. **legacy处理策略是否会修改不可变数据？** 否——第十节第1-2条确认legacy记录的保护完全依赖既有`dataset_manifests_no_update`/`no_delete`触发器（对全表生效，不区分契约版本），本附录未新增、也不需要新增任何针对legacy记录的写操作；migration 007（第十一节）不含任何`UPDATE`/`DELETE`语句。
 7. **Migration回滚是否会丢失或误读数据？** 已识别真实风险点并冻结应对方案——`DROP COLUMN`不受不可变触发器保护（第十一节11.3第1条），已通过`down.sql`显式守卫（存在契约版本2记录时拒绝回滚，第十一节11.2）消除"静默丢失多symbol身份数据"的可能性。
 8. **Feature是否仍可能在新规范下读取未治理的BTC数据？** 否——SQL级`vintage_id = ANY(governedVintageIds)`治理（既有实现）在单一多symbol Manifest模型下结构性地自动覆盖BTC与ETH（第五节第6条），第九节新增的构建期/启动期门禁（`DEPENDENCY_UNGOVERNED`/`DEPENDENCY_INCOMPLETE`/`MEMBER_IDENTITY_MISSING`/`CONTRACT_VERSION_UNSUPPORTED`）在查询发生前提供额外一层拦截，运行期`SOURCE_NOT_IN_DATASET_MANIFEST`/`SOURCE_OUTSIDE_DATASET_MANIFEST`提供逐行二次防线，三层防御无一依赖"BTC数据恰好不存在"这类偶然条件。
-9. **验收测试是否覆盖真实PostgreSQL代码路径而非只有mock？** 是——R28.22专门要求真实PostgreSQL集成测试验证`vintage_id = ANY()`治理效果（对照既有单symbol场景下已完成的同类真实数据库验证方法），R28.19/R28.23同样标注为集成测试（自动/PostgreSQL），详见`V1_4D_ACCEPTANCE_TESTS.md` §R28表格"自动/人工"列。
+9. **验收测试是否覆盖真实PostgreSQL代码路径而非只有mock？** 是——本附录R28.22专门要求真实PostgreSQL集成测试验证`vintage_id = ANY()`治理效果（对照既有单symbol场景下已完成的同类真实数据库验证方法），R28.19/R28.23同样要求PostgreSQL集成测试；这些要求由本附录及实现测试承载，未写入`V1_4D_ACCEPTANCE_TESTS.md` draft-4正文。
 10. **服务器历史72/-72结论是否在只读取证实际完成前保持`NOT_CONFIRMED`？** 是——第八节第3-4条明确重申该状态要求，本附录本身不执行任何取证查询、不访问生产数据库，不对该结论做出或暗示任何新的确认。
 
 ---

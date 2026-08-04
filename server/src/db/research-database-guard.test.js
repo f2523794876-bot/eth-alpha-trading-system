@@ -5,7 +5,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   RESEARCH_DATABASE_NAME, parseResearchDatabaseTarget, createGuardedResearchPgPool,
-  DATABASE_FAILURE_EXIT_CODE, isDatabaseGuardErrorCode, exitCodeForCliError
+  DATABASE_FAILURE_EXIT_CODE, isDatabaseGuardErrorCode, exitCodeForCliError,
+  ALLOWED_RESEARCH_DATABASE_IDENTITIES, assertExplicitResearchDatabaseIdentity,
+  RESEARCH_DATABASE_IDENTITY_ENV
 } from './research-database-guard.js';
 
 function fakePool({ queryImpl } = {}) {
@@ -25,6 +27,21 @@ function fakePool({ queryImpl } = {}) {
 
 test('RESEARCH_DATABASE_NAME 精确等于 eth_alpha_v14d_test', () => {
   assert.equal(RESEARCH_DATABASE_NAME, 'eth_alpha_v14d_test');
+});
+
+test('显式数据库身份只允许research/test，并按既有CLI惯例执行trim+小写归一化', () => {
+  assert.equal(RESEARCH_DATABASE_IDENTITY_ENV, 'V14D_DATABASE_IDENTITY');
+  assert.deepEqual(ALLOWED_RESEARCH_DATABASE_IDENTITIES, ['research', 'test']);
+  assert.equal(assertExplicitResearchDatabaseIdentity('research'), 'research');
+  assert.equal(assertExplicitResearchDatabaseIdentity(' TEST '), 'test');
+});
+
+test('显式数据库身份缺失、未知或production冲突均fail-closed', () => {
+  for (const value of [undefined, null, '', '   ']) {
+    assert.throws(() => assertExplicitResearchDatabaseIdentity(value), e => e.code === 'DATABASE_IDENTITY_REQUIRED');
+  }
+  assert.throws(() => assertExplicitResearchDatabaseIdentity('staging'), e => e.code === 'DATABASE_IDENTITY_REJECTED');
+  assert.throws(() => assertExplicitResearchDatabaseIdentity('production'), e => e.code === 'DATABASE_IDENTITY_CONFLICT');
 });
 
 test('parseResearchDatabaseTarget：eth_alpha_v14d_test 允许', () => {
@@ -187,9 +204,14 @@ test('createGuardedResearchPgPool：postgres/生产eth_alpha/缺失库名均在U
   }
 });
 
-// Round 2（P1闭环）：三个数据库保护错误码 -> 独立、稳定的DATABASE_FAILURE_EXIT_CODE。
-test('isDatabaseGuardErrorCode：只识别三个数据库保护错误码，普通业务/参数/冲突错误码不识别', () => {
-  for (const code of ['DATABASE_URL_REQUIRED', 'DATABASE_URL_INVALID', 'DATABASE_TARGET_REJECTED']) {
+// 数据库URL与显式身份保护错误码均映射到独立、稳定的DATABASE_FAILURE_EXIT_CODE。
+const DATABASE_GUARD_ERROR_CODES = [
+  'DATABASE_URL_REQUIRED', 'DATABASE_URL_INVALID', 'DATABASE_TARGET_REJECTED',
+  'DATABASE_IDENTITY_REQUIRED', 'DATABASE_IDENTITY_REJECTED', 'DATABASE_IDENTITY_CONFLICT'
+];
+
+test('isDatabaseGuardErrorCode：只识别数据库URL/身份保护错误码，普通业务/参数/冲突错误码不识别', () => {
+  for (const code of DATABASE_GUARD_ERROR_CODES) {
     assert.equal(isDatabaseGuardErrorCode(code), true);
   }
   for (const code of ['MISSING_REQUIRED_ARG', 'INVALID_RESUME_ID', 'RESUME_INTERVALS_CONFLICT', 'BACKFILL_RESUME_ALREADY_TERMINAL', undefined, null, '']) {
@@ -199,7 +221,7 @@ test('isDatabaseGuardErrorCode：只识别三个数据库保护错误码，普�
 
 test('exitCodeForCliError：数据库保护错误映射到DATABASE_FAILURE_EXIT_CODE(=5)，与historical-feature-backfill.js既有的HISTORICAL_BACKFILL_EXIT.DATABASE_FAILURE数值保持一致', () => {
   assert.equal(DATABASE_FAILURE_EXIT_CODE, 5);
-  for (const code of ['DATABASE_URL_REQUIRED', 'DATABASE_URL_INVALID', 'DATABASE_TARGET_REJECTED']) {
+  for (const code of DATABASE_GUARD_ERROR_CODES) {
     assert.equal(exitCodeForCliError({ code }), DATABASE_FAILURE_EXIT_CODE);
     assert.equal(exitCodeForCliError(Object.assign(new Error('x'), { code })), DATABASE_FAILURE_EXIT_CODE);
   }
@@ -209,7 +231,7 @@ test('exitCodeForCliError：非数据库保护错误默认返回调用方传入�
   assert.equal(exitCodeForCliError({ code: 'ANYTHING_ELSE' }), 1);
   assert.equal(exitCodeForCliError({}), 1);
   assert.equal(exitCodeForCliError(undefined), 1);
-  assert.equal(exitCodeForCliError({ code: 'CUSTOM_CODE' }, { defaultExitCode: 3 }), 3, '调用方可覆盖默认非DB退出码（当前三个CLI均未覆盖，仍为1，这里只验证机制本身）');
+  assert.equal(exitCodeForCliError({ code: 'CUSTOM_CODE' }, { defaultExitCode: 3 }), 3, '调用方可覆盖默认非DB退出码（当前CLI均未覆盖，仍为1，这里只验证机制本身）');
   for (const result of [
     exitCodeForCliError({ code: 'ANYTHING_ELSE' }),
     exitCodeForCliError({}),
