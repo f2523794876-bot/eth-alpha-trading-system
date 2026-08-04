@@ -37,6 +37,8 @@ jobs:
     env:
       TEST_DATABASE_URL: postgresql://v14d_authenticity_ci:actions-test-only-password@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci
       ALLOW_POSTGRES_INTEGRATION_TESTS: "1"
+      V14D_RESEARCH_DATABASE_NAME: eth_alpha_v14d_authenticity_ci
+      V14D_DATABASE_IDENTITY: test
       NODE_ENV: test
       EVIDENCE_DIR: verification-evidence
 
@@ -82,6 +84,14 @@ jobs:
           )"
           test "$database_name" = "eth_alpha_v14d_authenticity_ci"
 
+          test_database_url_name="$(
+            node --input-type=module -e \
+              "console.log(decodeURIComponent(new URL(process.env.TEST_DATABASE_URL).pathname.slice(1)))"
+          )"
+          test "$database_name" = "$test_database_url_name"
+          test "$database_name" = "$V14D_RESEARCH_DATABASE_NAME"
+          test "$V14D_DATABASE_IDENTITY" = "test"
+
           postgres_version="$(
             PGPASSWORD=actions-test-only-password psql \
               --host=127.0.0.1 --port=5432 \
@@ -97,7 +107,10 @@ jobs:
             echo "git status --short:"
             git status --short
             echo "PostgreSQL version: $postgres_version"
-            echo "Test database name: $database_name"
+            echo "Workflow PostgreSQL database name: $database_name"
+            echo "TEST_DATABASE_URL database name: $test_database_url_name"
+            echo "V14D_RESEARCH_DATABASE_NAME: $V14D_RESEARCH_DATABASE_NAME"
+            echo "Database-name consistency: PASS (all three names match exactly)"
             echo "TEST_DATABASE_URL target: postgresql://v14d_authenticity_ci:***@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci"
             echo "DATABASE_URL usage: NOT USED (variable is unset and no secrets are referenced)"
             echo "Lifecycle: the PostgreSQL service container is destroyed automatically when this job ends"
