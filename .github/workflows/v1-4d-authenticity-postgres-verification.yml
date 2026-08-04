@@ -1,0 +1,384 @@
+name: V1.4D isolated PostgreSQL authenticity verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/v1.4d-rerun-authenticity-guard
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v1-4d-authenticity-postgres-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  authenticity-postgres-verification:
+    name: Isolated PostgreSQL 16 authenticity acceptance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: v14d_authenticity_ci
+          POSTGRES_PASSWORD: actions-test-only-password
+          POSTGRES_DB: eth_alpha_v14d_authenticity_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U v14d_authenticity_ci -d eth_alpha_v14d_authenticity_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_URL: postgresql://v14d_authenticity_ci:actions-test-only-password@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci
+      ALLOW_POSTGRES_INTEGRATION_TESTS: "1"
+      NODE_ENV: test
+      EVIDENCE_DIR: verification-evidence
+
+    steps:
+      - name: Checkout requested branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Record immutable source and isolated database evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          mkdir -p "$EVIDENCE_DIR/logs"
+
+          for attempt in $(seq 1 30); do
+            if PGPASSWORD=actions-test-only-password pg_isready \
+              --host=127.0.0.1 --port=5432 \
+              --username=v14d_authenticity_ci \
+              --dbname=eth_alpha_v14d_authenticity_ci; then
+              break
+            fi
+            echo "Waiting for the isolated PostgreSQL service ($attempt/30)"
+            sleep 2
+          done
+
+          database_name="$(
+            PGPASSWORD=actions-test-only-password psql \
+              --host=127.0.0.1 --port=5432 \
+              --username=v14d_authenticity_ci \
+              --dbname=eth_alpha_v14d_authenticity_ci \
+              --tuples-only --no-align \
+              --command='SELECT current_database();'
+          )"
+          test "$database_name" = "eth_alpha_v14d_authenticity_ci"
+
+          postgres_version="$(
+            PGPASSWORD=actions-test-only-password psql \
+              --host=127.0.0.1 --port=5432 \
+              --username=v14d_authenticity_ci \
+              --dbname=eth_alpha_v14d_authenticity_ci \
+              --tuples-only --no-align \
+              --command='SHOW server_version;'
+          )"
+
+          {
+            echo "Current branch: ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+            echo "HEAD full SHA: $(git rev-parse HEAD)"
+            echo "git status --short:"
+            git status --short
+            echo "PostgreSQL version: $postgres_version"
+            echo "Test database name: $database_name"
+            echo "TEST_DATABASE_URL target: postgresql://v14d_authenticity_ci:***@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci"
+            echo "DATABASE_URL usage: NOT USED (variable is unset and no secrets are referenced)"
+            echo "Lifecycle: the PostgreSQL service container is destroyed automatically when this job ends"
+          } | tee "$EVIDENCE_DIR/environment.txt"
+
+      - name: Install locked dependencies
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          npm ci
+
+      - name: Apply project migrations through TEST_DATABASE_URL only
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          node --input-type=module <<'NODE' 2>&1 | tee ../verification-evidence/logs/migrations.log
+          import { Pool } from 'pg';
+          import { runMigrations } from './src/db/migrate.js';
+
+          if (process.env.DATABASE_URL !== undefined) {
+            throw new Error('DATABASE_URL must remain unset');
+          }
+          const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+          try {
+            await runMigrations(pool, 'up');
+            const result = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
+            console.log('Applied migrations:', result.rows.map(row => row.version).join(', '));
+          } finally {
+            await pool.end();
+          }
+          NODE
+
+      - name: Run PostgreSQL and authenticity test groups
+        id: test_groups
+        working-directory: server
+        shell: bash
+        run: |
+          set -uo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          results="../$EVIDENCE_DIR/group-results.tsv"
+          : > "$results"
+
+          run_group() {
+            local group="$1"
+            shift
+            local log="../$EVIDENCE_DIR/logs/${group}.tap"
+            set +e
+            env -u DATABASE_URL node --test --test-reporter=tap --test-concurrency=1 "$@" 2>&1 | tee "$log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            local pass fail skip
+            pass="$(awk '/^# pass / { value=$3 } END { print value+0 }' "$log")"
+            fail="$(awk '/^# fail / { value=$3 } END { print value+0 }' "$log")"
+            skip="$(awk '/^# skipped / { value=$3 } END { print value+0 }' "$log")"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$group" "$rc" "$pass" "$fail" "$skip" >> "$results"
+            return 0
+          }
+
+          run_group targeted_postgres \
+            tests/postgres/v1-4d-cleanup-single-run.integration.test.js \
+            tests/postgres/v1-4d-cli-entry.integration.test.js \
+            tests/postgres/v1-4d-r11-4-terminal-immutability.integration.test.js \
+            tests/postgres/v1-4d-replay-generator-evaluator.integration.test.js \
+            tests/postgres/v1-4d-report-builder.integration.test.js
+
+          run_group complete_v1_4d_postgres tests/postgres/v1-4d-*.integration.test.js
+
+          run_group authenticity_report_scorecard \
+            src/validation-replay/replay-authenticity.test.js \
+            src/validation-replay/cli-entry.test.js \
+            src/validation-replay/replay-evaluator.test.js \
+            src/validation-replay/report-builder.test.js \
+            src/validation-replay/research-scorecard.test.js \
+            scripts/v1-4d-scorecard-cli.test.mjs
+
+      - name: Run explicit Report and Scorecard rejection probes
+        id: rejection_probes
+        working-directory: server
+        shell: bash
+        run: |
+          set -uo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          log="../$EVIDENCE_DIR/logs/report-scorecard-rejection-probes.tap"
+          set +e
+          env -u DATABASE_URL node --input-type=module <<'NODE' 2>&1 | tee "$log"
+          import assert from 'node:assert/strict';
+          import {
+            assertScorecardRunAuthenticity,
+            createReplayAuthenticitySummary,
+            recordGenerationAuthenticity,
+            assertReplayAuthenticity
+          } from './src/validation-replay/replay-authenticity.js';
+          import { buildValidationReports } from './src/validation-replay/report-builder.js';
+
+          const passed = createReplayAuthenticitySummary({ mode: 'fresh', expectedCount: 1 });
+          recordGenerationAuthenticity(passed, 'INSERTED');
+          assertReplayAuthenticity(passed);
+
+          for (const status of ['FAILED', 'BLOCKED']) {
+            const pool = { query: async () => ({ rowCount: 1, rows: [{ status }] }) };
+            await assert.rejects(
+              buildValidationReports({
+                pool, validationRunId: `probe-${status}`, datasetVersion: 'probe-dataset',
+                algorithmVersion: 'probe-algorithm', ruleVersion: 'probe-rule',
+                researchAvailabilityRuleVersion: 'probe-availability',
+                evaluationVersion: 'probe-evaluation', authenticitySummary: passed
+              }),
+              error => error.code === 'REPORT_VALIDATION_RUN_NOT_ELIGIBLE' && error.status === status
+            );
+            console.log(`SCENARIO PASS | Report rejects ${status} validation run`);
+            assert.throws(
+              () => assertScorecardRunAuthenticity({ runStatus: status, horizons: ['24h'], reportRows: [] }),
+              error => error.code === 'SCORECARD_VALIDATION_RUN_NOT_ELIGIBLE'
+            );
+            console.log(`SCENARIO PASS | Scorecard rejects ${status} validation run`);
+          }
+
+          const report = horizon => ({
+            horizon, reportScope: 'ALL',
+            formalProxyDisclosure: { rerunAuthenticity: passed }
+          });
+          const inconsistent = structuredClone(passed);
+          inconsistent.mode = 'resume';
+          assert.throws(
+            () => assertScorecardRunAuthenticity({
+              runStatus: 'SUCCEEDED', horizons: ['24h', '72h'],
+              reportRows: [report('24h'), {
+                horizon: '72h', reportScope: 'ALL',
+                formalProxyDisclosure: { rerunAuthenticity: inconsistent }
+              }]
+            }),
+            error => error.code === 'SCORECARD_RERUN_AUTHENTICITY_INCONSISTENT'
+          );
+          console.log('SCENARIO PASS | Scorecard rejects inconsistent authenticity evidence');
+          NODE
+          rc=${PIPESTATUS[0]}
+          set -e
+          printf 'report_scorecard_rejection_probes\t%s\t%s\t%s\t%s\n' \
+            "$rc" "$([ "$rc" -eq 0 ] && echo 5 || echo 0)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" 0 \
+            >> "../$EVIDENCE_DIR/group-results.tsv"
+
+      - name: Reproduce and classify known P1-6 backfill baseline failure
+        id: backfill_baseline
+        working-directory: server
+        shell: bash
+        run: |
+          set -uo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          log="../$EVIDENCE_DIR/logs/backfill-p1-6-baseline.tap"
+          set +e
+          env -u DATABASE_URL node --test --test-reporter=tap --test-concurrency=1 \
+            --test-name-pattern='P1-6：main\(\).*单个--resume加多个--intervals' \
+            tests/postgres/v1-4d-backfill-cli.integration.test.js 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$rc" -ne 0 ] && grep -Fq -- '--as-of is required' "$log"; then
+            classification=KNOWN_BASELINE_REPRODUCED
+          elif [ "$rc" -eq 0 ]; then
+            classification=UNEXPECTEDLY_PASSED
+          else
+            classification=DIFFERENT_FAILURE
+          fi
+          printf '%s\n' "$classification" | tee "../$EVIDENCE_DIR/backfill-baseline-classification.txt"
+          printf 'backfill_p1_6_baseline\t%s\t%s\t%s\t%s\n' \
+            "$rc" "$([ "$rc" -eq 0 ] && echo 1 || echo 0)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" 0 \
+            >> "../$EVIDENCE_DIR/group-results.tsv"
+
+      - name: Build acceptance and scenario summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          results="$EVIDENCE_DIR/group-results.tsv"
+          summary="$EVIDENCE_DIR/verification-summary.md"
+          backfill_classification="$(cat "$EVIDENCE_DIR/backfill-baseline-classification.txt" 2>/dev/null || echo NOT_RUN)"
+
+          group_status() {
+            local group="$1"
+            local rc
+            rc="$(awk -F '\t' -v wanted="$group" '$1 == wanted { print $2 }' "$results" 2>/dev/null || true)"
+            if [ "$rc" = "0" ]; then echo PASS
+            elif [ -n "$rc" ]; then echo FAIL
+            else echo NOT_RUN
+            fi
+          }
+          targeted_status="$(group_status targeted_postgres)"
+          authenticity_status="$(group_status authenticity_report_scorecard)"
+          rejection_status="$(group_status report_scorecard_rejection_probes)"
+
+          {
+            echo "# V1.4D isolated PostgreSQL authenticity verification"
+            echo
+            echo "- Branch: ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+            echo "- HEAD: $(git rev-parse HEAD)"
+            echo "- Database: eth_alpha_v14d_authenticity_ci (ephemeral PostgreSQL 16 service)"
+            echo "- DATABASE_URL: not used; variable was explicitly unset"
+            echo
+            echo "## Test groups"
+            echo
+            echo "| Group | Exit | Pass | Fail | Skip |"
+            echo "|---|---:|---:|---:|---:|"
+            if [ -f "$results" ]; then
+              while IFS=$'\t' read -r group rc pass fail skip; do
+                echo "| $group | $rc | $pass | $fail | $skip |"
+              done < "$results"
+            fi
+            echo
+            echo "## Authenticity scenarios"
+            echo
+            echo "| Scenario | Result | Evidence |"
+            echo "|---|---|---|"
+            echo "| New Snapshot insert | $targeted_status | targeted PostgreSQL: INSERTED full generation flow |"
+            echo "| Identical rerun | $targeted_status | targeted PostgreSQL: REUSED_IDENTICAL and one retained Snapshot |"
+            echo "| Different-content collision | $targeted_status | targeted PostgreSQL: REPLAY_SNAPSHOT_IDENTITY_CONFLICT |"
+            echo "| Fresh zero inserts blocked | $authenticity_status | authenticity matrix: ZERO_FRESH_INSERTS |"
+            echo "| Fresh partial insert/reuse blocked | $authenticity_status | authenticity matrix: FRESH_REUSE_FORBIDDEN/FRESH_INSERT_COUNT_MISMATCH |"
+            echo "| Fresh all inserted; Evaluation allowed | $targeted_status | CLI PostgreSQL run: authenticity PASSED, evaluation/report path allowed |"
+            echo "| Report rejects FAILED/BLOCKED or authenticity not PASS | $rejection_status | unit tests plus explicit rejection probes |"
+            echo "| Scorecard rejects ineligible run/inconsistent evidence | $rejection_status | unit tests plus explicit rejection probes |"
+            echo "| Conflict aftermath | $targeted_status | CLI PostgreSQL assertions cover validation FAILED, generation FAILED/error_code, blocked reasons, and zero new Evaluation/Report while Snapshot remains single |"
+            echo
+            echo "## Known backfill P1-6"
+            echo
+            echo "- Classification: **$backfill_classification**"
+            echo "- Expected contract: RESUME_INTERVALS_CONFLICT"
+            echo "- Baseline behavior: --as-of is required"
+            echo "- This result is reported separately and is never converted into an authenticity pass."
+            echo
+            echo "The service container and its dedicated database are destroyed automatically when the job ends."
+          } | tee "$summary"
+
+          cat "$EVIDENCE_DIR/environment.txt" >> "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1-4d-authenticity-postgres-verification-${{ github.run_id }}
+          path: verification-evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce final verification status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$EVIDENCE_DIR/group-results.tsv"
+          test -f "$results"
+
+          failed=0
+          while IFS=$'\t' read -r group rc pass fail skip; do
+            if [ "$rc" -ne 0 ]; then
+              echo "::error title=Test group failed::$group (pass=$pass fail=$fail skip=$skip)"
+              failed=1
+            fi
+          done < "$results"
+
+          backfill_classification="$(cat "$EVIDENCE_DIR/backfill-baseline-classification.txt" 2>/dev/null || echo NOT_RUN)"
+          if [ "$backfill_classification" = "KNOWN_BASELINE_REPRODUCED" ]; then
+            echo "::error title=Known P1-6 baseline reproduced::Expected RESUME_INTERVALS_CONFLICT but received --as-of is required; verification cannot be reported as passed"
+            failed=1
+          elif [ "$backfill_classification" = "DIFFERENT_FAILURE" ] || [ "$backfill_classification" = "NOT_RUN" ]; then
+            echo "::error title=P1-6 baseline classification failed::$backfill_classification"
+            failed=1
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo "GITHUB_ACTIONS_POSTGRES_VERIFICATION_FAILED"
+            exit 1
+          fi
+          echo "GITHUB_ACTIONS_POSTGRES_VERIFICATION_PASSED"
