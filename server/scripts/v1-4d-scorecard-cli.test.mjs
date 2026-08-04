@@ -97,6 +97,34 @@ test('scorecard CLI ignores generic DATABASE_URL and requires explicit V14D_REPL
   assert.match(result.stderr, /generic DATABASE_URL is intentionally ignored/);
 });
 
+test('scorecard CLI --validation-run-id path now routes through createGuardedResearchPgPool: a V14D_REPLAY_DATABASE_URL declaring the wrong database name is rejected before any query, without a live Postgres server', () => {
+  const env = cleanEnv();
+  env.V14D_REPLAY_DATABASE_URL = 'postgresql://u:p@127.0.0.1:5432/definitely_not_eth_alpha_v14d_test';
+  const result = spawnSync(process.execPath, [
+    script.pathname, '--validation-run-id=00000000-0000-0000-0000-000000000000', '--evaluation-version=test'
+  ], { encoding: 'utf8', env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /DATABASE_TARGET_REJECTED|must target eth_alpha_v14d_test/);
+});
+
+test('scorecard CLI cost assumption defaults to pre-cost (0/0) and is always echoed to stderr, never silent', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v1-4d-scorecard-cost-'));
+  const input = path.join(dir, 'input.json');
+  const json = path.join(dir, 'scorecard.json');
+  await writeFile(input, JSON.stringify(fixtureRows()));
+  const defaultRun = spawnSync(process.execPath, [
+    script.pathname, `--input=${input}`, `--output=${json}`, '--seed=17'
+  ], { encoding: 'utf8', env: cleanEnv() });
+  assert.equal(defaultRun.status, 0, defaultRun.stderr);
+  assert.match(defaultRun.stderr, /cost_assumption default_pre_cost.*"feeBps":0,"slippageBps":0/);
+
+  const explicitRun = spawnSync(process.execPath, [
+    script.pathname, `--input=${input}`, `--output=${json}`, '--fee-bps=8', '--slippage-bps=4', '--seed=17'
+  ], { encoding: 'utf8', env: cleanEnv() });
+  assert.equal(explicitRun.status, 0, explicitRun.stderr);
+  assert.match(explicitRun.stderr, /cost_assumption explicit.*"feeBps":8,"slippageBps":4/);
+});
+
 test('verification exit-code matrix is strict for PASS/NOT_EVALUABLE/BLOCKED/FAIL', () => {
   assert.equal(exitCodeForStatus('PASS'), 0);
   assert.notEqual(exitCodeForStatus('NOT_EVALUABLE'), 0);
