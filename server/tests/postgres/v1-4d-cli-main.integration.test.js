@@ -15,8 +15,8 @@ import { evaluateReplayOutcomes } from '../../src/validation-replay/replay-evalu
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { buildDatasetManifest } from '../../src/validation-replay/dataset-manifest-builder.js';
 import { RESEARCH_AVAILABILITY_RULE_VERSION } from '../../src/validation-replay/research-availability.js';
-import { FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION } from '../../src/features/feature-version.js';
-import { sha256 } from '../../src/domain/hash.js';
+import { FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION, featureSetDefinition } from '../../src/features/feature-version.js';
+import { canonicalJsonHash, canonicalJsonStringify, sha256 } from '../../src/domain/hash.js';
 
 import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
 
@@ -45,7 +45,13 @@ async function seedFeatureRecord(pool, { referenceCloseTime, historicalAsOfTime 
   await pool.query(
     `INSERT INTO feature_sets(feature_set_version, algorithm_version, schema_version, definition, definition_hash)
      VALUES($1,$2,$3,$4::jsonb,$5) ON CONFLICT(feature_set_version) DO NOTHING`,
-    [FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, 'v1.4b-schema-1', JSON.stringify({}), sha256({})]
+    [
+      FEATURE_SET_VERSION,
+      FEATURE_ALGORITHM_VERSION,
+      featureSetDefinition.schemaVersion,
+      canonicalJsonStringify(featureSetDefinition),
+      canonicalJsonHash(featureSetDefinition)
+    ]
   );
   const featureValues = {
     closeToEma5: 0, trend4h: 'DOWN', trend1h: 'DOWN', volumeRatio20: 1,

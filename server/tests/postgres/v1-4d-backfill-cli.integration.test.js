@@ -246,6 +246,25 @@ test('P1-6：main()——单个--resume加多个--intervals必须拒绝(RESUME_I
   }
 });
 
+test('P1-6：校验优先级——无resume冲突时缺少--as-of仍稳定返回AS_OF_REQUIRED', async () => {
+  const originalDatabaseUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  try {
+    const common = ['--symbol', 'ETHUSDT', '--from', '2026-02-01T00:00:00Z', '--to', '2026-02-02T00:00:00Z'];
+    await assert.rejects(
+      backfillMain([...common, '--intervals', '15m', '--resume', randomUUID()]),
+      error => error.code === 'AS_OF_REQUIRED'
+    );
+    await assert.rejects(
+      backfillMain([...common, '--intervals', '15m,4h']),
+      error => error.code === 'AS_OF_REQUIRED'
+    );
+  } finally {
+    if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDatabaseUrl;
+  }
+});
+
 test('P1-6：单个--resume加单个interval不受影响——runBackfillForInterval正常resume路径不回归', { skip }, async () => {
   await withTxClient(async (client) => {
     const base = Date.UTC(2026, 1, 14, 0, 0, 0);

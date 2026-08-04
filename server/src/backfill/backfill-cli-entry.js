@@ -162,9 +162,6 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
   const intervals = String(args.intervals || '').split(',').map(s => s.trim()).filter(Boolean);
   const startTime = parseUtc(args.from, '--from');
   const endTime = parseUtc(args.to, '--to');
-  if (args['as-of'] === undefined || args['as-of'] === true) throw Object.assign(new Error('--as-of is required'), { code: 'AS_OF_REQUIRED' });
-  const fixedAsOf = parseUtc(args['as-of'], '--as-of');
-  if (!symbol || !intervals.length) throw Object.assign(new Error('--symbol and --intervals are required'), { code: 'MISSING_REQUIRED_ARG' });
 
   // P1-6修复（独立复审）：V1_4D_DATA_BACKFILL_SPEC.md§2.11只定义了"单个--resume续跑同一(symbol,interval)"
   // 的语义（回填任务按(interval_name,时间分页游标)为幂等单位），未定义"一个--resume ID分别套用到多个
@@ -178,6 +175,10 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
       { code: 'RESUME_INTERVALS_CONFLICT' }
     );
   }
+
+  if (args['as-of'] === undefined || args['as-of'] === true) throw Object.assign(new Error('--as-of is required'), { code: 'AS_OF_REQUIRED' });
+  const fixedAsOf = parseUtc(args['as-of'], '--as-of');
+  if (!symbol || !intervals.length) throw Object.assign(new Error('--symbol and --intervals are required'), { code: 'MISSING_REQUIRED_ARG' });
 
   const config = loadConfig();
   const pool = await createGuardedResearchPgPool(config, { createPgPool: createPgPoolOverride });
