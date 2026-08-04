@@ -177,7 +177,7 @@ test('P1-3：评估阶段注入异常——validation_runs必须转为FAILED，e
       [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
     );
     const generation = await generateReplaySnapshot({
-      pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETHUSDT', horizon: '24h',
       historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION,
       weightVersion: WEIGHT_VERSION, datasetVersion, ruleVersion: RULE_VERSION, backfillBatchIds: []
     });
