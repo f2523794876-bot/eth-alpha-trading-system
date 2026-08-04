@@ -215,7 +215,7 @@ test('BLOCKED：feature_records缺失时返回FEATURE_RECORD_MISSING', { skip },
   });
 });
 
-test('INSERTED：完整生成流程——predictionId格式/source_origin/calibrated_probabilities NULL/research_data_vintage/幂等去重', { skip }, async () => {
+test('INSERTED：完整生成流程——predictionId格式/source_origin/calibrated_probabilities NULL/research_data_vintage/幂等去重', { skip }, async (t) => {
   await withTxClient(async (client) => {
     const validationRunId = randomUUID();
     const dayStart = Date.UTC(2026, 4, 4, 0, 0, 0);
@@ -267,23 +267,117 @@ test('INSERTED：完整生成流程——predictionId格式/source_origin/calibr
     assert.equal(count, 1);
 
     // predictionId不含weightVersion：同一身份下改变研究语义必须稳定冲突，而不是静默复用旧Snapshot。
-    await assert.rejects(
-      generateReplaySnapshot({
+    // 先捕获第三次调用结果，再读取运行库约束与实际行，先写TAP诊断、最后断言。这样即便意外返回
+    // INSERTED，完整身份和数据库状态仍会被Actions Artifact保留，不会因assert提前终止而丢失证据。
+    let third = null;
+    let thirdError = null;
+    try {
+      third = await generateReplaySnapshot({
         pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
         historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: `${WEIGHT_VERSION}-changed`,
         datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION, backfillBatchIds: []
-      }),
-      error => error.code === 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT'
-        && error.predictionId === first.record.predictionId
-        && error.differingFields.includes('weightVersion')
-        && error.differingFields.includes('contentHash')
-    );
-    const failedAudit = (await client.query(
-      `SELECT status,error_code FROM historical_validation.replay_generation_runs
-       WHERE validation_run_id=$1 ORDER BY created_at DESC LIMIT 1`, [validationRunId]
-    )).rows[0];
+      });
+    } catch (error) {
+      thirdError = error;
+    }
+
+    const [databaseResult, migrationResult, constraintResult, matchingSnapshotsResult, generationRunsResult, validationRunResult, downstreamResult] = await Promise.all([
+      client.query('SELECT current_database() AS database'),
+      client.query("SELECT version,checksum FROM schema_migrations WHERE version='005'"),
+      client.query(
+        `SELECT c.conname AS name,pg_get_constraintdef(c.oid) AS definition
+         FROM pg_constraint c
+         JOIN pg_class t ON t.oid=c.conrelid
+         JOIN pg_namespace n ON n.oid=t.relnamespace
+         WHERE n.nspname='historical_validation' AND t.relname='replay_snapshots' AND c.contype='u'
+         ORDER BY c.conname`
+      ),
+      client.query(
+        `SELECT replay_snapshot_id,prediction_id,research_availability_rule_version,algorithm_version,dataset_version,
+                weight_version,rule_version,instrument,horizon,historical_as_of_time,content_hash,generation_run_id
+         FROM historical_validation.replay_snapshots
+         WHERE prediction_id=$1 AND research_availability_rule_version=$2
+         ORDER BY replay_snapshot_id`,
+        [first.record.predictionId, RESEARCH_AVAILABILITY_RULE_VERSION]
+      ),
+      client.query(
+        `SELECT generation_run_id,status,error_code,generated_count,deduped_count,blocked_count
+         FROM historical_validation.replay_generation_runs WHERE validation_run_id=$1 ORDER BY created_at,generation_run_id`,
+        [validationRunId]
+      ),
+      client.query('SELECT status,error_code,blocked_reasons FROM historical_validation.validation_runs WHERE validation_run_id=$1', [validationRunId]),
+      client.query(
+        `SELECT
+           (SELECT count(*)::int FROM historical_validation.replay_evaluation_runs WHERE validation_run_id=$1) AS evaluations,
+           (SELECT count(*)::int FROM historical_validation.validation_reports WHERE validation_run_id=$1) AS reports`,
+        [validationRunId]
+      )
+    ]);
+
+    const storedSnapshotId = matchingSnapshotsResult.rows[0]?.replay_snapshot_id ?? null;
+    const identityInput = weightVersion => ({
+      prediction_id: first.record.predictionId,
+      research_availability_rule_version: RESEARCH_AVAILABILITY_RULE_VERSION,
+      algorithm_version: ALGORITHM_VERSION,
+      dataset_version: DATASET_VERSION,
+      weightVersion,
+      rule_version: RULE_VERSION,
+      instrument: 'ETHUSDT',
+      symbol: 'ETH',
+      horizon: '24h',
+      reference_close_time: referenceCloseTime,
+      prediction_id_components: {
+        prefix: 'GMKG-REPLAY', symbol: 'ETH', horizon: '24h', reference_close_time: referenceCloseTime,
+        algorithm_version: ALGORITHM_VERSION, dataset_version: DATASET_VERSION
+      }
+    });
+    const generationById = new Map(generationRunsResult.rows.map(run => [String(run.generation_run_id), run]));
+    const thirdGenerationRun = generationRunsResult.rows.find(run => ![String(first.generationRunId), String(second.generationRunId)].includes(String(run.generation_run_id))) ?? null;
+    const callEvidence = [
+      {
+        call: 1, input: identityInput(WEIGHT_VERSION), status: first.status, error_code: null,
+        snapshot_id: storedSnapshotId, generation_run_id: first.generationRunId,
+        generation_status: generationById.get(String(first.generationRunId))?.status ?? null,
+        validation_status: validationRunResult.rows[0]?.status ?? null
+      },
+      {
+        call: 2, input: identityInput(WEIGHT_VERSION), status: second.status, error_code: null,
+        snapshot_id: second.record.replay_snapshot_id ?? storedSnapshotId, generation_run_id: second.generationRunId,
+        generation_status: generationById.get(String(second.generationRunId))?.status ?? null,
+        validation_status: validationRunResult.rows[0]?.status ?? null
+      },
+      {
+        call: 3, input: identityInput(`${WEIGHT_VERSION}-changed`), status: third?.status ?? 'THREW',
+        error_code: thirdError?.code ?? third?.errorCode ?? null,
+        snapshot_id: third?.record?.replay_snapshot_id ?? null, generation_run_id: third?.generationRunId ?? thirdGenerationRun?.generation_run_id ?? null,
+        generation_status: thirdGenerationRun?.status ?? null,
+        validation_status: validationRunResult.rows[0]?.status ?? null
+      }
+    ];
+    t.diagnostic(`AUTHENTICITY_CONFLICT_CALLS ${JSON.stringify(callEvidence)}`);
+    t.diagnostic(`AUTHENTICITY_CONFLICT_DATABASE ${JSON.stringify({
+      current_database: databaseResult.rows[0]?.database ?? null,
+      migration_005: migrationResult.rows[0] ?? null,
+      unique_constraints: constraintResult.rows,
+      matching_snapshot_count: matchingSnapshotsResult.rowCount,
+      matching_snapshots: matchingSnapshotsResult.rows,
+      generation_runs: generationRunsResult.rows,
+      validation_run: validationRunResult.rows[0] ?? null,
+      downstream_counts: downstreamResult.rows[0]
+    })}`);
+
+    assert.equal(third, null, '第三次异内容同身份调用不得返回成功结果');
+    assert.equal(thirdError?.code, 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT');
+    assert.equal(thirdError?.predictionId, first.record.predictionId);
+    assert.ok(thirdError?.differingFields?.includes('weightVersion'));
+    assert.ok(thirdError?.differingFields?.includes('contentHash'));
+    assert.equal(migrationResult.rowCount, 1, 'Migration 005必须存在');
+    assert.ok(constraintResult.rows.some(row => /UNIQUE \(prediction_id, research_availability_rule_version\)/.test(row.definition)), '目标复合唯一约束必须安装');
+
+    const failedAudit = thirdGenerationRun && { status: thirdGenerationRun.status, error_code: thirdGenerationRun.error_code };
     assert.deepEqual(failedAudit, { status: 'FAILED', error_code: 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT' });
-    assert.equal((await client.query('SELECT count(*)::int AS n FROM historical_validation.replay_snapshots WHERE prediction_id=$1', [first.record.predictionId])).rows[0].n, 1);
+    assert.equal(matchingSnapshotsResult.rowCount, 1);
+    assert.deepEqual(downstreamResult.rows[0], { evaluations: 0, reports: 0 });
   });
 });
 
