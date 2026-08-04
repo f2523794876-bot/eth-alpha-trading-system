@@ -11,7 +11,14 @@
 //     而不是直接调用createPgPool()，保护即自动生效，不存在"忘记调用校验函数"的操作员责任。
 //   - 校验失败时，连接（如果已经建立）必须被关闭，不得泄漏。
 
-export const RESEARCH_DATABASE_NAME = 'eth_alpha_v14d_test';
+// V1.4D unified fix: the allowed target name is now overridable via V14D_RESEARCH_DATABASE_NAME
+// so a genuinely separate, freshly-provisioned research database (e.g. for a specific 180-day run)
+// can be recognized without touching this constant's default and without weakening protection for
+// any existing deployment that doesn't set the override — unset behaves exactly as before.
+// The override itself is read once at module load, not re-read per call, so a single process's
+// notion of "the allowed research database" cannot drift mid-run.
+export const DEFAULT_RESEARCH_DATABASE_NAME = 'eth_alpha_v14d_test';
+export const RESEARCH_DATABASE_NAME = process.env.V14D_RESEARCH_DATABASE_NAME || DEFAULT_RESEARCH_DATABASE_NAME;
 export const ALLOWED_RESEARCH_DATABASE_IDENTITIES = Object.freeze(['research', 'test']);
 export const RESEARCH_DATABASE_IDENTITY_ENV = 'V14D_DATABASE_IDENTITY';
 

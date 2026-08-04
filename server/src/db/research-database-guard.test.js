@@ -3,8 +3,9 @@
 // 也不会泄漏未关闭的连接池。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
-  RESEARCH_DATABASE_NAME, parseResearchDatabaseTarget, createGuardedResearchPgPool,
+  RESEARCH_DATABASE_NAME, DEFAULT_RESEARCH_DATABASE_NAME, parseResearchDatabaseTarget, createGuardedResearchPgPool,
   DATABASE_FAILURE_EXIT_CODE, isDatabaseGuardErrorCode, exitCodeForCliError,
   ALLOWED_RESEARCH_DATABASE_IDENTITIES, assertExplicitResearchDatabaseIdentity,
   RESEARCH_DATABASE_IDENTITY_ENV
@@ -25,8 +26,34 @@ function fakePool({ queryImpl } = {}) {
   };
 }
 
-test('RESEARCH_DATABASE_NAME 精确等于 eth_alpha_v14d_test', () => {
+test('RESEARCH_DATABASE_NAME 精确等于 eth_alpha_v14d_test（V14D_RESEARCH_DATABASE_NAME未设置时的默认行为，不变）', () => {
   assert.equal(RESEARCH_DATABASE_NAME, 'eth_alpha_v14d_test');
+  assert.equal(DEFAULT_RESEARCH_DATABASE_NAME, 'eth_alpha_v14d_test');
+});
+
+test('V1.4D统一修复：V14D_RESEARCH_DATABASE_NAME可覆盖允许的目标库名（用于全新独立研究库），但对未设置该变量的既有部署零行为变化', () => {
+  const probe = code => spawnSync(process.execPath, ['--input-type=module', '--eval', code], { encoding: 'utf8' });
+
+  const overridden = probe(`
+    process.env.V14D_RESEARCH_DATABASE_NAME = 'eth_alpha_v14d_research_180d_202608';
+    const { RESEARCH_DATABASE_NAME, parseResearchDatabaseTarget } = await import(${JSON.stringify(new URL('./research-database-guard.js', import.meta.url).href)});
+    console.log(RESEARCH_DATABASE_NAME);
+    try { parseResearchDatabaseTarget('postgres://u:p@127.0.0.1/eth_alpha_v14d_research_180d_202608'); console.log('ACCEPTED_NEW_NAME'); } catch { console.log('REJECTED_NEW_NAME'); }
+    try { parseResearchDatabaseTarget('postgres://u:p@127.0.0.1/eth_alpha_v14d_test'); console.log('ACCEPTED_OLD_TEST_NAME'); } catch { console.log('REJECTED_OLD_TEST_NAME'); }
+  `);
+  assert.equal(overridden.status, 0, overridden.stderr);
+  const overriddenLines = overridden.stdout.trim().split('\n');
+  assert.equal(overriddenLines[0], 'eth_alpha_v14d_research_180d_202608');
+  assert.equal(overriddenLines[1], 'ACCEPTED_NEW_NAME');
+  assert.equal(overriddenLines[2], 'REJECTED_OLD_TEST_NAME', 'once overridden, the OLD eth_alpha_v14d_test target must be rejected, not silently also-allowed');
+
+  const unset = probe(`
+    delete process.env.V14D_RESEARCH_DATABASE_NAME;
+    const { RESEARCH_DATABASE_NAME } = await import(${JSON.stringify(new URL('./research-database-guard.js', import.meta.url).href)});
+    console.log(RESEARCH_DATABASE_NAME);
+  `);
+  assert.equal(unset.status, 0, unset.stderr);
+  assert.equal(unset.stdout.trim(), 'eth_alpha_v14d_test');
 });
 
 test('显式数据库身份只允许research/test，并按既有CLI惯例执行trim+小写归一化', () => {
