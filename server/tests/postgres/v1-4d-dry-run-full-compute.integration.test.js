@@ -252,10 +252,12 @@ test('P0-2：evaluation预演——已存在的真实待评估快照在dry-run�
     await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
 
     const manifestFrom = referenceCloseTime - FOUR_HOUR_MS + 1;
-    const manifestTo = referenceCloseTime + 1;
+    const targetEndTime = referenceCloseTime + 96 * FIFTEEN_MIN_MS;
+    const manifestTo = targetEndTime + FOUR_HOUR_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from: manifestFrom, to: manifestTo, replayNowMs });
 
-    // 真实（非dry-run）生成一条快照，制造"已存在、待评估"的历史状态——targetEndTime = referenceCloseTime + 24h。
+    // 在覆盖生成点到成熟点的同一个RUNNING validation_run中真实生成一条快照。
+    // evaluator只消费同一validation_run_id的generation证据，不能用另一个run的快照冒充本轮待评估记录。
     const validationRunId = randomUUID();
     await client.query(
       `INSERT INTO historical_validation.validation_runs(validation_run_id, dataset_version, symbol, horizons, from_utc, to_utc, algorithm_version, rule_version, dry_run, status, started_at)
@@ -267,22 +269,12 @@ test('P0-2：evaluation预演——已存在的真实待评估快照在dry-run�
       algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION, datasetVersion, ruleVersion: RULE_VERSION, backfillBatchIds: []
     });
     assert.equal(generation.status, 'INSERTED');
-    const targetEndTime = referenceCloseTime + 96 * FIFTEEN_MIN_MS;
-
-    // 另开一个全新的dry-run validation_run，窗口位于targetEndTime之后——其自身的生成尝试大概率BLOCKED
-    // （该窗口没有为它准备任何数据），但evaluation sweep是全局性的（不按validation_run_id过滤，见
-    // replay-evaluator.js findPendingReplaySnapshots），必须能扫描到上面这条待评估快照并完整跑一遍
-    // 定位+outcome计算，只是不写入。
-    const dryRunFrom = targetEndTime + 1; // +1对齐open_time相位（targetEndTime本身按close_time+1天算出，含close_time相位偏移）
-    const dryRunTo = targetEndTime + FOUR_HOUR_MS + 1;
-    const dryRunDatasetVersion = await buildVerifiedManifest(client, { from: dryRunFrom, to: dryRunTo, replayNowMs });
-    const points = enumerateRhythmPoints({ from: dryRunFrom, to: dryRunTo, horizon: '24h' });
-    assert.ok(points.length >= 1 && points[0] >= targetEndTime, '前提核验：dry-run窗口必须至少枚举出一个>=targetEndTime的节奏点，才能触发对该快照的评估sweep');
+    const points = enumerateRhythmPoints({ from: manifestFrom, to: manifestTo, horizon: '24h' });
+    assert.ok(points.some(point => point >= targetEndTime), '前提核验：dry-run窗口必须至少枚举出一个>=targetEndTime的节奏点，才能触发对该快照的评估sweep');
 
     const before = await tableCounts(client);
     const plan = await runWalkForward({
-      pool: client, symbol: 'ETHUSDT', from: dryRunFrom, to: dryRunTo, horizons: ['24h'],
-      algorithmVersion: ALGORITHM_VERSION, datasetVersion: dryRunDatasetVersion, ruleVersion: RULE_VERSION,
+      pool: client, resumeValidationRunId: validationRunId,
       weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: true,
       nowMs: Date.now(), replayNowMs
     });

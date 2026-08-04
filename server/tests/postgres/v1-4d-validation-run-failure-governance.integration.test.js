@@ -17,6 +17,7 @@ import { randomUUID } from 'node:crypto';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { buildDatasetManifest } from '../../src/validation-replay/dataset-manifest-builder.js';
 import { runWalkForward } from '../../src/validation-replay/cli-entry.js';
+import { generateReplaySnapshot } from '../../src/validation-replay/replay-generator.js';
 import { FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION } from '../../src/features/feature-version.js';
 import { sha256 } from '../../src/domain/hash.js';
 
@@ -160,37 +161,35 @@ test('P1-3：生成阶段注入异常——validation_runs必须转为FAILED，e
 
 test('P1-3：评估阶段注入异常——validation_runs必须转为FAILED，error_code/blocked_reasons记录EVALUATION阶段信息', { skip }, async () => {
   await withTxClient(async (client) => {
-    // 评估sweep只处理"targetEndTime<=historicalAsOfTime"的既有快照——若本次run自己刚生成的快照
-    // 尚未成熟(targetEndTime=referenceCloseTime+24h远大于本次窗口的historicalAsOfTime)，评估阶段
-    // 根本不会有任何pending记录、也就不会触发任何INSERT，注入点永远不会被命中。故先用一次独立的
-    // 真实(非故障注入)生成，制造一条"已存在、本次窗口内一定会到期评估"的快照，再对触发评估的这次
-    // runWalkForward调用注入故障。
+    // 评估器要求snapshot与generation证据属于当前validation_run。夹具先在覆盖生成点到成熟点的同一个
+    // RUNNING run中生成首条snapshot，再resume该run推进到targetEndTime，确保真正触达outcome INSERT故障点。
     const referenceCloseTime = Date.UTC(2026, 6, 16, 0, 0, 0) - 1;
     const replayNowMs = Date.now();
     await seedRhythmPoint(client, { referenceCloseTime, replayNowMs });
-    const priorFrom = referenceCloseTime - FOUR_HOUR_MS + 1;
-    const priorTo = referenceCloseTime + 1;
-    const priorDatasetVersion = await buildVerifiedManifest(client, { from: priorFrom, to: priorTo, replayNowMs });
-    const priorPlan = await runWalkForward({
-      pool: client, symbol: 'ETHUSDT', from: priorFrom, to: priorTo, horizons: ['24h'],
-      algorithmVersion: ALGORITHM_VERSION, datasetVersion: priorDatasetVersion, ruleVersion: RULE_VERSION,
-      weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: false,
-      nowMs: Date.now(), replayNowMs
-    });
-    const snapshotCountBefore = (await client.query(`SELECT count(*)::int AS n FROM historical_validation.replay_snapshots`)).rows[0].n;
-    assert.equal(snapshotCountBefore, 1, '前置：必须先真实生成一条待评估快照');
-
     const targetEndTime = referenceCloseTime + 96 * FIFTEEN_MIN_MS;
-    const from = targetEndTime + 1;
+    const from = referenceCloseTime - FOUR_HOUR_MS + 1;
     const to = targetEndTime + FOUR_HOUR_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to, replayNowMs });
+    const validationRunId = randomUUID();
+    await client.query(
+      `INSERT INTO historical_validation.validation_runs(validation_run_id,dataset_version,symbol,horizons,from_utc,to_utc,algorithm_version,rule_version,dry_run,status,started_at)
+       VALUES($1,$2,'ETHUSDT','["24h"]'::jsonb,to_timestamp($3/1000.0),to_timestamp($4/1000.0),$5,$6,false,'RUNNING',now())`,
+      [validationRunId, datasetVersion, from, to, ALGORITHM_VERSION, RULE_VERSION]
+    );
+    const generation = await generateReplaySnapshot({
+      pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+      historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION,
+      weightVersion: WEIGHT_VERSION, datasetVersion, ruleVersion: RULE_VERSION, backfillBatchIds: []
+    });
+    assert.equal(generation.status, 'INSERTED');
+    const snapshotCountBefore = (await client.query(`SELECT count(*)::int AS n FROM historical_validation.replay_snapshots`)).rows[0].n;
+    assert.equal(snapshotCountBefore, 1, '前置：必须先真实生成一条待评估快照');
 
     const faultyPool = makeFaultInjectingPool(client, 'INSERT INTO historical_validation.replay_outcome_events');
     let capturedError;
     try {
       await runWalkForward({
-        pool: faultyPool, symbol: 'ETHUSDT', from, to, horizons: ['24h'],
-        algorithmVersion: ALGORITHM_VERSION, datasetVersion, ruleVersion: RULE_VERSION,
+        pool: faultyPool, resumeValidationRunId: validationRunId,
         weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: false,
         nowMs: Date.now(), replayNowMs
       });
@@ -208,8 +207,7 @@ test('P1-3：评估阶段注入异常——validation_runs必须转为FAILED，e
     assert.equal(runRow.status, 'FAILED');
     assert.equal(runRow.blocked_reasons[0].phase, 'EVALUATION');
 
-    // 触发评估的这次run本身不应该新增任何replay_snapshots（它自己的生成尝试大概率BLOCKED，
-    // 因为这个窗口没有为它准备生成数据），待评估的那条快照仍然是唯一的一条。
+    // resume后的其他生成点没有对应feature，均由真实性门禁BLOCKED；首条待评估snapshot仍是唯一记录。
     const snapshotCountAfter = (await client.query(`SELECT count(*)::int AS n FROM historical_validation.replay_snapshots`)).rows[0].n;
     assert.equal(snapshotCountAfter, 1);
     const outcomeCount = (await client.query(`SELECT count(*)::int AS n FROM historical_validation.replay_outcome_events`)).rows[0].n;

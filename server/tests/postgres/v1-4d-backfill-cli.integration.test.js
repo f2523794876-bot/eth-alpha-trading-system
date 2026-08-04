@@ -129,7 +129,7 @@ test('resume：携带已有backfill_batch_id时从last_completed_open_time之后
     const adapter2 = makeMockAdapter({ pages: [[kline(bar1Open, bar1Close)]], serverTimeMs: nowMs2, calls: calls2 });
     const second = await runBackfillForInterval({ pool: client, adapter: adapter2, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close + 1, fixedAsOf: bar1Close, resumeBatchId: first.backfillBatchId, now: () => nowMs2 });
     assert.equal(second.status, 'SUCCEEDED');
-    assert.equal(calls2[0].startTime, bar0Open + 1, 'resume游标必须推进到last_completed_open_time之后，不得从bar0Open重新拉取');
+    assert.equal(calls2[0].startTime, bar1Open, 'resume游标必须推进到下一根15m K线的open_time，不得从bar0Open重新拉取');
 
     const bar0Count = (await client.query(`SELECT count(*)::int AS n FROM market_bars WHERE close_time=to_timestamp($1/1000.0)`, [bar0Close])).rows[0].n;
     const bar1Count = (await client.query(`SELECT count(*)::int AS n FROM market_bars WHERE close_time=to_timestamp($1/1000.0)`, [bar1Close])).rows[0].n;
@@ -197,7 +197,7 @@ test('P1-6红线：resume batch的interval_name与当前请求不一致——拒
     const beforeMarketBars = (await client.query('SELECT count(*)::int AS n FROM market_bars')).rows[0].n;
     const mustNotBeCalledAdapter = { serverTime: async () => { throw new Error('must not be called'); } };
     await assert.rejects(
-      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '4h', startTime: bar0Open, endTime: bar0Open + 900000, fixedAsOf: bar0Close, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
+      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '4h', startTime: bar0Open, endTime: bar0Open + 14400000, fixedAsOf: bar0Open + 14400000 - 1, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
       (e) => e.code === 'BACKFILL_RESUME_SYMBOL_INTERVAL_MISMATCH' && e.expectedInterval === '15m' && e.actualInterval === '4h'
     );
     const afterMarketBars = (await client.query('SELECT count(*)::int AS n FROM market_bars')).rows[0].n;

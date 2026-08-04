@@ -150,7 +150,7 @@ test('R8.1/R8.2-正常回放：真实生成+评估一个完整节点，前后五
     await backfillInterval({ pool: client, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
 
     const from = referenceCloseTime - DAY_MS + 1;
-    const to = referenceCloseTime + 2 * DAY_MS;
+    const to = referenceCloseTime + 2 * DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to, replayNowMs });
 
     const before = await snapshotProductionTables(client);

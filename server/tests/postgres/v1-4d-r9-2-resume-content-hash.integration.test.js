@@ -122,7 +122,7 @@ test('R9.2：一次性完整跑完两个节奏点(路径A) vs 第一点完成后
     // +1对齐open_time相位——bar的close_time=open_time+stepMs-1，要让某根bar的close_time精确落在
     // pointA（close-time相位）上，起点open_time必须相应偏移+1（呼应本代码库其余测试文件同款注释）。
     const manifestFrom = pointA - 3 * DAY_MS + 1;
-    const manifestTo = pointB + DAY_MS;
+    const manifestTo = pointB + DAY_MS + 1;
     // replayNowMs必须晚于manifestTo——否则backfillInterval()"仅接受已收盘K线"的过滤器会把
     // manifestTo之前尚未到达replayNowMs的bar静默丢弃，在manifest覆盖范围内制造缺口导致REJECTED。
     const replayNowMs = manifestTo + DAY_MS;

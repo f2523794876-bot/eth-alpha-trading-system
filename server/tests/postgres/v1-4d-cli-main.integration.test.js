@@ -662,7 +662,7 @@ test('P1-A-C：已有outcome使用evaluation V1，resume使用V2——拒绝(RES
     await backfillInterval({ pool, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
 
     const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
-    const to = referenceCloseTime + 2 * DAY_MS;
+    const to = referenceCloseTime + 2 * DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     // R11.4修复后不能再让首次run先跑到SUCCEEDED——见P1-A-A同款说明，改为RUNNING行+手工完成一次
@@ -721,7 +721,7 @@ test('P1-A-D：首次run与resume均使用相同evaluation版本——允许', {
     await backfillInterval({ pool, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
 
     const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
-    const to = referenceCloseTime + 2 * DAY_MS;
+    const to = referenceCloseTime + 2 * DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     // R11.4修复后不能再让首次run先跑到SUCCEEDED——见P1-A-A/P1-A-C同款说明，改为RUNNING行+手工完成
@@ -807,8 +807,8 @@ test('P1-A-F：历史数据已经混有多个weight_version（模拟本轮修复
     }
     const gapAdapter = makeMockAdapter({ pages: [gapBars], serverTimeMs: replayNowMs });
     await backfillInterval({ pool, adapter: gapAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: gapStart, endTime: referenceCloseTime2 - FIFTEEN_MIN_MS, now: () => replayNowMs });
-    const from = referenceCloseTime1 - DAY_MS;
-    const to = referenceCloseTime2 + DAY_MS;
+    const from = referenceCloseTime1 - DAY_MS + 1;
+    const to = referenceCloseTime2 + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(pool, { from, to });
 
     validationRunId = randomUUID();

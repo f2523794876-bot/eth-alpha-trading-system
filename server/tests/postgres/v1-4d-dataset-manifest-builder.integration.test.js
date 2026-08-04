@@ -144,8 +144,8 @@ test('R26.2：不同系统时钟（真实延迟后）重新构建同一批数据
 });
 
 // R26.3：manifest冻结后market_bars某一行的close值发生变化（测试环境构造，模拟内容篡改），
-// 用相同(symbol,intervals,from,to)重新构建manifest，content_hash必须不同——rowContentHash覆盖OHLCV六字段。
-test('R26.3：market_bars某一行close值变化后重新构建manifest，content_hash必须不同', { skip }, async () => {
+// 只读计算必须证明content_hash变化；受治理构建必须因同一逻辑窗口内容漂移而fail closed。
+test('R26.3：market_bars内容变化会改变content_hash，并触发同一逻辑窗口冲突', { skip }, async () => {
   await withTxClient(async (client) => {
     const base = Date.UTC(2026, 2, 7, 0, 0, 0);
     const { bar0Open, bar2Close } = await seedThreeBars(client, base);
@@ -158,9 +158,12 @@ test('R26.3：market_bars某一行close值变化后重新构建manifest，conten
     // 否则会被CHECK约束拒绝而非本测试想验证的"内容变化反映到哈希"场景。
     await client.query(`UPDATE market_bars SET close='999.50' WHERE instrument='ETHUSDT' AND open_time=to_timestamp($1/1000.0)`, [bar0Open]);
 
-    const second = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
-    assert.equal(second.status, 'SUCCEEDED');
-    assert.notEqual(second.datasetVersion, first.datasetVersion, 'close值变化必须反映为不同的dataset_version');
+    const candidate = await computeManifestContentForRange({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.notEqual(candidate.datasetVersion, first.datasetVersion, 'close值变化必须反映为不同的dataset_version');
+    await assert.rejects(
+      buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 }),
+      error => error.code === 'DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT' && error.candidateDatasetVersion === candidate.datasetVersion
+    );
   });
 });
 
@@ -205,7 +208,7 @@ test('R26.4：同一bar存在revision_number=1新版本后，manifest内容(comp
 // R26.5：追加一次覆盖同一时间范围的新backfill批次（backfill_batch_id=C），即使未引入新K线，
 // 重新构建manifest时backfillBatchIds集合本身变化，必须反映为不同的content_hash/dataset_version
 // （§2.9绑定字段清单：backfillBatchIds是被哈希字段之一）。
-test('R26.5：追加覆盖同一区间的新backfill_batch后重新构建manifest，backfillBatchIds集合变化必须反映为不同的dataset_version', { skip }, async () => {
+test('R26.5：backfillBatchIds变化会改变content_hash，并触发同一逻辑窗口冲突', { skip }, async () => {
   await withTxClient(async (client) => {
     const base = Date.UTC(2026, 2, 9, 0, 0, 0);
     const { bar0Open, bar2Close } = await seedThreeBars(client, base);
@@ -219,11 +222,13 @@ test('R26.5：追加覆盖同一区间的新backfill_batch后重新构建manifes
       [randomUUID(), bar0Open, bar2Close + 1]
     );
 
-    const second = await buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
-    assert.equal(second.status, 'SUCCEEDED');
-    const secondBatchIds = (await client.query(`SELECT backfill_batch_ids FROM historical_validation.dataset_manifests WHERE dataset_version=$1`, [second.datasetVersion])).rows[0].backfill_batch_ids;
-    assert.notDeepEqual(secondBatchIds.sort(), firstBatchIds.sort(), 'backfillBatchIds集合本身必须确实发生变化（这是本测试成立的前提）');
-    assert.notEqual(second.datasetVersion, first.datasetVersion, 'backfillBatchIds集合变化必须反映为不同的dataset_version');
+    const candidate = await computeManifestContentForRange({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 });
+    assert.notDeepEqual(candidate.backfillBatchIds.sort(), firstBatchIds.sort(), 'backfillBatchIds集合本身必须确实发生变化（这是本测试成立的前提）');
+    assert.notEqual(candidate.datasetVersion, first.datasetVersion, 'backfillBatchIds集合变化必须反映为不同的dataset_version');
+    await assert.rejects(
+      buildDatasetManifest({ pool: client, symbol: 'ETHUSDT', intervals: ['15m'], from: bar0Open, to: bar2Close + 1 }),
+      error => error.code === 'DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT' && error.candidateDatasetVersion === candidate.datasetVersion
+    );
   });
 });
 

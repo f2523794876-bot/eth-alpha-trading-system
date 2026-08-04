@@ -464,7 +464,7 @@ test('R11.4-replay_evaluation_runs：对同一历史as-of-time重复调用evalua
     await backfillInterval({ pool: client, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
 
     const from = referenceCloseTime - DAY_MS + 1;
-    const to = referenceCloseTime + 2 * DAY_MS;
+    const to = referenceCloseTime + 2 * DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
 
     const validationRunId = randomUUID();
