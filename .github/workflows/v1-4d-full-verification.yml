@@ -1,9 +1,8 @@
 on:
   workflow_dispatch:
-  push:
+  pull_request:
     branches:
-      - codex/v1.4d-multi-symbol-manifest-implementation
-      - codex/v1.4d-deferred-p2-cleanup
+      - main
 
 permissions:
   contents: read

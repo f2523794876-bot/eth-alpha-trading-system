@@ -341,7 +341,23 @@ Feature Backfill（`historical-feature-backfill.js`）在**任何**输入查询�
 | `SOURCE_OUTSIDE_DATASET_MANIFEST` | 查询期（逐行） | 既有 | 行越界（超出`data_from`/`data_to`/`fixed_as_of`） |
 | `SOURCE_NOT_IN_DATASET_MANIFEST` | 查询期（逐行） | 既有 | 行`vintage_id`未出现在`manifest.memberVintageIds` |
 
-**新增错误码之外，本附录不再引入其他新增错误码**；上表已完整覆盖用户任务清单要求的五个最低错误码（`DATASET_MANIFEST_DEPENDENCY_UNGOVERNED`/`DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT`/`DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED`/`DATASET_MANIFEST_MEMBER_IDENTITY_MISSING`/`DATASET_MANIFEST_DEPENDENCY_INCOMPLETE`），并明确了每一个与既有错误码的关系，不存在未定义触发条件的"游离"错误码。
+上表记录了附录设计时识别的错误语义；实现闭环随后增加了成员内容绑定和显式研究数据库身份门禁。此前“除此之外不再引入其他新增错误码”的表述已经不符合当前`main`，以紧接其后的实现登记表为准。该登记仅如实记录已经存在的实现和测试，不新增技术契约或功能范围。
+
+#### 9.2.1 当前实现新增稳定错误码登记（9个）
+
+| 错误码 | 准确触发条件 | 入口/模块 | 退出或返回行为 | 治理用途 |
+|---|---|---|---|---|
+| `DATASET_MANIFEST_DEPENDENCY_UNGOVERNED` | V2 `dependency_set`不与`FEATURE_BAR_DEPENDENCIES`完全一致，或成员落入未治理的symbol/interval/market type/source组 | `multi-symbol-manifest-contract.js`、`dataset-manifest-verifier-v2.js`、`historical-feature-backfill.js` | builder/manifest CLI异常路径为exit 1；verifier返回`ok:false`；Feature Backfill为`BLOCKED`、exit 3 | 在任何Feature计算前拒绝缺失或额外依赖，防止跨symbol未治理输入 |
+| `DATASET_MANIFEST_LOGICAL_WINDOW_CONFLICT` | 同一`logical_window_hash`已有不同`dataset_version`，或存储的逻辑窗口哈希/唯一约束结果与候选内容冲突 | `dataset-manifest-v2.js`、`dataset-manifest-verifier-v2.js` | builder/manifest CLI失败并exit 1；verifier返回`ok:false` | 保证同逻辑窗口幂等且不同内容稳定冲突 |
+| `DATASET_MANIFEST_CONTRACT_VERSION_UNSUPPORTED` | 契约版本未知，或调用入口要求V2而收到legacy V1 | `dataset-manifest-cli-entry.js`、`dataset-manifest-builder.js`、`dataset-manifest-verifier.js`、`historical-feature-backfill.js` | manifest CLI exit 1；verifier返回`ok:false`；Feature Backfill为`BLOCKED`、exit 3 | 阻止未知契约或legacy记录进入V2多symbol路径 |
+| `DATASET_MANIFEST_MEMBER_IDENTITY_MISSING` | 成员必填身份字段无效、vintage重复/冲突，或成员分组计数与Manifest声明不一致 | `multi-symbol-manifest-contract.js`、`dataset-manifest-verifier-v2.js`、`historical-feature-backfill.js` | verifier返回`ok:false`；Feature Backfill为`BLOCKED`、exit 3 | 确保每个成员具有完整且唯一的行身份 |
+| `DATASET_MANIFEST_DEPENDENCY_INCOMPLETE` | 依赖集合为空、候选行不满足依赖身份，或分依赖gap/duplicate/out-of-order/计数校验不完整 | `multi-symbol-manifest-contract.js`、`dataset-manifest-v2.js`、`dataset-manifest-verifier-v2.js`、`historical-feature-backfill.js` | builder返回`REJECTED`并由CLI设exit 1；verifier返回`ok:false`；Feature Backfill为`BLOCKED`、exit 3 | 禁止用不完整依赖覆盖生成或消费Manifest |
+| `DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH` | canonical normalization和确定性排序后的stored `manifest_members`与从数据库重算的`manifestMembers`不逐项一致 | `dataset-manifest-verifier-v2.js`（经`dataset-manifest-verifier.js`和`PostgresRepository.verifyHistoricalFeatureDataset()`进入） | verifier返回`ok:false`；Feature查询前抛同码并按`BLOCKED`、exit 3处理 | 将symbol、interval、market type、source、时间、revision、vintage ID和row content hash绑定到content hash，阻断成员替换 |
+| `DATABASE_IDENTITY_REQUIRED` | `V14D_DATABASE_IDENTITY`缺失、空白或不是字符串 | `research-database-guard.js`，由`v1-4d-manifest-inventory.mjs`在连接前调用 | inventory CLI输出`BLOCKED`并exit 5；inventory SQL执行0次 | 要求研究/测试操作具有显式数据库运行身份 |
+| `DATABASE_IDENTITY_REJECTED` | 规范化后的显式身份不是封闭允许集`research`/`test`，且不是单独分类的`production` | 同上 | inventory CLI输出`BLOCKED`并exit 5；inventory SQL执行0次 | fail-closed拒绝未知、staging等未授权身份 |
+| `DATABASE_IDENTITY_CONFLICT` | 规范化后的显式身份为`production` | 同上 | inventory CLI输出`BLOCKED`并exit 5；inventory SQL执行0次 | 明确拒绝生产身份执行研究Manifest盘点 |
+
+这里的“9个新增稳定错误码”按`main`相对PR #20前基线的实际实现增量登记：本节原五个Manifest治理码、成员内容绑定修复新增的`DATASET_MANIFEST_MEMBER_CONTENT_MISMATCH`，以及PR #21新增的三个显式数据库身份码。`DATABASE_URL_REQUIRED`、`DATABASE_URL_INVALID`和`DATABASE_TARGET_REJECTED`是这些变更之前已经存在的数据库目标门禁错误码，继续保持exit 5语义，但不重复计入上述9个新增码。
 
 ### 9.3 血缘（lineage）与审计
 
@@ -583,3 +599,4 @@ npm run dataset:build-manifest -- \
 | 版本 | 日期 | 变更 |
 |---|---|---|
 | v1.4d-multi-symbol-addendum-draft-1 | 2026-08-03 | 初稿：正式冻结P0-3"单一多symbol Dataset Manifest"架构裁决；新增`manifest_contract_version`/`dataset_type`/`symbols`/`dependency_set`契约；冻结契约版本2内容哈希16字段清单与基于实际`canonicalJsonHash()`计算的worked example/golden哈希值；冻结`logical_window_hash`多symbol身份对象（`dependencySet`取代扁平`symbols`+`intervals`）；冻结分依赖独立完整性验证与禁止跨依赖抵消规则；新增5个错误码并与既有错误码（`DATASET_MANIFEST_DEPENDENCY_UNGOVERNED`/`LOGICAL_WINDOW_CONFLICT`/`MEMBERS_MISSING`/`SOURCE_NOT_IN_DATASET_MANIFEST`/`SOURCE_OUTSIDE_DATASET_MANIFEST`）逐一reconcile；冻结legacy策略十条；判定Migration 007为**必需**并给出完整up/down.sql（含回滚守卫）；与draft-4五份文档的冲突范围与化解机制（§0.3）；十项一致性自检全部通过 |
+| v1.4d-multi-symbol-addendum-closure-1 | 2026-08-04 | 治理记录修正：依据已合入`main`的代码、测试和CLI路径登记9个实际新增的稳定错误码，修正“无其他新增错误码”的过时表述；未追溯修改draft-4冻结文档，未新增技术契约。 |
