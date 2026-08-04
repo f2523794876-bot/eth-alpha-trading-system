@@ -16,6 +16,10 @@ import { generateReplaySnapshot } from './replay-generator.js';
 import { evaluateReplayOutcomes } from './replay-evaluator.js';
 import { buildValidationReports } from './report-builder.js';
 import { RESEARCH_AVAILABILITY_RULE_VERSION } from './research-availability.js';
+import {
+  assertReplayAuthenticity, createReplayAuthenticitySummary, recordGenerationAuthenticity,
+  REPLAY_AUTHENTICITY_MODES
+} from './replay-authenticity.js';
 
 const DAY_MS = 86400000;
 const HORIZONS = Object.freeze(['24h', '72h']);
@@ -173,6 +177,7 @@ async function markValidationRunFailed({ pool, validationRunId, error, failureCo
     historicalAsOfTime: failureContext.historicalAsOfTime,
     message: error.message,
     code: error.code || null,
+    authenticity: error.authenticitySummary || null,
     at: new Date().toISOString()
   };
   const failGuard = await pool.query(
@@ -401,8 +406,15 @@ async function checkResumeVersionConsistency({ pool, validationRunId, weightVers
 export async function runWalkForward(options) {
   const {
     pool, dryRun = false, resumeValidationRunId = null, explicitParams = {}, splitRatio = null,
-    weightVersion, evaluationVersion, nowMs = Date.now(), replayNowMs = nowMs
+    weightVersion, evaluationVersion, authenticityMode = 'resume', nowMs = Date.now(), replayNowMs = nowMs
   } = options;
+
+  if (!REPLAY_AUTHENTICITY_MODES.includes(authenticityMode)) {
+    throw Object.assign(new Error(`--authenticity-mode must be one of ${REPLAY_AUTHENTICITY_MODES.join(', ')}`), { code: 'INVALID_REPLAY_AUTHENTICITY_MODE' });
+  }
+  if (resumeValidationRunId && authenticityMode === 'fresh') {
+    throw Object.assign(new Error('--resume cannot be combined with --authenticity-mode fresh'), { code: 'FRESH_MODE_CANNOT_RESUME' });
+  }
 
   // 向后兼容直接调用runWalkForward()（不经main()）的既有调用方/测试：若未传explicitParams，
   // 从顶层options字段合成——顶层字段本身即视为"本次显式提供"（因为直接调用方就是在明确声明这些值）。
@@ -515,10 +527,12 @@ export async function runWalkForward(options) {
   // 使用者需要能确认本次实际生效的值确实与自己预期一致。
   const effectiveOptionsSummary = {
     validationRunId, symbol, from, to, horizons, algorithmVersion, datasetVersion, ruleVersion,
-    weightVersion: effective.weightVersion, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd, dryRun
+    weightVersion: effective.weightVersion, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd, dryRun, authenticityMode
   };
   const plan = { validationRunId, dryRun, effectiveOptions: effectiveOptionsSummary, generationAttempts: 0, evaluationSweeps: 0, results: [], resumeCheckpoints: {} };
+  plan.authenticity = createReplayAuthenticitySummary({ mode: authenticityMode });
   const pendingDryRunSnapshots = new Map();
+  const deferredFreshEvaluationSweeps = [];
 
   // P0-1/P0-2修复（独立复审）：
   // ①真正的断点续跑——resume时先算出每个horizon各自的checkpoint（见computeResumeCheckpoint），
@@ -538,7 +552,31 @@ export async function runWalkForward(options) {
   // catch块本身只负责"打上FAILED标记"，不吞掉/替换原始异常——markValidationRunFailed若自身失败（终态
   // 更新语句本身出错），会抛出一个携带original error作为cause的新错误，而不是静默吞掉任何一方。
   let failureContext = { phase: null, horizon: null, historicalAsOfTime: null };
+  const runEvaluationSweep = async ({ horizon, historicalAsOfTime }) => {
+    failureContext = { phase: 'EVALUATION', horizon, historicalAsOfTime };
+    const evaluation = await evaluateReplayOutcomes({
+      pool, validationRunId, evaluationVersion: effective.evaluationVersion,
+      historicalAsOfTime, replayNowMs, dryRun,
+      inMemorySnapshots: dryRun ? [...pendingDryRunSnapshots.values()] : []
+    });
+    plan.evaluationSweeps += 1;
+    plan.authenticity.evaluated_count += evaluation.evaluated;
+    const inMemoryPreviewed = evaluation.results.filter(result => result.source === 'IN_MEMORY_PLANNED');
+    for (const result of inMemoryPreviewed) pendingDryRunSnapshots.delete(result.predictionId);
+    plan.results.push({
+      horizon, historicalAsOfTime, phase: 'evaluation',
+      evaluated: evaluation.evaluated, deduped: evaluation.deduped,
+      previewed: evaluation.results.length,
+      previewedPredictionIds: evaluation.results.map(result => result.predictionId),
+      sameRunLinks: inMemoryPreviewed.map(result => ({
+        predictionId: result.predictionId,
+        generationRunId: result.generationRunId,
+        evaluatedHistoricalAsOfTime: historicalAsOfTime
+      }))
+    });
+  };
   try {
+    const horizonPlans = [];
     for (const horizon of horizons) {
       const points = enumerateRhythmPoints({ from, to, horizon });
       plan.generationAttempts += points.length;
@@ -547,18 +585,38 @@ export async function runWalkForward(options) {
         ? await computeResumeCheckpoint({ pool, validationRunId, horizon, points })
         : { resumeFromIndex: 0, totalPoints: points.length };
       plan.resumeCheckpoints[horizon] = checkpoint;
+      plan.authenticity.expected_count += points.length - checkpoint.resumeFromIndex;
+      horizonPlans.push({ horizon, points, checkpoint });
+    }
 
+    for (const { horizon, points, checkpoint } of horizonPlans) {
       for (let i = checkpoint.resumeFromIndex; i < points.length; i++) {
         const historicalAsOfTime = points[i];
         failureContext = { phase: 'GENERATION', horizon, historicalAsOfTime };
-        const generation = await generateReplaySnapshot({
-          pool, validationRunId, instrument, symbol, horizon, historicalAsOfTime, replayNowMs,
-          algorithmVersion, weightVersion: effective.weightVersion, datasetVersion, ruleVersion,
-          backfillBatchIds: options.backfillBatchIds || [], dryRun
-        });
+        let generation;
+        plan.authenticity.attempted_count += 1;
+        try {
+          generation = await generateReplaySnapshot({
+            pool, validationRunId, instrument, symbol, horizon, historicalAsOfTime, replayNowMs,
+            algorithmVersion, weightVersion: effective.weightVersion, datasetVersion, ruleVersion,
+            backfillBatchIds: options.backfillBatchIds || [], dryRun
+          });
+        } catch (error) {
+          recordGenerationAuthenticity(
+            plan.authenticity,
+            error.code === 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT' ? 'CONFLICT' : 'BLOCKED',
+            { incrementAttempt: false }
+          );
+          error.authenticitySummary = { ...plan.authenticity };
+          throw error;
+        }
+        if (generation.status !== 'PLANNED') {
+          recordGenerationAuthenticity(plan.authenticity, generation.status, { incrementAttempt: false });
+          if (authenticityMode === 'fresh') assertReplayAuthenticity(plan.authenticity, { final: false });
+        }
         const generationResult = {
           horizon, historicalAsOfTime, phase: 'generation', status: generation.status,
-          predictionId: generation.record?.predictionId ?? null,
+          predictionId: generation.record?.predictionId ?? generation.record?.prediction_id ?? null,
           generationRunId: generation.generationRunId
         };
         plan.results.push(generationResult);
@@ -570,30 +628,16 @@ export async function runWalkForward(options) {
           });
         }
 
-        failureContext = { phase: 'EVALUATION', horizon, historicalAsOfTime };
-        const evaluation = await evaluateReplayOutcomes({
-          pool, validationRunId, evaluationVersion: effective.evaluationVersion,
-          historicalAsOfTime, replayNowMs, dryRun,
-          inMemorySnapshots: dryRun ? [...pendingDryRunSnapshots.values()] : []
-        });
-        plan.evaluationSweeps += 1;
-        // previewed：本次sweep实际处理过的pending快照数量（dry-run下evaluation.evaluated/deduped恒为0，
-        // 因为INSERT本身被跳过；evaluation.results.length是dry-run场景下唯一能证明"确实扫描过pending快照
-        // 并跑完了locatePathForEvaluationForReplay+computeForecastOutcome全部计算"的证据）。
-        const inMemoryPreviewed = evaluation.results.filter(result => result.source === 'IN_MEMORY_PLANNED');
-        for (const result of inMemoryPreviewed) pendingDryRunSnapshots.delete(result.predictionId);
-        plan.results.push({
-          horizon, historicalAsOfTime, phase: 'evaluation',
-          evaluated: evaluation.evaluated, deduped: evaluation.deduped,
-          previewed: evaluation.results.length,
-          previewedPredictionIds: evaluation.results.map(result => result.predictionId),
-          sameRunLinks: inMemoryPreviewed.map(result => ({
-            predictionId: result.predictionId,
-            generationRunId: result.generationRunId,
-            evaluatedHistoricalAsOfTime: historicalAsOfTime
-          }))
-        });
+        if (authenticityMode === 'fresh' && !dryRun) deferredFreshEvaluationSweeps.push({ horizon, historicalAsOfTime });
+        else await runEvaluationSweep({ horizon, historicalAsOfTime });
       }
+    }
+
+    if (!dryRun) {
+      assertReplayAuthenticity(plan.authenticity);
+      for (const sweep of deferredFreshEvaluationSweeps) await runEvaluationSweep(sweep);
+    } else {
+      plan.authenticity.gate_status = 'PLANNED';
     }
 
     // §4.2冻结要求dry-run必须输出一份"执行计划"，列出预计推进的historical_as_of_time节奏点数量、预计涉及的
@@ -630,7 +674,8 @@ export async function runWalkForward(options) {
         sameRunEvaluationPreviewedCount: sameRunEvaluationLinks.length,
         sameRunEvaluationLinks,
         pendingInMemorySnapshotCount: pendingDryRunSnapshots.size,
-        resumeCheckpoints: plan.resumeCheckpoints
+        resumeCheckpoints: plan.resumeCheckpoints,
+        authenticity: plan.authenticity
       };
     }
 
@@ -638,7 +683,8 @@ export async function runWalkForward(options) {
       failureContext = { phase: 'REPORT', horizon: null, historicalAsOfTime: null };
       plan.reports = await buildValidationReports({
         pool, validationRunId, datasetVersion, algorithmVersion, ruleVersion,
-        researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd
+        researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION, evaluationVersion: effective.evaluationVersion, trainEnd, validationEnd,
+        authenticitySummary: plan.authenticity
       });
     }
 
@@ -652,6 +698,7 @@ export async function runWalkForward(options) {
       }
     }
   } catch (error) {
+    error.authenticitySummary ||= { ...plan.authenticity };
     // VALIDATION_RUN_STATE_CONFLICT已经证明该行不再处于RUNNING（上面的防御性条件更新0行命中），
     // 该行本身未被本次调用触碰，不需要（也不应该）再尝试markValidationRunFailed对它做多余的
     // 条件更新尝试。其余任何真实异常（manifest gate之后的生成/评估/报告阶段失败）才需要归档为FAILED。
@@ -737,6 +784,7 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
       pool, dryRun: Boolean(args['dry-run']), resumeValidationRunId: typeof resumeId === 'string' ? resumeId : null,
       explicitParams, splitRatio,
       weightVersion: args['weight-version'], evaluationVersion: args['evaluation-version'],
+      authenticityMode: args['authenticity-mode'] || 'resume',
       nowMs: Date.now()
     });
     console.info('validation_run_id', plan.validationRunId);
@@ -749,6 +797,7 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
     if (plan.dryRun) {
       console.info('dry_run_execution_plan', JSON.stringify(plan.executionPlan));
     }
+    console.info('rerun_authenticity', JSON.stringify(plan.authenticity));
     return plan;
   } finally {
     await pool.end();
@@ -756,5 +805,8 @@ export async function main(argv = process.argv.slice(2), { createPgPool: createP
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch(error => { console.error('validation:walk-forward failed', { code: error.code || error.message }); process.exitCode = exitCodeForCliError(error); });
+  main().catch(error => {
+    console.error('validation:walk-forward failed', { code: error.code || error.message, authenticity: error.authenticitySummary || null });
+    process.exitCode = exitCodeForCliError(error);
+  });
 }

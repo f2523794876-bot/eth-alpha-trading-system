@@ -26,6 +26,11 @@ test('verification arguments accept individual and combined 7/90-day replay plan
   assert.throws(() => parseReplayDays('30'), error => error.code === 'INVALID_REPLAY_DAYS');
 });
 
+test('formal verification runner explicitly requests fresh replay authenticity', async () => {
+  const source = await readFile(new URL('./verify-v1-4d.mjs', import.meta.url), 'utf8');
+  assert.match(source, /'--authenticity-mode',\s*'fresh'/);
+});
+
 test('replay windows end at the explicit cutoff and span exactly 7 or 90 days', () => {
   const replayTo = '2026-07-01T00:00:00.000Z';
   for (const days of [7, 90]) {

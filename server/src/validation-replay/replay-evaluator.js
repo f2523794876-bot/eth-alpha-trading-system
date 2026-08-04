@@ -34,14 +34,21 @@ function snapshotDue(record, historicalAsOfTime) {
 // 找出targetEndTime（以历史模拟时钟衡量）已到达、且本evaluationVersion+research_availability_rule_version
 // 组合尚未评估过的replay_snapshots——复合JOIN键镜像§2.3/§2.5冻结的复合唯一约束关系，不得只按prediction_id去重
 // （否则researchAvailability规则版本升级后的重跑会被旧版本记录静默挡住）。
-async function findPendingReplaySnapshots(pool, { evaluationVersion, historicalAsOfTime, limit }) {
+async function findPendingReplaySnapshots(pool, { validationRunId, evaluationVersion, historicalAsOfTime, limit }) {
   const result = await pool.query(
     `SELECT s.* FROM historical_validation.replay_snapshots s
+     JOIN historical_validation.validation_runs vr
+       ON vr.validation_run_id=$4 AND vr.algorithm_version=s.algorithm_version AND vr.dataset_version=s.dataset_version
      LEFT JOIN historical_validation.replay_outcome_events e
        ON e.prediction_id=s.prediction_id AND e.evaluation_version=$1 AND e.research_availability_rule_version=s.research_availability_rule_version
      WHERE s.target_end_time<=to_timestamp($2/1000.0) AND e.replay_outcome_event_id IS NULL
+       AND EXISTS (
+         SELECT 1 FROM historical_validation.replay_generation_runs g
+         WHERE g.validation_run_id=$4 AND g.horizon=s.horizon
+           AND g.historical_as_of_time=s.target_start_time AND g.status='SUCCEEDED'
+       )
      ORDER BY s.target_end_time ASC LIMIT $3`,
-    [evaluationVersion, historicalAsOfTime, limit]
+    [evaluationVersion, historicalAsOfTime, limit, validationRunId]
   );
   return result.rows;
 }
@@ -75,7 +82,7 @@ export async function evaluateReplayOutcomes({
   const startedAt = now();
   if (!dryRun) await recordEvaluationRun(pool, { evaluationRunId, validationRunId, historicalAsOfTime, status: 'RUNNING', startedAt, finishedAt: null });
 
-  const persistedPending = await findPendingReplaySnapshots(pool, { evaluationVersion, historicalAsOfTime, limit });
+  const persistedPending = await findPendingReplaySnapshots(pool, { validationRunId, evaluationVersion, historicalAsOfTime, limit });
   const dueInMemory = inMemorySnapshots.filter(record => snapshotDue(record, historicalAsOfTime));
   const pending = [
     ...dueInMemory.map(record => ({ record, source: 'IN_MEMORY_PLANNED' })),

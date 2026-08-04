@@ -437,7 +437,7 @@ test('R11.4-replay_generation_runs：对同一逻辑节点重复调用generateRe
     // 重新处理同一节奏点的场景（正常resume会被computeResumeCheckpoint跳过，这里绕过该守卫直接
         // 调用底层函数，专门验证generateReplaySnapshot()自身对"重复处理"的免疫机制）。
     const second = await generateReplaySnapshot(commonArgs);
-    assert.equal(second.status, 'DEDUPED', 'replay_snapshots的UNIQUE(prediction_id,research_availability_rule_version)约束使第二次尝试产生DEDUPED而非二次INSERTED');
+    assert.equal(second.status, 'REUSED_IDENTICAL', 'replay_snapshots的UNIQUE约束命中后必须先验证内容一致，再明确标记为REUSED_IDENTICAL');
     assert.notEqual(second.generationRunId, first.generationRunId, '两次调用必须产生两个不同的generation_run_id——第二次不得复用/覆盖第一次的ID');
 
     const firstRowAfter = (await client.query('SELECT * FROM historical_validation.replay_generation_runs WHERE generation_run_id=$1', [first.generationRunId])).rows[0];

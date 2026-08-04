@@ -224,13 +224,21 @@ test('完整非dry-run执行：单个24h节奏点产出replay_snapshots/replay_g
     const from = referenceCloseTime - DAY_MS + 1; // P0-4修复联动：+1对齐open_time相位(referenceCloseTime本身是close_time相位)，见fillContiguousCoverage说明
     const to = referenceCloseTime + DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to });
+    const runFrom = referenceCloseTime;
+    const runTo = referenceCloseTime + 1;
 
     const plan = await runWalkForward({
-      pool: client, symbol: 'ETHUSDT', from, to, horizons: ['24h'],
+      pool: client, symbol: 'ETHUSDT', from: runFrom, to: runTo, horizons: ['24h'],
       algorithmVersion: ALGORITHM_VERSION, datasetVersion, ruleVersion: RULE_VERSION,
-      weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: false,
+      weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, dryRun: false, authenticityMode: 'fresh',
       nowMs: Date.now(), replayNowMs
     });
+    assert.deepEqual({
+      expected: plan.authenticity.expected_count, attempted: plan.authenticity.attempted_count,
+      inserted: plan.authenticity.inserted_count, reused: plan.authenticity.reused_identical_count,
+      conflict: plan.authenticity.conflict_count, blocked: plan.authenticity.blocked_count,
+      status: plan.authenticity.gate_status
+    }, { expected: 1, attempted: 1, inserted: 1, reused: 0, conflict: 0, blocked: 0, status: 'PASSED' });
 
     const runRow = (await client.query('SELECT status FROM historical_validation.validation_runs WHERE validation_run_id=$1', [plan.validationRunId])).rows[0];
     assert.equal(runRow.status, 'SUCCEEDED');
@@ -244,6 +252,49 @@ test('完整非dry-run执行：单个24h节奏点产出replay_snapshots/replay_g
 
     const reportCount = (await client.query('SELECT count(*)::int AS n FROM historical_validation.validation_reports WHERE validation_run_id=$1', [plan.validationRunId])).rows[0].n;
     assert.ok(reportCount > 0, 'runWalkForward必须调用report-builder产出报告');
+
+    let freshnessError;
+    try {
+      await runWalkForward({
+        pool: client, symbol: 'ETHUSDT', from: runFrom, to: runTo, horizons: ['24h'],
+        algorithmVersion: ALGORITHM_VERSION, datasetVersion, ruleVersion: RULE_VERSION,
+        weightVersion: WEIGHT_VERSION, evaluationVersion: EVALUATION_VERSION, authenticityMode: 'fresh',
+        nowMs: Date.now(), replayNowMs
+      });
+    } catch (error) { freshnessError = error; }
+    assert.equal(freshnessError?.code, 'RERUN_AUTHENTICITY_CHECK_FAILED');
+    assert.equal(freshnessError.authenticitySummary.expected_count, 1);
+    assert.equal(freshnessError.authenticitySummary.inserted_count, 0);
+    assert.equal(freshnessError.authenticitySummary.reused_identical_count, 1);
+    const blockedRun = (await client.query(
+      `SELECT validation_run_id,status,error_code FROM historical_validation.validation_runs
+       WHERE validation_run_id<>$1 ORDER BY created_at DESC LIMIT 1`, [plan.validationRunId]
+    )).rows[0];
+    assert.equal(blockedRun.status, 'FAILED');
+    assert.equal(blockedRun.error_code, 'RERUN_AUTHENTICITY_CHECK_FAILED');
+    assert.equal((await client.query('SELECT count(*)::int AS n FROM historical_validation.replay_evaluation_runs WHERE validation_run_id=$1', [blockedRun.validation_run_id])).rows[0].n, 0, 'fresh真实性通过前不得执行Evaluation');
+    assert.equal((await client.query('SELECT count(*)::int AS n FROM historical_validation.validation_reports WHERE validation_run_id=$1', [blockedRun.validation_run_id])).rows[0].n, 0, 'fresh真实性失败不得生成Report');
+
+    let identityError;
+    try {
+      await runWalkForward({
+        pool: client, symbol: 'ETHUSDT', from: runFrom, to: runTo, horizons: ['24h'],
+        algorithmVersion: ALGORITHM_VERSION, datasetVersion, ruleVersion: RULE_VERSION,
+        weightVersion: `${WEIGHT_VERSION}-changed`, evaluationVersion: EVALUATION_VERSION, authenticityMode: 'resume',
+        nowMs: Date.now(), replayNowMs
+      });
+    } catch (error) { identityError = error; }
+    assert.equal(identityError?.code, 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT');
+    assert.equal(identityError.authenticitySummary.conflict_count, 1);
+    const conflictRun = (await client.query(
+      `SELECT validation_run_id,status,error_code FROM historical_validation.validation_runs
+       WHERE validation_run_id<>ALL($1::uuid[]) ORDER BY created_at DESC LIMIT 1`,
+      [[plan.validationRunId, blockedRun.validation_run_id]]
+    )).rows[0];
+    assert.equal(conflictRun.status, 'FAILED');
+    assert.equal(conflictRun.error_code, 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT');
+    assert.equal((await client.query('SELECT count(*)::int AS n FROM historical_validation.replay_evaluation_runs WHERE validation_run_id=$1', [conflictRun.validation_run_id])).rows[0].n, 0);
+    assert.equal((await client.query('SELECT count(*)::int AS n FROM historical_validation.validation_reports WHERE validation_run_id=$1', [conflictRun.validation_run_id])).rows[0].n, 0);
   });
 });
 

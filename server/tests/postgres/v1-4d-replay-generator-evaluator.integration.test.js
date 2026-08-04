@@ -256,15 +256,34 @@ test('INSERTED：完整生成流程——predictionId格式/source_origin/calibr
     assert.equal(runRow.status, 'SUCCEEDED');
     assert.equal(runRow.generated_count, 1);
 
-    // 幂等：同一(instrument,horizon,historicalAsOfTime)再跑一次应DEDUPED，不产生第二行
+    // 幂等：同一(instrument,horizon,historicalAsOfTime)再跑一次应明确标记为相同内容复用，不产生第二行
     const second = await generateReplaySnapshot({
       pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
       historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
       datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION, backfillBatchIds: []
     });
-    assert.equal(second.status, 'DEDUPED');
+    assert.equal(second.status, 'REUSED_IDENTICAL');
     const count = (await client.query('SELECT count(*)::int AS n FROM historical_validation.replay_snapshots WHERE prediction_id=$1', [first.record.predictionId])).rows[0].n;
     assert.equal(count, 1);
+
+    // predictionId不含weightVersion：同一身份下改变研究语义必须稳定冲突，而不是静默复用旧Snapshot。
+    await assert.rejects(
+      generateReplaySnapshot({
+        pool: client, validationRunId, instrument: 'ETHUSDT', symbol: 'ETH', horizon: '24h',
+        historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: `${WEIGHT_VERSION}-changed`,
+        datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION, backfillBatchIds: []
+      }),
+      error => error.code === 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT'
+        && error.predictionId === first.record.predictionId
+        && error.differingFields.includes('weightVersion')
+        && error.differingFields.includes('contentHash')
+    );
+    const failedAudit = (await client.query(
+      `SELECT status,error_code FROM historical_validation.replay_generation_runs
+       WHERE validation_run_id=$1 ORDER BY created_at DESC LIMIT 1`, [validationRunId]
+    )).rows[0];
+    assert.deepEqual(failedAudit, { status: 'FAILED', error_code: 'REPLAY_SNAPSHOT_IDENTITY_CONFLICT' });
+    assert.equal((await client.query('SELECT count(*)::int AS n FROM historical_validation.replay_snapshots WHERE prediction_id=$1', [first.record.predictionId])).rows[0].n, 1);
   });
 });
 

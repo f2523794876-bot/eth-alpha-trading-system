@@ -7,6 +7,7 @@ import { checkSampleSufficiency } from '../validation/walk-forward.js';
 import { computeSplitEffectiveSamples } from './purge.js';
 import { buildPoDiagnosticReport } from './po-diagnostic.js';
 import { canonicalJsonHash } from '../domain/hash.js';
+import { assertReportAuthenticity } from './replay-authenticity.js';
 
 // V1_4_HISTORICAL_VALIDATION_SPEC.md §5.1：4个"可评估/部分可评估"primaryCause取值 + 5个NOT_EVALUABLE项
 // （V1.4D范围内这5项对应的模块从未真实运行，是结构性无法评估，不是"排除了它们"）。
@@ -141,10 +142,11 @@ function buildUpDownRangeBreakdown(samples) {
   return breakdown;
 }
 
-function buildFormalProxyDisclosure() {
+function buildFormalProxyDisclosure(authenticitySummary) {
   return {
     pathDataSource: 'market_bars:formal:spot',
-    disclosure: 'path evaluation 100% 来自 formal（public.market_bars），回放从不读取 provisional_market_bars（V1_4D_DATA_BACKFILL_SPEC.md §2.13）'
+    disclosure: 'path evaluation 100% 来自 formal（public.market_bars），回放从不读取 provisional_market_bars（V1_4D_DATA_BACKFILL_SPEC.md §2.13）',
+    rerunAuthenticity: authenticitySummary
   };
 }
 
@@ -157,7 +159,17 @@ function buildPoStateBreakdownWithDisclosure(poStateDistribution) {
 }
 
 // report_scope: 'ALL' | 'TRAIN' | 'VALIDATION' | 'TEST'。trainEnd/validationEnd为undefined时只产出'ALL'一份报告。
-export async function buildValidationReports({ pool, validationRunId, datasetVersion, algorithmVersion, ruleVersion, researchAvailabilityRuleVersion, evaluationVersion, trainEnd, validationEnd }) {
+export async function buildValidationReports({ pool, validationRunId, datasetVersion, algorithmVersion, ruleVersion, researchAvailabilityRuleVersion, evaluationVersion, trainEnd, validationEnd, authenticitySummary }) {
+  assertReportAuthenticity(authenticitySummary);
+  const runState = await pool.query(
+    'SELECT status FROM historical_validation.validation_runs WHERE validation_run_id=$1',
+    [validationRunId]
+  );
+  if (runState.rowCount !== 1 || !['RUNNING', 'SUCCEEDED'].includes(runState.rows[0].status)) {
+    throw Object.assign(new Error(`Validation run ${validationRunId} is not eligible for report generation`), {
+      code: 'REPORT_VALIDATION_RUN_NOT_ELIGIBLE', validationRunId, status: runState.rows[0]?.status ?? 'NOT_FOUND'
+    });
+  }
   const reports = [];
   for (const horizon of ['24h', '72h']) {
     const samples = await loadSamplesForHorizon(pool, { validationRunId, horizon, evaluationVersion });
@@ -213,7 +225,7 @@ export async function buildValidationReports({ pool, validationRunId, datasetVer
         purgedStraddlingCount,
         poStateBreakdown: buildPoStateBreakdownWithDisclosure(poDiagnostic.poStateDistribution),
         upDownRangeBreakdown: buildUpDownRangeBreakdown(directionSamples),
-        formalProxyDisclosure: buildFormalProxyDisclosure(),
+        formalProxyDisclosure: buildFormalProxyDisclosure(authenticitySummary),
         calibratedProbabilitiesStatus: 'null (V1.4D not eligible)',
         errorAttributionSummary: buildErrorAttributionSummary(pairsForAttribution),
         algorithmVersion, ruleVersion, researchAvailabilityRuleVersion

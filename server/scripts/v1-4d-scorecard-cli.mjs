@@ -3,6 +3,7 @@ import { Pool } from 'pg';
 import { buildResearchScorecard, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
 import { createGuardedResearchPgPool } from '../src/db/research-database-guard.js';
 import { canonicalTrendOrNull } from '../src/domain/trend.js';
+import { assertScorecardRunAuthenticity } from '../src/validation-replay/replay-authenticity.js';
 
 // V1.4D unified fix: this CLI previously connected with a bare `new Pool()`, bypassing the
 // declared-name + post-connect current_database() protection every other Phase 2/4/4.5/5 CLI
@@ -31,6 +32,7 @@ const args = parseArgs(process.argv.slice(2));
 const output = args.output || 'v1-4d-research-scorecard.json';
 const markdownOutput = args['markdown-output'] || markdownPathFor(output);
 let rows;
+let rerunAuthenticity = null;
 if (args.input) {
   const payload = JSON.parse(await readFile(args.input, 'utf8'));
   rows = Array.isArray(payload) ? payload : payload.rows;
@@ -44,6 +46,20 @@ if (args.input) {
     { createPgPool: async config => new Pool({ connectionString: config.databaseUrl, max: 2 }) }
   );
   try {
+    const runResult = await pool.query(
+      `SELECT status, horizons FROM historical_validation.validation_runs WHERE validation_run_id=$1`,
+      [args['validation-run-id']]
+    );
+    const reportResult = await pool.query(
+      `SELECT horizon, report_scope AS "reportScope", formal_proxy_disclosure AS "formalProxyDisclosure"
+       FROM historical_validation.validation_reports WHERE validation_run_id=$1`,
+      [args['validation-run-id']]
+    );
+    rerunAuthenticity = assertScorecardRunAuthenticity({
+      runStatus: runResult.rows[0]?.status,
+      horizons: runResult.rows[0]?.horizons,
+      reportRows: reportResult.rows
+    });
     const result = await pool.query(
       `SELECT s.prediction_id AS "predictionId", s.horizon, s.expected_direction AS "predictedDirection", s.feature_values_used AS "featureValuesUsed",
               s.proxy_state_at_generation AS "proxyStateAtGeneration", s.target_start_time AS "targetStartTime",
@@ -116,12 +132,12 @@ console.error(costFlagsProvided
   : `cost_assumption default_pre_cost ${JSON.stringify(costOptions)} (no --round-trip-cost-bps/--fee-bps/--slippage-bps given; see V1_4D_180D_FORMAL_RESEARCH_PLAN.md §K.1 item 2)`);
 const trainEnd = rows.find(row => row.trainEnd != null)?.trainEnd ?? null;
 const validationEnd = rows.find(row => row.validationEnd != null)?.validationEnd ?? null;
-const scorecard = buildResearchScorecard(rows, {
+const scorecard = { ...buildResearchScorecard(rows, {
   ...costOptions,
   randomSeed: args.seed == null ? 1404 : Number(args.seed),
   trainEnd,
   validationEnd
-});
+}), rerunAuthenticity };
 await writeFile(output, `${JSON.stringify(scorecard, null, 2)}\n`);
 await writeFile(markdownOutput, renderResearchScorecardMarkdown(scorecard));
 console.log(`research_scorecard_status ${scorecard.status}`);

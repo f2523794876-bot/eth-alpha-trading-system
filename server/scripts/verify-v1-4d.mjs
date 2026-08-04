@@ -86,7 +86,8 @@ function replayArgs(days) {
     '--dataset-version', process.env.V14D_DATASET_VERSION,
     '--rule-version', process.env.V14D_RULE_VERSION,
     '--weight-version', process.env.V14D_WEIGHT_VERSION,
-    '--evaluation-version', process.env.V14D_EVALUATION_VERSION
+    '--evaluation-version', process.env.V14D_EVALUATION_VERSION,
+    '--authenticity-mode', 'fresh'
   ];
 }
 

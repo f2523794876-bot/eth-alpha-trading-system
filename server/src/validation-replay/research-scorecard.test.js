@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildResearchScorecard, classificationMetrics, renderResearchScorecardMarkdown } from './research-scorecard.js';
 import { buildValidationReports } from './report-builder.js';
+import { assertReplayAuthenticity, createReplayAuthenticitySummary, recordGenerationAuthenticity } from './replay-authenticity.js';
 
 test('classificationMetrics calculates three-class macro-F1', () => {
   const rows = [
@@ -255,6 +256,7 @@ test('research scorecard and report-builder expose the same independent directio
   const inserted = [];
   const pool = {
     async query(sql, params = []) {
+      if (sql.includes('SELECT status FROM historical_validation.validation_runs')) return { rowCount: 1, rows: [{ status: 'RUNNING' }] };
       if (sql.includes('SELECT s.prediction_id')) {
         const horizon = params[1];
         return { rows: horizon === '24h' ? rows.map(row => ({
@@ -284,6 +286,9 @@ test('research scorecard and report-builder expose the same independent directio
       throw new Error(`Unexpected SQL in report-builder parity test: ${sql}`);
     }
   };
+  const authenticitySummary = createReplayAuthenticitySummary({ mode: 'resume', expectedCount: 1 });
+  recordGenerationAuthenticity(authenticitySummary, 'INSERTED');
+  assertReplayAuthenticity(authenticitySummary);
   const reports = await buildValidationReports({
     pool,
     validationRunId: '00000000-0000-0000-0000-000000000001',
@@ -291,7 +296,7 @@ test('research scorecard and report-builder expose the same independent directio
     algorithmVersion: 'test-algorithm',
     ruleVersion: 'test-rule',
     researchAvailabilityRuleVersion: 'test-availability',
-    evaluationVersion: 'test-evaluation'
+    evaluationVersion: 'test-evaluation', authenticitySummary
   });
   assert.equal(inserted.length, 2);
   const report = reports.find(value => value.horizon === '24h' && value.reportScope === 'ALL');

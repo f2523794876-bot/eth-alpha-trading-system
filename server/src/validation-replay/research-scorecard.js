@@ -476,6 +476,7 @@ export function renderResearchScorecardMarkdown(scorecard) {
     '# V1.4D research scorecard', '',
     `- Status: **${scorecard.status}**`,
     `- Generated at: ${scorecard.generatedAt}`,
+    `- Rerun authenticity: ${scorecard.rerunAuthenticity ? `${scorecard.rerunAuthenticity.gate_status} (${scorecard.rerunAuthenticity.mode}; inserted=${scorecard.rerunAuthenticity.inserted_count}, reused_identical=${scorecard.rerunAuthenticity.reused_identical_count}, conflicts=${scorecard.rerunAuthenticity.conflict_count})` : 'NOT_APPLICABLE (offline input)'}`,
     `- Fee/slippage/total cost (bps): ${scorecard.assumptions.feeBps}/${scorecard.assumptions.slippageBps}/${scorecard.assumptions.roundTripCostBps}`,
     `- Input/eligible/economic/path samples: ${scorecard.dataQuality.inputCount}/${scorecard.dataQuality.eligibleDirectionCount}/${scorecard.dataQuality.economicEligibleCount}/${scorecard.dataQuality.pathEligibleCount}`,
     `- Direction raw/effective samples: ${scorecard.dataQuality.directionRawSampleCount}/${scorecard.dataQuality.directionEffectiveSampleCount}`,
