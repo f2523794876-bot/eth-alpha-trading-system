@@ -68,10 +68,10 @@ async function seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTim
     [FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, 'v1.4b-schema-1', JSON.stringify({}), sha256({})]
   );
   const featureValues = {
-    closeToEma5: 0, trend4h: 'down', trend1h: 'down', volumeRatio20: 1,
+    closeToEma5: 0, trend4h: 'DOWN', trend1h: 'DOWN', volumeRatio20: 1,
     swingHigh: 1100, swingLow: 900, breakoutState: null, upperWickRatio: 0.1, lowerWickRatio: 0.1,
     distanceToSupportAtr: 5, distanceToResistanceAtr: 5, falseBreakoutRisk: 'NONE',
-    btcTrendState: 'flat', ethBtcRollingCorrelation: 0, logReturn1: 0
+    btcTrendState: 'RANGE', ethBtcRollingCorrelation: 0, logReturn1: 0
   };
   await client.query(
     `INSERT INTO feature_records(

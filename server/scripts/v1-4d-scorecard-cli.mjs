@@ -2,6 +2,7 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { Pool } from 'pg';
 import { buildResearchScorecard, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
 import { createGuardedResearchPgPool } from '../src/db/research-database-guard.js';
+import { canonicalTrendOrNull } from '../src/domain/trend.js';
 
 // V1.4D unified fix: this CLI previously connected with a bare `new Pool()`, bypassing the
 // declared-name + post-connect current_database() protection every other Phase 2/4/4.5/5 CLI
@@ -77,7 +78,7 @@ if (args.input) {
         actualReturn: row.actualReturn == null ? null : Number(row.actualReturn),
         mfe: row.mfe == null ? null : Number(row.mfe),
         mae: row.mae == null ? null : Number(row.mae),
-        trend4hDirection: trend === 'up' ? 'UP' : trend === 'down' ? 'DOWN' : trend === 'flat' ? 'RANGE' : null,
+        trend4hDirection: canonicalTrendOrNull(trend),
         proxyStateAtGeneration: row.proxyStateAtGeneration ?? null,
         marketRegime: row.featureValuesUsed?.marketRegime ?? null,
         trainEnd: row.trainEnd,

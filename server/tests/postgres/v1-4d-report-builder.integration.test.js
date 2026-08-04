@@ -62,10 +62,10 @@ async function seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTim
     [FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, 'v1.4b-schema-1', JSON.stringify({}), sha256({})]
   );
   const featureValues = {
-    closeToEma5: 0, trend4h: 'down', trend1h: 'down', volumeRatio20: 1,
+    closeToEma5: 0, trend4h: 'DOWN', trend1h: 'DOWN', volumeRatio20: 1,
     swingHigh: 1100, swingLow: 900, breakoutState: null, upperWickRatio: 0.1, lowerWickRatio: 0.1,
     distanceToSupportAtr: 5, distanceToResistanceAtr: 5, falseBreakoutRisk: 'NONE',
-    btcTrendState: 'flat', ethBtcRollingCorrelation: 0, logReturn1: 0
+    btcTrendState: 'RANGE', ethBtcRollingCorrelation: 0, logReturn1: 0
   };
   // ON CONFLICT DO NOTHING：P0-1新增测试需要两个不同validation_run在同一referenceCloseTime各自调用
   // seedGeneratedSnapshot（构造"共享同一historicalAsOfTime"的场景），第二次调用对同一

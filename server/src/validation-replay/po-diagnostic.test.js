@@ -33,14 +33,18 @@ test('computeStateTransitionMatrix：按targetStartTime排序后统计相邻prox
 test('computeInputConditionHitRates：命中率按featureValuesList总数计算，空数组返回{}', () => {
   assert.deepEqual(computeInputConditionHitRates([]), {});
   const rates = computeInputConditionHitRates([
-    { trend4h: 'up', breakoutState: 'BREAKOUT_UP', falseBreakoutRisk: 'NONE', swingHigh: 1, swingLow: 1 },
-    { trend4h: 'down', breakoutState: null, falseBreakoutRisk: 'HIGH', swingHigh: null, swingLow: 1 }
+    { trend4h: 'UP', breakoutState: 'BREAKOUT_UP', falseBreakoutRisk: 'NONE', swingHigh: 1, swingLow: 1 },
+    { trend4h: 'DOWN', breakoutState: null, falseBreakoutRisk: 'HIGH', swingHigh: null, swingLow: 1 },
+    { trend4h: 'RANGE', breakoutState: null, falseBreakoutRisk: 'NONE', swingHigh: 1, swingLow: 1 },
+    { trend4h: 'flat', breakoutState: null, falseBreakoutRisk: 'NONE', swingHigh: 1, swingLow: 1 }
   ]);
-  assert.equal(rates.trend4hUp, 0.5);
-  assert.equal(rates.trend4hDown, 0.5);
-  assert.equal(rates.breakoutStateUp, 0.5);
-  assert.equal(rates.falseBreakoutVetoed, 0.5);
-  assert.equal(rates.swingHighOrLowMissing, 0.5);
+  assert.equal(rates.trend4hUp, 0.25);
+  assert.equal(rates.trend4hDown, 0.25);
+  assert.equal(rates.trend4hRange, 0.25);
+  assert.equal(rates.trend4hFlat, rates.trend4hRange);
+  assert.equal(rates.breakoutStateUp, 0.25);
+  assert.equal(rates.falseBreakoutVetoed, 0.25);
+  assert.equal(rates.swingHighOrLowMissing, 0.25);
 });
 
 test('buildPoDiagnosticReport：persistentUnknownDiagnosis只收集证据，不产出结论/数值建议', () => {

@@ -3,6 +3,7 @@
 // validation_reports.po_state_breakdown 或独立po_diagnostic_summary子结构。
 
 import { PO_STATES } from '../forecast/po-state-engine.js';
+import { TREND } from '../domain/trend.js';
 
 // samples: 来自replay_snapshots的{proxyStateAtGeneration, targetStartTime, directionEligibleForStatistics}集合（单一horizon）。
 export function computePoStateDistribution(samples) {
@@ -49,10 +50,12 @@ export function computeInputConditionHitRates(featureValuesList) {
   const total = featureValuesList.length;
   if (total === 0) return {};
   const share = predicate => featureValuesList.filter(predicate).length / total;
+  const trend4hRange = share(fv => fv.trend4h === TREND.RANGE);
   return {
-    trend4hUp: share(fv => fv.trend4h === 'up'),
-    trend4hDown: share(fv => fv.trend4h === 'down'),
-    trend4hFlat: share(fv => fv.trend4h === 'flat'),
+    trend4hUp: share(fv => fv.trend4h === TREND.UP),
+    trend4hDown: share(fv => fv.trend4h === TREND.DOWN),
+    trend4hRange,
+    trend4hFlat: trend4hRange, // 兼容既有报告字段；其语义明确映射Canonical RANGE。
     breakoutStateUp: share(fv => fv.breakoutState === 'BREAKOUT_UP'),
     breakoutStateDown: share(fv => fv.breakoutState === 'BREAKOUT_DOWN'),
     falseBreakoutVetoed: share(fv => fv.falseBreakoutRisk != null && fv.falseBreakoutRisk !== 'NONE'),

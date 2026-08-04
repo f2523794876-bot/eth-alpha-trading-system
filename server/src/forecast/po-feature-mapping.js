@@ -1,5 +1,6 @@
 // V1_4C_SCOPE_SPEC.md §8.3 — 映射二/三/四，纯函数，无storage参数。映射一（连续bar计数）在bar-path-locator.js（需查询market_bars历史）。
 import { BTC_ALIGNMENT_FORMULA_VERSION } from './forecast-version.js';
+import { TREND, isCanonicalTrend } from '../domain/trend.js';
 
 export const CORRELATION_FLOOR = 0.3;
 export const TOLERANCE_ATR_MULTIPLE = 0.3; // 复用V1_4_FORECAST_DATA_SPEC.md §4.2既有0.3xATR容差常量，语义收窄为"到失效线的距离容差"
@@ -20,15 +21,15 @@ export function isFalseBreakoutVetoed(falseBreakoutRisk) {
 // 映射四：带符号相关性 effectiveBtcDirection，本轮修正正负号语义
 export function effectiveBtcDirection(correlation, btcTrendState, correlationFloor = CORRELATION_FLOOR) {
   if (!Number.isFinite(correlation)) return 'UNKNOWN';
-  if (!btcTrendState || btcTrendState === 'flat') return 'UNKNOWN';
+  if (!isCanonicalTrend(btcTrendState) || btcTrendState === TREND.RANGE) return 'UNKNOWN';
   if (correlation >= correlationFloor) return btcTrendState;                                   // 正相关，含边界：沿用BTC表面方向
-  if (correlation <= -correlationFloor) return btcTrendState === 'up' ? 'down' : 'up';          // 负相关，含边界：方向取反
+  if (correlation <= -correlationFloor) return btcTrendState === TREND.UP ? TREND.DOWN : TREND.UP; // 负相关，含边界：方向取反
   return 'UNKNOWN';                                                                              // (-floor, +floor) 开区间：相关性不足
 }
 
 // btcAlignmentServer：effectiveBtcDirection 与 candidateDirection 比较 → SUPPORT/OPPOSE/UNKNOWN
 export function btcAlignmentServer(candidateDirection, btcTrendState, ethBtcRollingCorrelation, correlationFloor = CORRELATION_FLOOR) {
-  if (candidateDirection !== 'up' && candidateDirection !== 'down') return 'UNKNOWN';
+  if (candidateDirection !== TREND.UP && candidateDirection !== TREND.DOWN) return 'UNKNOWN';
   const effective = effectiveBtcDirection(ethBtcRollingCorrelation, btcTrendState, correlationFloor);
   if (effective === 'UNKNOWN') return 'UNKNOWN';
   return effective === candidateDirection ? 'SUPPORT' : 'OPPOSE';

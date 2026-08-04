@@ -69,6 +69,10 @@ test('scorecard CLI writes evaluable JSON and Markdown without a database', asyn
   assert.equal(parsed.horizons['72h'].status, 'EVALUATED');
   assert.equal(parsed.horizons['24h'].rawSampleCount, 2);
   assert.equal(parsed.horizons['24h'].effectiveSampleCount, 2);
+  assert.equal(parsed.horizons['24h'].baselines.follow4hTrend.status, 'EVALUATED');
+  assert.equal(parsed.horizons['24h'].baselines.follow4hTrend.sampleCount, 1);
+  assert.equal(parsed.horizons['72h'].baselines.follow4hTrend.status, 'EVALUATED');
+  assert.equal(parsed.horizons['72h'].baselines.follow4hTrend.sampleCount, 1);
   assert.match(await readFile(markdown, 'utf8'), /Leakage-safe baselines/);
 });
 

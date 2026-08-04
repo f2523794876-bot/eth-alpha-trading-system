@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { TREND } from '../domain/trend.js';
 import { finalizeFeatureRecord } from './feature-contract.js';
 import { assessFeatureQuality } from './feature-quality.js';
 import { sourceRef, validateLineage } from './feature-lineage.js';
@@ -12,7 +13,7 @@ const logReturn=(bars,lag)=>bars.length>lag&&n(bars.at(-1).close)>0&&n(bars.at(-
 const ema=(values,period)=>{if(values.length<period)return null;const k=2/(period+1);let out=avg(values.slice(0,period));for(const value of values.slice(period))out=value*k+out*(1-k);return out;};
 const trueRanges=bars=>bars.map((bar,i)=>{const h=n(bar.high),l=n(bar.low),pc=i?n(bars[i-1].close):n(bar.open);return Math.max(h-l,Math.abs(h-pc),Math.abs(l-pc));});
 const atr=(bars,period=14)=>bars.length>=period+1?avg(trueRanges(bars).slice(-period)):null;
-const trend=bars=>{const closes=bars.map(x=>n(x.close));const e5=ema(closes,5),e20=ema(closes,20);return !Number.isFinite(e5)||!Number.isFinite(e20)?null:e5>e20?'UP':e5<e20?'DOWN':'RANGE';};
+const trend=bars=>{const closes=bars.map(x=>n(x.close));const e5=ema(closes,5),e20=ema(closes,20);return !Number.isFinite(e5)||!Number.isFinite(e20)?null:e5>e20?TREND.UP:e5<e20?TREND.DOWN:TREND.RANGE;};
 const pearson=(a,b)=>{const size=Math.min(a.length,b.length);if(size<6)return null;const x=a.slice(-size),y=b.slice(-size),mx=avg(x),my=avg(y),sx=Math.sqrt(x.reduce((s,v)=>s+(v-mx)**2,0)),sy=Math.sqrt(y.reduce((s,v)=>s+(v-my)**2,0));return sx&&sy?x.reduce((s,v,i)=>s+(v-mx)*(y[i]-my),0)/(sx*sy):null;};
 const zscore=(value,series)=>{const s=sd(series);return Number.isFinite(value)&&Number.isFinite(s)&&s>0?(value-avg(series))/s:null;};
 const sorted=rows=>[...rows].sort((a,b)=>Number(a.closeTime??a.observedAt)-Number(b.closeTime??b.observedAt));
@@ -33,7 +34,7 @@ function derivativeFeatures(input){
 
 export function computeFeatureValues(input){
   const eth15=barFeatures(input.eth15||[]),eth1=barFeatures(input.eth1h||[]),eth4=barFeatures(input.eth4h||[]),btc15=barFeatures(input.btc15||[]),derivatives=derivativeFeatures(input),ethReturns=sorted(input.eth15||[]).slice(-30).map((x,i,a)=>i?Math.log(n(x.close)/n(a[i-1].close)):null).filter(Number.isFinite),btcReturns=sorted(input.btc15||[]).slice(-30).map((x,i,a)=>i?Math.log(n(x.close)/n(a[i-1].close)):null).filter(Number.isFinite);
-  const alignment=[eth15.trend,eth1.trend,eth4.trend].filter(Boolean),allSame=alignment.length===3&&new Set(alignment).size===1,conflict=alignment.includes('UP')&&alignment.includes('DOWN');
+  const alignment=[eth15.trend,eth1.trend,eth4.trend].filter(Boolean),allSame=alignment.length===3&&new Set(alignment).size===1,conflict=alignment.includes(TREND.UP)&&alignment.includes(TREND.DOWN);
   return {...eth15,...derivatives,btcReturn:btc15.logReturn1,btcTrendState:btc15.trend,btcVolatility:btc15.realizedVolatility,ethBtcReturnSpread:Number.isFinite(eth15.logReturn1)&&Number.isFinite(btc15.logReturn1)?eth15.logReturn1-btc15.logReturn1:null,ethBtcRollingCorrelation:pearson(ethReturns,btcReturns),btcConflictState:eth15.trend&&btc15.trend&&eth15.trend!==btc15.trend?'CONFLICT':'ALIGNED',trend15m:eth15.trend,trend1h:eth1.trend,trend4h:eth4.trend,multiTimeframeAlignment:allSame?alignment[0]:'MIXED',multiTimeframeConflict:conflict,strategicRegime:eth4.trend};
 }
 
