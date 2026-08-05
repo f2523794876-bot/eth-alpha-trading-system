@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { canonicalJson, canonicalJsonBytes, canonicalSha256 } from '../formal-research/canonical-json.js';
+import { canonicalJson, canonicalSha256 } from '../formal-research/canonical-json.js';
 import { Draft202012SchemaRegistry, loadJsonSchema, SchemaValidationError } from '../formal-research/schema-registry.js';
 import { validateEffectiveOptions } from './cli-entry.js';
 
@@ -92,7 +92,16 @@ export function validateFormalRunConfig(config) {
 }
 
 export function freezeFormalRunConfig(input) {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+  let safeInput;
+  try {
+    // canonicalJson performs the descriptor/prototype/Proxy check before any
+    // property value is read. Parsing its output creates a plain data snapshot,
+    // so all later reads and spreads operate only on trusted JSON-domain data.
+    safeInput = JSON.parse(canonicalJson(input));
+  } catch {
+    throw fail('RUN_CONFIG_INVALID', 'Formal run config input must be safe JSON data');
+  }
+  if (!safeInput || typeof safeInput !== 'object' || Array.isArray(safeInput)) {
     throw fail('RUN_CONFIG_INVALID', 'Formal run config input must be an object');
   }
   const detectedIdentity = readGitIdentity({ repositoryRoot: REPOSITORY_ROOT });
@@ -101,19 +110,23 @@ export function freezeFormalRunConfig(input) {
     sourceCommit: detectedIdentity.sourceCommit
   };
   for (const key of ['gitObjectFormat', 'sourceCommit']) {
-    if (input[key] !== undefined && input[key] !== normalizedIdentity[key]) {
+    if (safeInput[key] !== undefined && safeInput[key] !== normalizedIdentity[key]) {
       throw fail('VERSION_MISMATCH', `${key} does not match the checked-out repository`);
     }
   }
 
-  const candidate = { ...input, ...normalizedIdentity };
+  const candidate = { ...safeInput, ...normalizedIdentity };
   validateFormalRunConfig(candidate);
   const serialized = canonicalJson(candidate);
   const config = deepFreeze(JSON.parse(serialized));
-  return Object.freeze({
+  const result = {
     config,
     canonicalJson: serialized,
-    canonicalBytes: canonicalJsonBytes(config),
     sha256: canonicalSha256(config)
+  };
+  Object.defineProperty(result, 'canonicalBytes', {
+    enumerable: true,
+    get() { return Buffer.from(serialized, 'utf8'); }
   });
+  return Object.freeze(result);
 }

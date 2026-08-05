@@ -74,8 +74,23 @@ export class Draft202012SchemaRegistry {
     if (!schema || typeof schema !== 'object' || Array.isArray(schema) || typeof schema.$id !== 'string') {
       throw Object.assign(new TypeError('Schema must be an object with a non-empty $id'), { code: 'SCHEMA_ID_REQUIRED' });
     }
+    if (schema.$id.length === 0) {
+      throw Object.assign(new TypeError('Schema must be an object with a non-empty $id'), { code: 'SCHEMA_ID_REQUIRED' });
+    }
     if (schema.$schema !== 'https://json-schema.org/draft/2020-12/schema') {
       throw Object.assign(new TypeError(`Schema ${schema.$id} must declare Draft 2020-12`), { code: 'SCHEMA_DIALECT_INVALID' });
+    }
+    if (this.schemaIds.has(schema.$id) || this.ajv.getSchema(schema.$id)) {
+      throw Object.assign(new TypeError('Schema identifier is already registered'), { code: 'SCHEMA_DUPLICATE' });
+    }
+    let schemaIsValid = false;
+    try {
+      schemaIsValid = this.ajv.validateSchema(schema);
+    } catch {
+      schemaIsValid = false;
+    }
+    if (!schemaIsValid) {
+      throw Object.assign(new TypeError('Schema does not satisfy the Draft 2020-12 meta-schema'), { code: 'SCHEMA_INVALID' });
     }
     this.ajv.addSchema(schema);
     this.schemaIds.add(schema.$id);
@@ -93,7 +108,13 @@ export class Draft202012SchemaRegistry {
       if (!validator) throw Object.assign(new Error(`Unknown schema: ${schemaOrId}`), { code: 'SCHEMA_NOT_FOUND' });
       return validator;
     }
-    return this.ajv.compile(schemaOrId);
+    // Object schemas are never compiled through a shortcut. They must pass the
+    // same id, dialect, meta-schema and duplicate-registration gates as schemas
+    // supplied to the constructor.
+    this.addSchema(schemaOrId);
+    const validator = this.ajv.getSchema(schemaOrId.$id);
+    if (!validator) throw Object.assign(new Error('Registered schema could not be compiled'), { code: 'SCHEMA_NOT_FOUND' });
+    return validator;
   }
 
   validate(schemaOrId, data) {

@@ -57,8 +57,11 @@ function assertJsonValue(value, path, ancestors) {
       if (typeof key === 'symbol') throw new CanonicalJsonError('Symbol own keys are not JSON properties', path);
       assertUnicodeScalarString(key, `${path}.<key>`);
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      assertEnumerableDataDescriptor(descriptor, `${path}.${key}`);
-      assertJsonValue(descriptor.value, `${path}.${key}`, ancestors);
+      // Object property names are caller-controlled and may contain secrets. Public
+      // validation paths deliberately retain structure without echoing the key.
+      const redactedPath = `${path}.*`;
+      assertEnumerableDataDescriptor(descriptor, redactedPath);
+      assertJsonValue(descriptor.value, redactedPath, ancestors);
     }
   }
   ancestors.delete(value);

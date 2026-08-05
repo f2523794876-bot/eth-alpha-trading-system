@@ -108,6 +108,18 @@ test('canonicalization rejects symbol and non-enumerable own properties', () => 
   assert.throws(() => canonicalJson(hiddenObject), { code: 'CANONICAL_JSON_INVALID' });
 });
 
+test('canonicalization errors do not disclose caller-controlled property names', () => {
+  const secret = 'database-password-is-secret';
+  const value = {};
+  Object.defineProperty(value, secret, { enumerable: true, get() { return 'hidden'; } });
+  let error;
+  try { canonicalJson(value); } catch (caught) { error = caught; }
+  assert.equal(error.code, 'CANONICAL_JSON_INVALID');
+  assert.doesNotMatch(error.message, new RegExp(secret));
+  assert.doesNotMatch(error.path, new RegExp(secret));
+  assert.equal(error.path, '$.*');
+});
+
 test('canonicalization rejects arrays with symbol or extra non-index own properties', () => {
   const extra = [1];
   extra.extra = 2;

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -43,6 +44,10 @@ function input(overrides = {}) {
     schemaVersion: 'v1.4d-formal-run-config/1',
     validationRunId: '123e4567-e89b-42d3-a456-426614174000',
     artifactMode: 'DRY_RUN',
+    artifactRoot: '/tmp/v1-4d-artifacts',
+    lockTimeoutMs: 30_000,
+    staleLockRecovery: 'DISABLED',
+    maxArtifactBytes: 10_485_760,
     databaseIdentity: 'test',
     researchFrom: '2025-01-01T00:00:00.000Z',
     researchTo: '2025-07-01T00:00:00.000Z',
@@ -96,6 +101,81 @@ test('T1 canonical hash is stable across caller object insertion order', () => {
   const second = Object.fromEntries(reverseEntries);
   assert.equal(freezeFormalRunConfig(first).sha256, freezeFormalRunConfig(second).sha256);
   assert.equal(freezeFormalRunConfig(first).canonicalJson, freezeFormalRunConfig(second).canonicalJson);
+});
+
+test('T1 signs all artifact publication controls and every mutation changes the hash', () => {
+  const original = freezeFormalRunConfig(input());
+  for (const [field, value] of [
+    ['artifactRoot', '/tmp/v1-4d-artifacts-two'],
+    ['lockTimeoutMs', 30_001],
+    ['staleLockRecovery', 'ENABLED'],
+    ['maxArtifactBytes', 10_485_761]
+  ]) {
+    const changed = freezeFormalRunConfig(input({ [field]: value }));
+    assert.notEqual(changed.canonicalJson, original.canonicalJson, field);
+    assert.notEqual(changed.sha256, original.sha256, field);
+    assert.equal(changed.config[field], value);
+  }
+});
+
+test('T1 rejects every missing or invalid artifact publication control', () => {
+  for (const field of ['artifactRoot', 'lockTimeoutMs', 'staleLockRecovery', 'maxArtifactBytes']) {
+    const missing = input();
+    delete missing[field];
+    assert.throws(() => freezeFormalRunConfig(missing), { code: 'RUN_CONFIG_INVALID' }, field);
+  }
+  for (const overrides of [
+    { artifactRoot: 'relative/path' },
+    { artifactRoot: '/tmp/../escape' },
+    { artifactRoot: '/tmp//duplicate' },
+    { artifactRoot: '/tmp/trailing/' },
+    { lockTimeoutMs: 0 },
+    { lockTimeoutMs: 300_001 },
+    { lockTimeoutMs: 1.5 },
+    { staleLockRecovery: 'AUTO' },
+    { maxArtifactBytes: 0 },
+    { maxArtifactBytes: 1.5 },
+    { maxArtifactBytes: Number.MAX_SAFE_INTEGER + 1 }
+  ]) assert.throws(() => freezeFormalRunConfig(input(overrides)), { code: 'RUN_CONFIG_INVALID' });
+});
+
+test('T1 rejects accessors and Proxy input without executing user code or leaking its error', () => {
+  let getterCalls = 0;
+  const accessorInput = input();
+  Object.defineProperty(accessorInput, 'dangerous', {
+    enumerable: true,
+    get() { getterCalls += 1; throw new Error('getter-secret-must-not-leak'); }
+  });
+  let accessorError;
+  try { freezeFormalRunConfig(accessorInput); } catch (caught) { accessorError = caught; }
+  assert.equal(accessorError.code, 'RUN_CONFIG_INVALID');
+  assert.equal(getterCalls, 0);
+  assert.doesNotMatch(JSON.stringify(accessorError), /getter-secret/);
+
+  let trapCalls = 0;
+  const proxyInput = new Proxy(input(), {
+    getPrototypeOf() { trapCalls += 1; throw new Error('proxy-secret-must-not-leak'); },
+    ownKeys() { trapCalls += 1; throw new Error('proxy-secret-must-not-leak'); },
+    getOwnPropertyDescriptor() { trapCalls += 1; throw new Error('proxy-secret-must-not-leak'); },
+    get() { trapCalls += 1; throw new Error('proxy-secret-must-not-leak'); }
+  });
+  let proxyError;
+  try { freezeFormalRunConfig(proxyInput); } catch (caught) { proxyError = caught; }
+  assert.equal(proxyError.code, 'RUN_CONFIG_INVALID');
+  assert.equal(trapCalls, 0);
+  assert.doesNotMatch(JSON.stringify(proxyError), /proxy-secret/);
+});
+
+test('T1 canonical bytes are defensive copies and remain consistent with JSON and SHA-256', () => {
+  const result = freezeFormalRunConfig(input());
+  const first = result.canonicalBytes;
+  const pristine = Buffer.from(first);
+  first[0] ^= 0xff;
+  const second = result.canonicalBytes;
+  assert.notStrictEqual(first, second);
+  assert.deepEqual(second, pristine);
+  assert.deepEqual(second, Buffer.from(result.canonicalJson, 'utf8'));
+  assert.equal(createHash('sha256').update(second).digest('hex'), result.sha256);
 });
 
 test('T1 cross-schema thresholds validation rejects missing fields and extra business values', () => {

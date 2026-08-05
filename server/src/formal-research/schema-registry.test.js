@@ -127,6 +127,61 @@ test('registry rejects schemas that do not explicitly declare Draft 2020-12', ()
   }] }), { code: 'SCHEMA_DIALECT_INVALID' });
 });
 
+test('direct object schemas pass the same Draft 2020-12 registration gates', () => {
+  const registry = new Draft202012SchemaRegistry();
+  const direct = {
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    $id: 'https://example.invalid/direct.json',
+    type: 'object', properties: { value: { type: 'integer' } },
+    required: ['value'], additionalProperties: false
+  };
+  assert.equal(registry.validate(direct, { value: 1 }).value, 1);
+  assert.throws(() => registry.validate(direct.$id, { value: '1' }), SchemaValidationError);
+});
+
+test('direct object schemas cannot bypass id, dialect, meta-schema, duplicate, or ref gates', () => {
+  const registry = new Draft202012SchemaRegistry();
+  assert.throws(() => registry.compile({
+    $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'integer'
+  }), { code: 'SCHEMA_ID_REQUIRED' });
+  assert.throws(() => registry.compile({
+    $schema: 'http://json-schema.org/draft-07/schema#',
+    $id: 'https://example.invalid/old-draft.json', type: 'integer'
+  }), { code: 'SCHEMA_DIALECT_INVALID' });
+  assert.throws(() => registry.compile({
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    $id: 'https://example.invalid/invalid.json', type: 'not-a-json-schema-type'
+  }), { code: 'SCHEMA_INVALID' });
+
+  const duplicate = {
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    $id: 'https://example.invalid/duplicate.json', type: 'integer'
+  };
+  registry.addSchema(duplicate);
+  assert.throws(() => registry.addSchema(duplicate), { code: 'SCHEMA_DUPLICATE' });
+
+  assert.throws(() => registry.compile({
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    $id: 'https://example.invalid/direct-missing-ref.json',
+    $ref: 'https://example.invalid/not-registered.json'
+  }), /can't resolve reference|MissingRefError/);
+});
+
+test('direct object schema gate errors do not echo caller-controlled schema content', () => {
+  const secret = 'postgres://admin:secret@example.invalid/production';
+  const registry = new Draft202012SchemaRegistry();
+  let error;
+  try {
+    registry.compile({
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      $id: 'https://example.invalid/redacted-invalid.json',
+      type: secret
+    });
+  } catch (caught) { error = caught; }
+  assert.equal(error.code, 'SCHEMA_INVALID');
+  assert.doesNotMatch(JSON.stringify(error), /admin|secret|production/);
+});
+
 test('public schema errors redact caller-controlled property names and values', () => {
   const schema = {
     $schema: 'https://json-schema.org/draft/2020-12/schema',
