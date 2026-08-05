@@ -90,15 +90,26 @@ test('R1：重复执行同一批次幂等，第二次rowsDeduped等于全部行�
 
 test('R2.2：未收盘K线（close_time>服务器时间）必须被过滤丢弃', { skip }, async () => {
   await withTxClient(async (client) => {
-    const openTime = Date.UTC(2026, 0, 3, 0, 0, 0);
-    const closeTime = openTime + 900000 - 1;
-    const nowMs = openTime + 100; // 服务器时间远早于close_time，代表bar尚未收盘
-    const adapter = makeMockAdapter({ pages: [[kline(openTime, closeTime)]], serverTimeMs: nowMs });
+    const closedOpenTime = Date.UTC(2026, 0, 3, 0, 0, 0);
+    const closedCloseTime = closedOpenTime + 900000 - 1;
+    const futureOpenTime = closedOpenTime + 900000;
+    const futureCloseTime = futureOpenTime + 900000 - 1;
+    const fixedAsOf = closedCloseTime;
+    const adapter = makeMockAdapter({
+      pages: [[kline(closedOpenTime, closedCloseTime), kline(futureOpenTime, futureCloseTime)]],
+      serverTimeMs: fixedAsOf
+    });
 
-    const result = await backfillInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: openTime, endTime: openTime, now: () => nowMs });
-    assert.equal(result.rowsInserted, 0, '未收盘K线不得写入market_bars');
-    const count = (await client.query(`SELECT count(*)::int AS n FROM market_bars WHERE instrument='ETHUSDT' AND close_time=to_timestamp($1/1000.0)`, [closeTime])).rows[0].n;
-    assert.equal(count, 0);
+    const result = await backfillInterval({
+      pool: client, adapter, symbol: 'ETHUSDT', interval: '15m',
+      startTime: closedOpenTime, endTime: closedOpenTime, requestedTo: futureOpenTime + 900000,
+      fixedAsOf, now: () => fixedAsOf
+    });
+    assert.equal(result.rowsInserted, 1, 'fixedAsOf前已收盘K线必须正常写入');
+    const closedCount = (await client.query(`SELECT count(*)::int AS n FROM market_bars WHERE instrument='ETHUSDT' AND close_time=to_timestamp($1/1000.0)`, [closedCloseTime])).rows[0].n;
+    const futureCount = (await client.query(`SELECT count(*)::int AS n FROM market_bars WHERE instrument='ETHUSDT' AND close_time=to_timestamp($1/1000.0)`, [futureCloseTime])).rows[0].n;
+    assert.equal(closedCount, 1);
+    assert.equal(futureCount, 0, 'fixedAsOf后未收盘K线不得写入market_bars');
   });
 });
 
@@ -312,34 +323,38 @@ test('R3.3：目标区间与现有(模拟实时采集的)覆盖区间部分重�
 });
 
 // P2-3修复（独立复审）：分页游标必须真正前进，否则fail closed而不是无限循环。构造一个损坏的adapter——
-// 返回恰好PAGE_LIMIT(1000)条"陈旧"K线（openTime全部早于本次请求的startTime），模拟adapter/上游API异常
-// 返回了不符合请求区间的重复/陈旧页。若无本项守卫，主循环会把cursor算成一个不大于原cursor的值，
-// 对同一(或更早)区间无限重复请求；有守卫后，应在处理完这一页后立即fail closed，而不是发起第二次请求。
+// 第一页返回恰好PAGE_LIMIT(1000)条合法K线，第二页无视新startTime并重复旧页。若无本项守卫，主循环会
+// 对同一区间无限重复请求；有守卫后，应在重复页上立即fail closed，不得发起第三次请求。
 test('P2-3红线：分页游标未真正前进时fail closed（BACKFILL_CURSOR_NOT_ADVANCING），不无限循环', { skip }, async () => {
   await withTxClient(async (client) => {
     const requestedStart = Date.UTC(2026, 0, 10, 0, 0, 0);
     const requestedEnd = requestedStart + 2000 * 900000;
-    // 构造1000条(=PAGE_LIMIT)全部早于requestedStart的陈旧K线，最后一条的openTime+intervalMs仍<=requestedStart，
-    // 即cursor在这一页处理后不会前进——这正是本次要拦截的场景。
-    const staleRows = [];
+    // 第一页返回1000条合法且位于fixedAsOf范围内的K线，使游标真实推进；第二页错误地重复同一页，
+    // 此时page末尾推导出的nextCursor等于当前cursor，必须触发游标不前进保护。
+    const eligibleRows = [];
     for (let i = 0; i < 1000; i += 1) {
-      const openTime = requestedStart - (1000 - i) * 900000;
-      staleRows.push(kline(openTime, openTime + 900000 - 1, '1000.00'));
+      const openTime = requestedStart + i * 900000;
+      eligibleRows.push(kline(openTime, openTime + 900000 - 1, '1000.00'));
     }
-    let secondCallHappened = false;
+    let callCount = 0;
     const adapter = {
       serverTime: async () => ({ body: { serverTime: requestedEnd + 60000 }, requestId: randomUUID() }),
       spotKlines: async () => {
-        if (secondCallHappened) throw new Error('must not be called a second time — cursor guard must fail closed after the first page');
-        secondCallHappened = true;
-        return { body: staleRows, requestId: randomUUID(), status: 200, headers: {} };
+        callCount += 1;
+        if (callCount > 2) throw new Error('must not be called a third time — cursor guard must fail closed on the repeated page');
+        return { body: eligibleRows, requestId: randomUUID(), status: 200, headers: {} };
       }
     };
 
     await assert.rejects(
-      backfillInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: requestedStart, endTime: requestedEnd, now: () => requestedEnd + 60000 }),
+      backfillInterval({
+        pool: client, adapter, symbol: 'ETHUSDT', interval: '15m',
+        startTime: requestedStart, endTime: requestedEnd, fixedAsOf: requestedEnd - 1,
+        now: () => requestedEnd + 60000
+      }),
       (e) => e.code === 'BACKFILL_CURSOR_NOT_ADVANCING'
     );
+    assert.equal(callCount, 2, '必须先处理合法第一页，再在重复第二页上触发游标保护');
   });
 });
 

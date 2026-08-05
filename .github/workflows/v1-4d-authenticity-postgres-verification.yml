@@ -1,0 +1,351 @@
+name: V1.4D isolated PostgreSQL authenticity verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/v1.4d-rerun-authenticity-guard
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v1-4d-authenticity-postgres-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  authenticity-postgres-verification:
+    name: Isolated PostgreSQL 16 authenticity acceptance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: v14d_authenticity_ci
+          POSTGRES_PASSWORD: actions-test-only-password
+          POSTGRES_DB: eth_alpha_v14d_authenticity_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U v14d_authenticity_ci -d eth_alpha_v14d_authenticity_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_URL: postgresql://v14d_authenticity_ci:actions-test-only-password@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci
+      ALLOW_POSTGRES_INTEGRATION_TESTS: "1"
+      NODE_ENV: test
+      EVIDENCE_DIR: verification-evidence
+
+    steps:
+      - name: Checkout requested branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+
+      - name: Record immutable source and isolated database evidence
+        shell: bash
+        env:
+          V14D_DATABASE_IDENTITY: test
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          mkdir -p "$EVIDENCE_DIR/logs"
+
+          for attempt in $(seq 1 30); do
+            if PGPASSWORD=actions-test-only-password pg_isready \
+              --host=127.0.0.1 --port=5432 \
+              --username=v14d_authenticity_ci \
+              --dbname=eth_alpha_v14d_authenticity_ci; then
+              break
+            fi
+            echo "Waiting for the isolated PostgreSQL service ($attempt/30)"
+            sleep 2
+          done
+
+          database_name="$(
+            PGPASSWORD=actions-test-only-password psql \
+              --host=127.0.0.1 --port=5432 \
+              --username=v14d_authenticity_ci \
+              --dbname=eth_alpha_v14d_authenticity_ci \
+              --tuples-only --no-align \
+              --command='SELECT current_database();'
+          )"
+          test "$database_name" = "eth_alpha_v14d_authenticity_ci"
+
+          test_database_url_name="$(
+            node --input-type=module -e \
+              "console.log(decodeURIComponent(new URL(process.env.TEST_DATABASE_URL).pathname.slice(1)))"
+          )"
+          test "$database_name" = "$test_database_url_name"
+          test "$database_name" = "eth_alpha_v14d_authenticity_ci"
+          test "$V14D_DATABASE_IDENTITY" = "test"
+
+          postgres_version="$(
+            PGPASSWORD=actions-test-only-password psql \
+              --host=127.0.0.1 --port=5432 \
+              --username=v14d_authenticity_ci \
+              --dbname=eth_alpha_v14d_authenticity_ci \
+              --tuples-only --no-align \
+              --command='SHOW server_version;'
+          )"
+
+          {
+            echo "Current branch: ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+            echo "HEAD full SHA: $(git rev-parse HEAD)"
+            echo "git status --short:"
+            git status --short
+            echo "PostgreSQL version: $postgres_version"
+            echo "Workflow PostgreSQL database name: $database_name"
+            echo "TEST_DATABASE_URL database name: $test_database_url_name"
+            echo "Authorized fixed CI database name: eth_alpha_v14d_authenticity_ci"
+            echo "Database-name consistency: PASS (service, URL and fixed CI allowlist match exactly)"
+            echo "TEST_DATABASE_URL target: postgresql://v14d_authenticity_ci:***@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci"
+            echo "DATABASE_URL usage: NOT USED (variable is unset and no secrets are referenced)"
+            echo "Lifecycle: the PostgreSQL service container is destroyed automatically when this job ends"
+          } | tee "$EVIDENCE_DIR/environment.txt"
+
+      - name: Install locked dependencies
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          npm ci
+
+      - name: Apply project migrations through TEST_DATABASE_URL only
+        working-directory: server
+        shell: bash
+        env:
+          V14D_DATABASE_IDENTITY: test
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          node --input-type=module <<'NODE' 2>&1 | tee ../verification-evidence/logs/migrations.log
+          import { Pool } from 'pg';
+          import { runMigrations } from './src/db/migrate.js';
+
+          if (process.env.DATABASE_URL !== undefined) {
+            throw new Error('DATABASE_URL must remain unset');
+          }
+          const pool = new Pool({ connectionString: process.env.TEST_DATABASE_URL });
+          try {
+            await runMigrations(pool, 'up');
+            const result = await pool.query('SELECT version FROM schema_migrations ORDER BY version');
+            console.log('Applied migrations:', result.rows.map(row => row.version).join(', '));
+          } finally {
+            await pool.end();
+          }
+          NODE
+
+      - name: Run PostgreSQL and authenticity test groups
+        id: test_groups
+        working-directory: server
+        shell: bash
+        run: |
+          set -uo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          results="../$EVIDENCE_DIR/group-results.tsv"
+          : > "$results"
+
+          run_group() {
+            local environment_scope="$1"
+            local group="$2"
+            shift 2
+            local log="../$EVIDENCE_DIR/logs/${group}.tap"
+            local rc
+            set +e
+            if [ "$environment_scope" = "postgres" ]; then
+              env -u DATABASE_URL \
+                V14D_DATABASE_IDENTITY=test \
+                node --test --test-reporter=tap --test-concurrency=1 "$@" 2>&1 | tee "$log"
+              rc=${PIPESTATUS[0]}
+            else
+              env -u DATABASE_URL -u V14D_RESEARCH_DATABASE_NAME -u V14D_DATABASE_IDENTITY \
+                node --test --test-reporter=tap --test-concurrency=1 "$@" 2>&1 | tee "$log"
+              rc=${PIPESTATUS[0]}
+            fi
+            set -e
+            local pass fail skip
+            pass="$(awk '/^# pass / { value=$3 } END { print value+0 }' "$log")"
+            fail="$(awk '/^# fail / { value=$3 } END { print value+0 }' "$log")"
+            skip="$(awk '/^# skipped / { value=$3 } END { print value+0 }' "$log")"
+            printf '%s\t%s\t%s\t%s\t%s\n' "$group" "$rc" "$pass" "$fail" "$skip" >> "$results"
+            return 0
+          }
+
+          run_group postgres targeted_postgres \
+            tests/postgres/v1-4d-cleanup-single-run.integration.test.js \
+            tests/postgres/v1-4d-cli-entry.integration.test.js \
+            tests/postgres/v1-4d-r11-4-terminal-immutability.integration.test.js \
+            tests/postgres/v1-4d-replay-generator-evaluator.integration.test.js \
+            tests/postgres/v1-4d-report-builder.integration.test.js
+
+          run_group postgres complete_v1_4d_postgres tests/postgres/v1-4d-*.integration.test.js
+
+          run_group offline authenticity_report_scorecard \
+            src/db/research-database-guard.test.js \
+            src/validation-replay/replay-authenticity.test.js \
+            src/validation-replay/cli-entry.test.js \
+            src/validation-replay/replay-evaluator.test.js \
+            src/validation-replay/report-builder.test.js \
+            src/validation-replay/research-scorecard.test.js \
+            scripts/v1-4d-scorecard-cli.test.mjs \
+            scripts/v1-4d-workflow-gate.test.mjs \
+            tests/postgres/_pg-integration-gate.test.js
+
+      - name: Run explicit Report and Scorecard rejection probes
+        id: rejection_probes
+        working-directory: server
+        shell: bash
+        run: |
+          set -uo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          log="../$EVIDENCE_DIR/logs/report-scorecard-rejection-probes.tap"
+          set +e
+          env -u DATABASE_URL -u V14D_RESEARCH_DATABASE_NAME -u V14D_DATABASE_IDENTITY \
+            node --test --test-reporter=tap --test-concurrency=1 \
+            src/validation-replay/replay-authenticity-rejection-probes.test.js 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          pass="$(awk '/^# pass / { value=$3 } END { print value+0 }' "$log")"
+          fail="$(awk '/^# fail / { value=$3 } END { print value+0 }' "$log")"
+          skip="$(awk '/^# skipped / { value=$3 } END { print value+0 }' "$log")"
+          printf 'report_scorecard_rejection_probes\t%s\t%s\t%s\t%s\n' \
+            "$rc" "$pass" "$fail" "$skip" \
+            >> "../$EVIDENCE_DIR/group-results.tsv"
+
+      - name: Verify P1-6 backfill regression
+        id: p1_6_regression
+        working-directory: server
+        shell: bash
+        run: |
+          set -uo pipefail
+          unset DATABASE_URL
+          test -z "${DATABASE_URL+x}"
+          log="../$EVIDENCE_DIR/logs/backfill-p1-6-regression.tap"
+          set +e
+          env -u DATABASE_URL -u V14D_RESEARCH_DATABASE_NAME -u V14D_DATABASE_IDENTITY \
+            node --test --test-reporter=tap --test-concurrency=1 \
+            --test-name-pattern='P1-6：main\(\).*单个--resume加多个--intervals' \
+            tests/postgres/v1-4d-backfill-cli.integration.test.js 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+
+          pass="$(awk '/^# pass / { value=$3 } END { print value+0 }' "$log")"
+          fail="$(awk '/^# fail / { value=$3 } END { print value+0 }' "$log")"
+          skip="$(awk '/^# skipped / { value=$3 } END { print value+0 }' "$log")"
+          if [ "$rc" -eq 0 ] && [ "$pass" -eq 1 ] && [ "$fail" -eq 0 ] && [ "$skip" -eq 0 ]; then
+            classification=P1_6_REGRESSION_PASSED
+          else
+            classification=P1_6_REGRESSION_FAILED
+          fi
+          printf '%s\n' "$classification" | tee "../$EVIDENCE_DIR/backfill-p1-6-classification.txt"
+          printf 'backfill_p1_6_regression\t%s\t%s\t%s\t%s\n' \
+            "$rc" "$pass" "$fail" "$skip" \
+            >> "../$EVIDENCE_DIR/group-results.tsv"
+
+      - name: Build and self-test structured verification gate
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          node scripts/v1-4d-workflow-gate.mjs --self-test | tee "../$EVIDENCE_DIR/logs/workflow-gate-self-test.log"
+          node scripts/v1-4d-workflow-gate.mjs --collect-scenarios \
+            "../$EVIDENCE_DIR/logs" "../$EVIDENCE_DIR/scenario-results.tsv"
+          node scripts/v1-4d-workflow-gate.mjs --validate \
+            "../$EVIDENCE_DIR/group-results.tsv" "../$EVIDENCE_DIR/scenario-results.tsv"
+
+      - name: Build acceptance and scenario summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          results="$EVIDENCE_DIR/group-results.tsv"
+          summary="$EVIDENCE_DIR/verification-summary.md"
+          backfill_classification="$(cat "$EVIDENCE_DIR/backfill-p1-6-classification.txt" 2>/dev/null || echo NOT_RUN)"
+
+          {
+            echo "# V1.4D isolated PostgreSQL authenticity verification"
+            echo
+            echo "- Branch: ${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+            echo "- HEAD: $(git rev-parse HEAD)"
+            echo "- Database: eth_alpha_v14d_authenticity_ci (ephemeral PostgreSQL 16 service)"
+            echo "- DATABASE_URL: not used; variable was explicitly unset"
+            echo
+            echo "## Test groups"
+            echo
+            echo "| Group | Exit | Pass | Fail | Skip |"
+            echo "|---|---:|---:|---:|---:|"
+            if [ -f "$results" ]; then
+              while IFS=$'\t' read -r group rc pass fail skip; do
+                echo "| $group | $rc | $pass | $fail | $skip |"
+              done < "$results"
+            fi
+            echo
+            echo "## Authenticity scenarios"
+            echo
+            echo "| Scenario | Result | Evidence |"
+            echo "|---|---|---|"
+            if [ -f "$EVIDENCE_DIR/scenario-results.tsv" ]; then
+              while IFS=$'\t' read -r scenario result; do
+                echo "| $scenario | $result | exact test/assertion evidence recorded in TAP and conflict JSON diagnostics |"
+              done < "$EVIDENCE_DIR/scenario-results.tsv"
+            fi
+            echo
+            echo "## Backfill P1-6 regression"
+            echo
+            echo "- Result: **$backfill_classification**"
+            echo "- Expected contract: RESUME_INTERVALS_CONFLICT"
+            echo "- The dedicated regression test must pass normally; failures are enforced by the final gate."
+            echo
+            echo "The service container and its dedicated database are destroyed automatically when the job ends."
+          } | tee "$summary"
+
+          cat "$EVIDENCE_DIR/environment.txt" >> "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1-4d-authenticity-postgres-verification-${{ github.run_id }}
+          path: verification-evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Enforce final verification status
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          results="$EVIDENCE_DIR/group-results.tsv"
+          test -f "$results"
+
+          set +e
+          node server/scripts/v1-4d-workflow-gate.mjs --validate \
+            "$results" "$EVIDENCE_DIR/scenario-results.tsv"
+          gate_rc=$?
+          set -e
+          if [ "$gate_rc" -ne 0 ]; then
+            echo "GITHUB_ACTIONS_POSTGRES_VERIFICATION_FAILED"
+            exit 1
+          fi
+          echo "GITHUB_ACTIONS_POSTGRES_VERIFICATION_PASSED"

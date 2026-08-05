@@ -9,6 +9,7 @@ import {
   classifyReplayFailure, deriveVerificationStatus, exitCodeForStatus,
   extractChildErrorCode, redactSensitiveText
 } from './v1-4d-verification-contract.mjs';
+import { buildResearchScorecard } from '../src/validation-replay/research-scorecard.js';
 
 const script = new URL('./v1-4d-scorecard-cli.mjs', import.meta.url);
 const cleanEnv = () => {
@@ -24,6 +25,14 @@ test('verification arguments accept individual and combined 7/90-day replay plan
   assert.deepEqual(parseReplayDays('7,90'), [7, 90]);
   assert.deepEqual(parseReplayDays('both'), [7, 90]);
   assert.throws(() => parseReplayDays('30'), error => error.code === 'INVALID_REPLAY_DAYS');
+});
+
+test('formal verification runner explicitly requests fresh replay authenticity', async () => {
+  const source = await readFile(new URL('./verify-v1-4d.mjs', import.meta.url), 'utf8');
+  assert.match(source, /'--authenticity-mode',\s*'fresh'/);
+  assert.match(source, /`--fee-bps=\$\{formalCosts\.feeBps\}`/);
+  assert.match(source, /`--slippage-bps=\$\{formalCosts\.slippageBps\}`/);
+  assert.doesNotMatch(source, /valueArg\('fee-bps'\)\s*\|\|\s*8|valueArg\('slippage-bps'\)\s*\|\|\s*4/);
 });
 
 test('replay windows end at the explicit cutoff and span exactly 7 or 90 days', () => {
@@ -69,6 +78,10 @@ test('scorecard CLI writes evaluable JSON and Markdown without a database', asyn
   assert.equal(parsed.horizons['72h'].status, 'EVALUATED');
   assert.equal(parsed.horizons['24h'].rawSampleCount, 2);
   assert.equal(parsed.horizons['24h'].effectiveSampleCount, 2);
+  assert.equal(parsed.horizons['24h'].baselines.follow4hTrend.status, 'EVALUATED');
+  assert.equal(parsed.horizons['24h'].baselines.follow4hTrend.sampleCount, 1);
+  assert.equal(parsed.horizons['72h'].baselines.follow4hTrend.status, 'EVALUATED');
+  assert.equal(parsed.horizons['72h'].baselines.follow4hTrend.sampleCount, 1);
   assert.match(await readFile(markdown, 'utf8'), /Leakage-safe baselines/);
 });
 
@@ -79,7 +92,8 @@ test('scorecard CLI writes NOT_EVALUABLE reports and exits non-zero for empty hi
   const markdown = path.join(dir, 'scorecard.md');
   await writeFile(input, '[]');
   const result = spawnSync(process.execPath, [
-    script.pathname, `--input=${input}`, `--output=${json}`, `--markdown-output=${markdown}`
+    script.pathname, `--input=${input}`, `--output=${json}`, `--markdown-output=${markdown}`,
+    '--fee-bps=0', '--slippage-bps=0'
   ], { encoding: 'utf8', env: cleanEnv() });
   assert.equal(result.status, 2, result.stderr);
   assert.equal(JSON.parse(await readFile(json, 'utf8')).status, 'NOT_EVALUABLE');
@@ -90,11 +104,167 @@ test('scorecard CLI ignores generic DATABASE_URL and requires explicit V14D_REPL
   const env = cleanEnv();
   env.DATABASE_URL = 'postgresql://production.example.invalid/never-connect';
   const result = spawnSync(process.execPath, [
-    script.pathname, '--validation-run-id=00000000-0000-0000-0000-000000000000', '--evaluation-version=test'
+    script.pathname, '--validation-run-id=00000000-0000-0000-0000-000000000000', '--evaluation-version=test',
+    '--fee-bps=0', '--slippage-bps=0'
   ], { encoding: 'utf8', env });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /V14D_REPLAY_DATABASE_URL is required/);
   assert.match(result.stderr, /generic DATABASE_URL is intentionally ignored/);
+});
+
+test('scorecard CLI --validation-run-id path now routes through createGuardedResearchPgPool: a V14D_REPLAY_DATABASE_URL declaring the wrong database name is rejected before any query, without a live Postgres server', () => {
+  const env = cleanEnv();
+  env.V14D_REPLAY_DATABASE_URL = 'postgresql://u:p@127.0.0.1:5432/definitely_not_eth_alpha_v14d_test';
+  const result = spawnSync(process.execPath, [
+    script.pathname, '--validation-run-id=00000000-0000-0000-0000-000000000000', '--evaluation-version=test',
+    '--fee-bps=0', '--slippage-bps=0'
+  ], { encoding: 'utf8', env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /DATABASE_TARGET_REJECTED|must target eth_alpha_v14d_test/);
+});
+
+test('scorecard CLI requires both explicit cost parameters and accepts explicit 0/0 and 8/4 consistently', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v1-4d-scorecard-cost-'));
+  const input = path.join(dir, 'input.json');
+  const json = path.join(dir, 'scorecard.json');
+  await writeFile(input, JSON.stringify(fixtureRows()));
+  for (const flags of [[], ['--fee-bps=8'], ['--slippage-bps=4']]) {
+    const rejected = spawnSync(process.execPath, [script.pathname, `--input=${input}`, `--output=${json}`, ...flags], { encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /SCORECARD_COST_ASSUMPTIONS_REQUIRED|both required/);
+  }
+  for (const [fee, slippage] of [[0, 0], [8, 4]]) {
+    const explicitRun = spawnSync(process.execPath, [
+      script.pathname, `--input=${input}`, `--output=${json}`, `--fee-bps=${fee}`, `--slippage-bps=${slippage}`, '--seed=17'
+    ], { encoding: 'utf8', env: cleanEnv() });
+    assert.equal(explicitRun.status, 0, explicitRun.stderr);
+    assert.match(explicitRun.stderr, new RegExp(`cost_assumption explicit.*"feeBps":${fee},"slippageBps":${slippage}`));
+    const parsed = JSON.parse(await readFile(json, 'utf8'));
+    assert.equal(parsed.assumptions.feeBps, fee);
+    assert.equal(parsed.assumptions.slippageBps, slippage);
+    const direct = buildResearchScorecard(fixtureRows(), { feeBps: fee, slippageBps: slippage, randomSeed: 17 });
+    assert.deepEqual(parsed.system.economics, direct.system.economics, 'CLI and builder must agree for identical explicit costs');
+  }
+});
+
+test('scorecard CLI rejects empty, whitespace and bare cost flags as required parameters', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v1-4d-scorecard-required-cost-'));
+  const input = path.join(dir, 'input.json');
+  await writeFile(input, JSON.stringify(fixtureRows()));
+  for (const flags of [
+    ['--fee-bps=', '--slippage-bps=0'], ['--fee-bps=0', '--slippage-bps='],
+    ['--fee-bps=   ', '--slippage-bps=0'], ['--fee-bps=0', '--slippage-bps=   '],
+    ['--fee-bps', '--slippage-bps=0'], ['--slippage-bps', '--fee-bps=0']
+  ]) {
+    const result = spawnSync(process.execPath, [script.pathname, `--input=${input}`, ...flags], { encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED'/);
+  }
+});
+
+test('scorecard CLI rejects present non-numeric cost strings with the invalid error code', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v1-4d-scorecard-typed-cost-'));
+  const input = path.join(dir, 'input.json');
+  await writeFile(input, JSON.stringify(fixtureRows()));
+  for (const value of ['true', 'false', 'null', 'undefined', 'object', 'NaN', 'Infinity']) {
+    const result = spawnSync(process.execPath, [script.pathname, `--input=${input}`, `--fee-bps=${value}`, '--slippage-bps=0'], { encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /code: 'SCORECARD_COST_ASSUMPTIONS_INVALID'/);
+  }
+});
+
+test('scorecard CLI parses explicit decimal strings while preserving 0/0 and 8/4', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v1-4d-scorecard-numeric-cost-'));
+  const input = path.join(dir, 'input.json');
+  const output = path.join(dir, 'scorecard.json');
+  await writeFile(input, JSON.stringify(fixtureRows()));
+  for (const [fee, slippage] of [['0', '0'], ['8', '4'], [' 8 ', ' 4 ']]) {
+    const result = spawnSync(process.execPath, [
+      script.pathname, `--input=${input}`, `--output=${output}`, `--fee-bps=${fee}`, `--slippage-bps=${slippage}`
+    ], { encoding: 'utf8', env: cleanEnv() });
+    assert.equal(result.status, 0, result.stderr);
+    const scorecard = JSON.parse(await readFile(output, 'utf8'));
+    assert.equal(scorecard.assumptions.feeBps, Number(fee));
+    assert.equal(scorecard.assumptions.slippageBps, Number(slippage));
+  }
+});
+
+test('scorecard CLI rejects negative, NaN and non-finite explicit costs', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'v1-4d-scorecard-invalid-cost-'));
+  const input = path.join(dir, 'input.json');
+  await writeFile(input, JSON.stringify(fixtureRows()));
+  for (const flags of [['--fee-bps=-1', '--slippage-bps=0'], ['--fee-bps=NaN', '--slippage-bps=0'], ['--fee-bps=0', '--slippage-bps=Infinity']]) {
+    const result = spawnSync(process.execPath, [script.pathname, `--input=${input}`, ...flags], { encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /SCORECARD_COST_ASSUMPTIONS_INVALID|finite non-negative/);
+  }
+});
+
+test('formal verify CLI fails closed before execution when either cost parameter is absent', async () => {
+  const verify = new URL('./verify-v1-4d.mjs', import.meta.url);
+  for (const flags of [[], ['--fee-bps=8'], ['--slippage-bps=4']]) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'v1-4d-verify-cost-'));
+    const result = spawnSync(process.execPath, [verify.pathname, '--replay-days=both', ...flags], { cwd, encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(result.status, 0);
+    const report = JSON.parse(await readFile(path.join(cwd, 'v1-4d-verification-report.json'), 'utf8'));
+    assert.equal(report.error.code, 'SCORECARD_COST_ASSUMPTIONS_REQUIRED');
+  }
+});
+
+test('formal verify CLI rejects empty, whitespace and bare cost flags with the required error code', async () => {
+  const verify = new URL('./verify-v1-4d.mjs', import.meta.url);
+  for (const flags of [
+    ['--fee-bps=', '--slippage-bps=0'], ['--fee-bps=0', '--slippage-bps='],
+    ['--fee-bps=   ', '--slippage-bps=0'], ['--fee-bps=0', '--slippage-bps=   '],
+    ['--fee-bps', '--slippage-bps=0'], ['--slippage-bps', '--fee-bps=0']
+  ]) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'v1-4d-verify-required-cost-'));
+    const result = spawnSync(process.execPath, [verify.pathname, '--replay-days=both', ...flags], { cwd, encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(result.status, 0);
+    const report = JSON.parse(await readFile(path.join(cwd, 'v1-4d-verification-report.json'), 'utf8'));
+    assert.equal(report.error.code, 'SCORECARD_COST_ASSUMPTIONS_REQUIRED');
+    assert.deepEqual(report.gates, []);
+  }
+});
+
+test('formal verify CLI rejects present non-numeric cost strings with the invalid error code', async () => {
+  const verify = new URL('./verify-v1-4d.mjs', import.meta.url);
+  for (const value of ['true', 'false', 'null', 'undefined', 'object']) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'v1-4d-verify-typed-cost-'));
+    const result = spawnSync(process.execPath, [verify.pathname, '--replay-days=both', `--fee-bps=${value}`, '--slippage-bps=0'], { cwd, encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(result.status, 0);
+    const report = JSON.parse(await readFile(path.join(cwd, 'v1-4d-verification-report.json'), 'utf8'));
+    assert.equal(report.error.code, 'SCORECARD_COST_ASSUMPTIONS_INVALID');
+    assert.deepEqual(report.gates, []);
+  }
+});
+
+test('formal verify CLI accepts explicit numeric strings for 0/0 and 8/4 before later configuration gates', async () => {
+  const verify = new URL('./verify-v1-4d.mjs', import.meta.url);
+  for (const [fee, slippage] of [['0', '0'], ['8', '4'], [' 8 ', ' 4 ']]) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'v1-4d-verify-numeric-cost-'));
+    const env = cleanEnv();
+    delete env.TEST_DATABASE_URL;
+    const result = spawnSync(process.execPath, [
+      verify.pathname, '--replay-days=both', `--fee-bps=${fee}`, `--slippage-bps=${slippage}`
+    ], { cwd, encoding: 'utf8', env });
+    assert.notEqual(result.status, 0);
+    const report = JSON.parse(await readFile(path.join(cwd, 'v1-4d-verification-report.json'), 'utf8'));
+    assert.equal(report.error.code, 'POSTGRES_CONFIG_MISSING', 'valid numeric costs must pass the cost gate');
+    assert.deepEqual(report.gates, []);
+  }
+});
+
+test('formal verify CLI rejects invalid explicit costs before any verification gate runs', async () => {
+  const verify = new URL('./verify-v1-4d.mjs', import.meta.url);
+  for (const flags of [['--fee-bps=-1', '--slippage-bps=0'], ['--fee-bps=NaN', '--slippage-bps=0'], ['--fee-bps=0', '--slippage-bps=Infinity']]) {
+    const cwd = await mkdtemp(path.join(tmpdir(), 'v1-4d-verify-invalid-cost-'));
+    const result = spawnSync(process.execPath, [verify.pathname, '--replay-days=both', ...flags], { cwd, encoding: 'utf8', env: cleanEnv() });
+    assert.notEqual(result.status, 0);
+    const report = JSON.parse(await readFile(path.join(cwd, 'v1-4d-verification-report.json'), 'utf8'));
+    assert.equal(report.error.code, 'SCORECARD_COST_ASSUMPTIONS_INVALID');
+    assert.deepEqual(report.gates, []);
+  }
 });
 
 test('verification exit-code matrix is strict for PASS/NOT_EVALUABLE/BLOCKED/FAIL', () => {

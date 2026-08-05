@@ -87,10 +87,10 @@ async function seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTim
     [FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, 'v1.4b-schema-1', JSON.stringify({}), sha256({})]
   );
   const featureValues = {
-    closeToEma5: 0, trend4h: 'down', trend1h: 'down', volumeRatio20: 1,
+    closeToEma5: 0, trend4h: 'DOWN', trend1h: 'DOWN', volumeRatio20: 1,
     swingHigh: 1100, swingLow: 900, breakoutState: null, upperWickRatio: 0.1, lowerWickRatio: 0.1,
     distanceToSupportAtr: 5, distanceToResistanceAtr: 5, falseBreakoutRisk: 'NONE',
-    btcTrendState: 'flat', ethBtcRollingCorrelation: 0, logReturn1: 0
+    btcTrendState: 'RANGE', ethBtcRollingCorrelation: 0, logReturn1: 0
   };
   await client.query(
     `INSERT INTO feature_records(
@@ -150,7 +150,7 @@ test('R8.1/R8.2-正常回放：真实生成+评估一个完整节点，前后五
     await backfillInterval({ pool: client, adapter: pathAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: pathStart, endTime: pathStart + 96 * FIFTEEN_MIN_MS, now: () => replayNowMs });
 
     const from = referenceCloseTime - DAY_MS + 1;
-    const to = referenceCloseTime + 2 * DAY_MS;
+    const to = referenceCloseTime + 2 * DAY_MS + 1;
     const datasetVersion = await buildVerifiedManifest(client, { from, to, replayNowMs });
 
     const before = await snapshotProductionTables(client);

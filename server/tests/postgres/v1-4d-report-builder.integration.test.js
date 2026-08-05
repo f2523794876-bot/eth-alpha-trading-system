@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 import { generateReplaySnapshot } from '../../src/validation-replay/replay-generator.js';
 import { evaluateReplayOutcomes } from '../../src/validation-replay/replay-evaluator.js';
-import { buildValidationReports } from '../../src/validation-replay/report-builder.js';
+import { buildValidationReports as buildValidationReportsImpl } from '../../src/validation-replay/report-builder.js';
 import { RESEARCH_AVAILABILITY_RULE_VERSION } from '../../src/validation-replay/research-availability.js';
 import { FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, SOURCE_DATASET_VERSION } from '../../src/features/feature-version.js';
 import { sha256 } from '../../src/domain/hash.js';
@@ -24,6 +24,13 @@ const WEIGHT_VERSION = 'v1.4c-server-weight-1';
 const DATASET_VERSION = 'v1.4d-sha256-' + '22'.repeat(32);
 const RULE_VERSION = 'v1.4c-po-rule-1';
 const EVALUATION_VERSION = 'v1.4c-outcome-evaluation-1';
+
+const passedAuthenticity = () => ({
+  schema_version: 'v1.4d-rerun-authenticity/1', mode: 'resume', expected_count: 1,
+  attempted_count: 1, inserted_count: 1, reused_identical_count: 0,
+  conflict_count: 0, blocked_count: 0, evaluated_count: 1, gate_status: 'PASSED'
+});
+const buildValidationReports = args => buildValidationReportsImpl({ ...args, authenticitySummary: passedAuthenticity() });
 
 function makeMockAdapter({ pages, serverTimeMs }) {
   let call = 0;
@@ -62,10 +69,10 @@ async function seedFeatureRecord(client, { referenceCloseTime, historicalAsOfTim
     [FEATURE_SET_VERSION, FEATURE_ALGORITHM_VERSION, 'v1.4b-schema-1', JSON.stringify({}), sha256({})]
   );
   const featureValues = {
-    closeToEma5: 0, trend4h: 'down', trend1h: 'down', volumeRatio20: 1,
+    closeToEma5: 0, trend4h: 'DOWN', trend1h: 'DOWN', volumeRatio20: 1,
     swingHigh: 1100, swingLow: 900, breakoutState: null, upperWickRatio: 0.1, lowerWickRatio: 0.1,
     distanceToSupportAtr: 5, distanceToResistanceAtr: 5, falseBreakoutRisk: 'NONE',
-    btcTrendState: 'flat', ethBtcRollingCorrelation: 0, logReturn1: 0
+    btcTrendState: 'RANGE', ethBtcRollingCorrelation: 0, logReturn1: 0
   };
   // ON CONFLICT DO NOTHING：P0-1新增测试需要两个不同validation_run在同一referenceCloseTime各自调用
   // seedGeneratedSnapshot（构造"共享同一historicalAsOfTime"的场景），第二次调用对同一
@@ -334,7 +341,7 @@ test('P2-5：runB对runA已生成的快照DEDUPED后，runB的报告必须包含
       historicalAsOfTime: referenceCloseTime, replayNowMs, algorithmVersion: ALGORITHM_VERSION, weightVersion: WEIGHT_VERSION,
       datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
     });
-    assert.equal(genB.status, 'DEDUPED', 'runB必须命中runA已插入的同一条快照(DEDUPED)才是本测试要验证的场景');
+    assert.equal(genB.status, 'REUSED_IDENTICAL', 'runB必须命中runA已插入且Canonical内容完全相同的快照才是本测试场景');
     assert.equal(genB.record.prediction_id, genA.record.predictionId);
 
     await seedFullPath(client, { referenceCloseTime, replayNowMs });
@@ -478,7 +485,7 @@ test('P0-1-D：同一snapshot存在多条generation记录（resume重新处理�
       datasetVersion: DATASET_VERSION, ruleVersion: RULE_VERSION
     });
     assert.equal(first.status, 'INSERTED');
-    assert.equal(second.status, 'DEDUPED');
+    assert.equal(second.status, 'REUSED_IDENTICAL');
     assert.equal(first.record.predictionId, second.record.prediction_id);
     assert.notEqual(first.generationRunId, second.generationRunId, '两次调用必须产生两条独立的generation_run行，这正是本测试要验证"不因此重复计数"的前提');
 

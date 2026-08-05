@@ -15,7 +15,10 @@ import { FEATURE_ALGORITHM_VERSION, FEATURE_SET_VERSION } from '../../src/featur
 import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
 
 const url = process.env.TEST_DATABASE_URL;
-const skip = !isPostgresIntegrationTestAuthorized(url);
+const authorizedDatabaseName = isPostgresIntegrationTestAuthorized(url)
+  ? decodeURIComponent(new URL(url).pathname.slice(1))
+  : null;
+const skip = authorizedDatabaseName === null;
 const migration = name => readFile(new URL(`../../migrations/${name}`, import.meta.url), 'utf8');
 
 async function withTransaction(work) {
@@ -24,7 +27,7 @@ async function withTransaction(work) {
   try {
     await client.query('BEGIN');
     const identity = (await client.query('SELECT current_database() AS database')).rows[0].database;
-    assert.match(identity, /^eth_alpha_v14d_(?:test|round)/);
+    assert.equal(identity, authorizedDatabaseName, '必须连接到公共安全门禁精确授权的测试数据库');
     assert.notEqual(identity, 'eth_alpha');
     await work(client);
   } finally {
@@ -200,7 +203,8 @@ test('R28.12/R28.23 real advisory-lock concurrency and conflict rollback', { ski
   const pool = new Pool({ connectionString: url, max: 4 });
   try {
     const identity = (await pool.query('SELECT current_database() AS database')).rows[0].database;
-    assert.match(identity, /^eth_alpha_v14d_(?:test|round)/);
+    assert.equal(identity, authorizedDatabaseName, '必须连接到公共安全门禁精确授权的测试数据库');
+    assert.notEqual(identity, 'eth_alpha');
     const from = Date.UTC(2024, 0, 1) + (process.pid % 1000) * 86_400_000;
     const to = from + 14_400_000, fixedAsOf = to - 1;
     await seedWindow(pool, from, to);

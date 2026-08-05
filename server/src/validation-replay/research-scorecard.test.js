@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResearchScorecard, classificationMetrics, renderResearchScorecardMarkdown } from './research-scorecard.js';
+import {
+  buildResearchScorecard, classificationMetrics, normalizeResearchCosts,
+  parseResearchCostArgument, renderResearchScorecardMarkdown
+} from './research-scorecard.js';
 import { buildValidationReports } from './report-builder.js';
+import { assertReplayAuthenticity, createReplayAuthenticitySummary, recordGenerationAuthenticity } from './replay-authenticity.js';
 
 test('classificationMetrics calculates three-class macro-F1', () => {
   const rows = [
@@ -54,7 +58,7 @@ test('scorecard is deterministic and reports separate 24H/72H, grouped, path and
 });
 
 test('TRAIN-proportion random baseline derives proportions only from same-horizon TRAIN rows and scores non-TRAIN rows', () => {
-  const scorecard = buildResearchScorecard(completeRows(), { randomSeed: 11 });
+  const scorecard = buildResearchScorecard(completeRows(), { feeBps: 0, slippageBps: 0, randomSeed: 11 });
   const random24 = scorecard.horizons['24h'].baselines.historicalProportionRandom;
   assert.equal(random24.status, 'EVALUATED');
   assert.equal(random24.trainingSampleCount, 2);
@@ -90,7 +94,7 @@ test('maximum drawdown, consecutive classification errors and consecutive net lo
 });
 
 test('scorecard does not invent ActionPermission when absent', () => {
-  const scorecard = buildResearchScorecard([{ actualDirection: 'UP', predictedDirection: 'UP', actualReturn: .01 }]);
+  const scorecard = buildResearchScorecard([{ actualDirection: 'UP', predictedDirection: 'UP', actualReturn: .01 }], { feeBps: 0, slippageBps: 0 });
   assert.equal(scorecard.byActionPermission.status, 'NOT_EVALUABLE');
   assert.deepEqual(scorecard.byActionPermission.groups, {});
   assert.match(scorecard.disclosures.actionPermission, /NOT_EVALUABLE/);
@@ -100,13 +104,13 @@ test('scorecard does not invent ActionPermission when absent', () => {
 test('ActionPermission grouping accepts only DISPLAY_ONLY/AUDIT_ONLY research labels', () => {
   const rows = completeRows();
   rows.push({ actualDirection: 'UP', predictedDirection: 'UP', actualReturn: .01, horizon: '24h', actionPermission: 'ALLOW' });
-  const scorecard = buildResearchScorecard(rows);
+  const scorecard = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0 });
   assert.deepEqual(Object.keys(scorecard.byActionPermission.groups).sort(), ['AUDIT_ONLY', 'DISPLAY_ONLY']);
   assert.equal(scorecard.dataQuality.invalidActionPermissionCount, 1);
 });
 
 test('empty or unusable history is explicitly NOT_EVALUABLE and never emits fabricated zero performance', () => {
-  const empty = buildResearchScorecard([]);
+  const empty = buildResearchScorecard([], { feeBps: 0, slippageBps: 0 });
   assert.equal(empty.status, 'NOT_EVALUABLE');
   assert.equal(empty.system.status, 'NOT_EVALUABLE');
   assert.equal(empty.horizons['24h'].status, 'NOT_EVALUABLE');
@@ -115,7 +119,7 @@ test('empty or unusable history is explicitly NOT_EVALUABLE and never emits fabr
 });
 
 test('Markdown report contains horizon, baseline, data-quality and explicit NOT_EVALUABLE disclosures', () => {
-  const markdown = renderResearchScorecardMarkdown(buildResearchScorecard(completeRows()));
+  const markdown = renderResearchScorecardMarkdown(buildResearchScorecard(completeRows(), { feeBps: 0, slippageBps: 0 }));
   assert.match(markdown, /24H \/ 72H system results/);
   assert.match(markdown, /Always RANGE/);
   assert.match(markdown, /TRAIN-proportion random/);
@@ -124,9 +128,47 @@ test('Markdown report contains horizon, baseline, data-quality and explicit NOT_
   assert.doesNotMatch(markdown, /undefined/);
 });
 
-test('invalid costs fail closed instead of producing NaN scorecard values', () => {
-  assert.throws(() => buildResearchScorecard(completeRows(), { feeBps: -1 }), /finite non-negative/);
-  assert.throws(() => buildResearchScorecard(completeRows(), { slippageBps: Number.NaN }), /finite non-negative/);
+test('missing and empty costs fail closed with the required error code', () => {
+  for (const options of [
+    {}, { feeBps: 1 }, { slippageBps: 1 },
+    { feeBps: undefined, slippageBps: 0 }, { feeBps: 0, slippageBps: undefined },
+    { feeBps: null, slippageBps: 0 }, { feeBps: 0, slippageBps: null },
+    { feeBps: '', slippageBps: 0 }, { feeBps: 0, slippageBps: '' },
+    { feeBps: '   ', slippageBps: 0 }, { feeBps: 0, slippageBps: '\t' }
+  ]) {
+    assert.throws(() => buildResearchScorecard(completeRows(), options), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_REQUIRED');
+  }
+});
+
+test('normalizer and builder reject every non-number cost type without coercion', () => {
+  for (const options of [
+    { feeBps: -1, slippageBps: 0 }, { feeBps: 0, slippageBps: -1 },
+    { feeBps: Number.NaN, slippageBps: 0 }, { feeBps: 0, slippageBps: Number.POSITIVE_INFINITY },
+    { feeBps: true, slippageBps: 0 }, { feeBps: false, slippageBps: 0 },
+    { feeBps: 0, slippageBps: true }, { feeBps: 0, slippageBps: false },
+    { feeBps: '8', slippageBps: 4 }, { feeBps: 8, slippageBps: '4' },
+    { feeBps: {}, slippageBps: 0 }, { feeBps: 0, slippageBps: [] }
+  ]) {
+    assert.throws(() => normalizeResearchCosts(options), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_INVALID');
+    assert.throws(() => buildResearchScorecard(completeRows(), options), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_INVALID');
+  }
+});
+
+test('CLI cost parser distinguishes missing values from invalid values and accepts decimal strings', () => {
+  for (const value of [undefined, null, '', '   ', true]) {
+    assert.throws(() => parseResearchCostArgument(value, 'feeBps'), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_REQUIRED');
+  }
+  for (const value of [false, 0, {}, [], 'true', 'false', 'null', 'undefined', 'NaN', 'Infinity', '-1', 'not-a-number']) {
+    assert.throws(() => parseResearchCostArgument(value, 'feeBps'), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_INVALID');
+  }
+  assert.equal(parseResearchCostArgument('0', 'feeBps'), 0);
+  assert.equal(parseResearchCostArgument(' 8 ', 'feeBps'), 8);
+  assert.equal(parseResearchCostArgument('4.5', 'slippageBps'), 4.5);
+});
+
+test('explicit numeric 0/0 and 8/4 remain valid at the bottom-level contract', () => {
+  assert.deepEqual(normalizeResearchCosts({ feeBps: 0, slippageBps: 0 }), { feeBps: 0, slippageBps: 0, totalBps: 0 });
+  assert.deepEqual(normalizeResearchCosts({ feeBps: 8, slippageBps: 4 }), { feeBps: 8, slippageBps: 4, totalBps: 12 });
 });
 
 function statisticalRow({ id, horizon = '24h', start, end, split = 'TEST' }) {
@@ -153,7 +195,7 @@ test('scorecard uses frozen boundary semantics and purges samples ending exactly
     statisticalRow({ id: 'at-validation-end', start: 150, end: 200 }),
     statisticalRow({ id: 'test', start: 200, end: 250 })
   ];
-  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  const horizon = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0, trainEnd: 100, validationEnd: 200 }).horizons['24h'];
   assert.equal(horizon.rawSampleCount, 5);
   assert.equal(horizon.prePurgeEffectiveSampleCount, 5);
   assert.equal(horizon.purgedStraddlingCount, 2);
@@ -170,7 +212,7 @@ test('TRAIN→VALIDATION and VALIDATION→TEST straddlers are removed before seg
     statisticalRow({ id: 'train-validation', start: 90, end: 110 }),
     statisticalRow({ id: 'validation-test', start: 190, end: 210 })
   ];
-  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  const horizon = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0, trainEnd: 100, validationEnd: 200 }).horizons['24h'];
   assert.equal(horizon.rawSampleCount, 2);
   assert.equal(horizon.prePurgeEffectiveSampleCount, 2);
   assert.equal(horizon.purgedStraddlingCount, 2);
@@ -187,7 +229,7 @@ test('overlap removal reports independent raw/effective counts for 24H and 72H',
     statisticalRow({ id: '72-a', horizon: '72h', start: 1000, end: 1300 }),
     statisticalRow({ id: '72-b', horizon: '72h', start: 1010, end: 1310 })
   ];
-  const scorecard = buildResearchScorecard(rows);
+  const scorecard = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0 });
   assert.equal(scorecard.horizons['24h'].rawSampleCount, 2);
   assert.equal(scorecard.horizons['24h'].effectiveSampleCount, 1);
   assert.equal(scorecard.horizons['72h'].rawSampleCount, 2);
@@ -201,7 +243,7 @@ test('non-overlapping samples preserve raw=effective and empty TRAIN remains exp
     statisticalRow({ id: 'validation', start: 100, end: 150 }),
     statisticalRow({ id: 'test', start: 200, end: 250 })
   ];
-  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  const horizon = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0, trainEnd: 100, validationEnd: 200 }).horizons['24h'];
   assert.equal(horizon.rawSampleCount, 2);
   assert.equal(horizon.effectiveSampleCount, 2);
   assert.deepEqual(horizon.segments.TRAIN, { rawSampleCount: 0, effectiveSampleCount: 0 });
@@ -213,7 +255,7 @@ test('purge can leave a segment empty without fabricating segment performance', 
     statisticalRow({ id: 'crossing-only', start: 90, end: 110 }),
     statisticalRow({ id: 'test', start: 200, end: 250 })
   ];
-  const horizon = buildResearchScorecard(rows, { trainEnd: 100, validationEnd: 200 }).horizons['24h'];
+  const horizon = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0, trainEnd: 100, validationEnd: 200 }).horizons['24h'];
   assert.equal(horizon.purgedStraddlingCount, 1);
   assert.deepEqual(horizon.segments.VALIDATION, { rawSampleCount: 1, effectiveSampleCount: 0 });
 });
@@ -239,7 +281,7 @@ function independentEligibilityRows() {
 }
 
 test('direction and path pipelines retain opposite eligibility cases with independent denominators', () => {
-  const scorecard = buildResearchScorecard(independentEligibilityRows());
+  const scorecard = buildResearchScorecard(independentEligibilityRows(), { feeBps: 0, slippageBps: 0 });
   const horizon = scorecard.horizons['24h'];
   assert.equal(horizon.directionSampleCounts.rawSampleCount, 2);
   assert.equal(horizon.directionSampleCounts.effectiveSampleCount, 2);
@@ -255,6 +297,7 @@ test('research scorecard and report-builder expose the same independent directio
   const inserted = [];
   const pool = {
     async query(sql, params = []) {
+      if (sql.includes('SELECT status FROM historical_validation.validation_runs')) return { rowCount: 1, rows: [{ status: 'RUNNING' }] };
       if (sql.includes('SELECT s.prediction_id')) {
         const horizon = params[1];
         return { rows: horizon === '24h' ? rows.map(row => ({
@@ -284,6 +327,9 @@ test('research scorecard and report-builder expose the same independent directio
       throw new Error(`Unexpected SQL in report-builder parity test: ${sql}`);
     }
   };
+  const authenticitySummary = createReplayAuthenticitySummary({ mode: 'resume', expectedCount: 1 });
+  recordGenerationAuthenticity(authenticitySummary, 'INSERTED');
+  assertReplayAuthenticity(authenticitySummary);
   const reports = await buildValidationReports({
     pool,
     validationRunId: '00000000-0000-0000-0000-000000000001',
@@ -291,11 +337,11 @@ test('research scorecard and report-builder expose the same independent directio
     algorithmVersion: 'test-algorithm',
     ruleVersion: 'test-rule',
     researchAvailabilityRuleVersion: 'test-availability',
-    evaluationVersion: 'test-evaluation'
+    evaluationVersion: 'test-evaluation', authenticitySummary
   });
   assert.equal(inserted.length, 2);
   const report = reports.find(value => value.horizon === '24h' && value.reportScope === 'ALL');
-  const horizon = buildResearchScorecard(rows).horizons['24h'];
+  const horizon = buildResearchScorecard(rows, { feeBps: 0, slippageBps: 0 }).horizons['24h'];
   assert.equal(horizon.directionSampleCounts.rawSampleCount, report.directionRawSampleCount);
   assert.equal(horizon.directionSampleCounts.effectiveSampleCount, report.directionEffectiveSampleCount);
   assert.equal(horizon.pathSampleCounts.rawSampleCount, report.pathRawSampleCount);

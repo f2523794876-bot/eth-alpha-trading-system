@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import pg from 'pg';
 import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
 import { main } from '../../scripts/v1-4d-manifest-inventory.mjs';
-import { DATABASE_FAILURE_EXIT_CODE, RESEARCH_DATABASE_NAME } from '../../src/db/research-database-guard.js';
+import { DATABASE_FAILURE_EXIT_CODE } from '../../src/db/research-database-guard.js';
 
 const TEST_DATABASE_URL = process.env.TEST_DATABASE_URL;
 const skip = !isPostgresIntegrationTestAuthorized(TEST_DATABASE_URL);
@@ -35,11 +35,12 @@ pgtest('inventory CLI passes both explicit and connected identities before runni
 
 pgtest('inventory CLI rejects a real PostgreSQL target mismatch before transaction or inventory SQL', async () => {
   const declaredUrl = new URL(TEST_DATABASE_URL);
-  assert.equal(declaredUrl.pathname.slice(1), RESEARCH_DATABASE_NAME);
+  const declaredDatabaseName = decodeURIComponent(declaredUrl.pathname.slice(1));
+  assert.ok(declaredDatabaseName);
 
   const mismatchUrl = new URL(TEST_DATABASE_URL);
   mismatchUrl.pathname = '/postgres';
-  assert.notEqual(mismatchUrl.pathname.slice(1), RESEARCH_DATABASE_NAME);
+  assert.notEqual(mismatchUrl.pathname.slice(1), declaredDatabaseName);
 
   const observed = {
     poolQueries: [],

@@ -27,6 +27,7 @@ import {
 } from '../forecast/forecast-contract.js';
 import { FEATURE_ALGORITHM_VERSION, FEATURE_SET_VERSION } from '../features/feature-version.js';
 import { buildResearchDataVintage, RESEARCH_AVAILABILITY_RULE_VERSION } from './research-availability.js';
+import { assertReplaySnapshotIdentity } from './replay-authenticity.js';
 
 const AUXILIARY_EVIDENCE_FIELDS = ['fundingRate', 'fundingRateZScore', 'openInterest', 'openInterestChange', 'openInterestChangeRatio', 'longShortRatio', 'longShortRatioZScore', 'takerBuySellRatio', 'derivativesAvailability'];
 // generator-service.js 同名常量/函数是模块私有（未导出），本模块独立复制这两个纯辅助——不改变任何判定逻辑，
@@ -163,9 +164,15 @@ export async function generateReplaySnapshot({
   const auditRecords = [...located.auditRecords, ...atr.auditRecords, ...breakoutCount.auditRecords, ...breakdownCount.auditRecords];
   const researchDataVintage = buildResearchDataVintage({ auditRecords, backfillBatchIds, asOfTime: historicalAsOfTime });
   const primaryBackfillBatchId = backfillBatchIds[0] ?? null;
+  const candidateRecord = {
+    ...snapshotInput, predictionId, contentHash, backfillBatchId: primaryBackfillBatchId, ruleVersion,
+    historicalAsOfTime, researchDataVintage,
+    researchAvailabilityRuleVersion: RESEARCH_AVAILABILITY_RULE_VERSION,
+    sourceOrigin: 'HISTORICAL_REPLAY', brierScoreComponent: null
+  };
 
   if (dryRun) {
-    return { status: 'PLANNED', record: { ...snapshotInput, predictionId, contentHash }, generationRunId };
+    return { status: 'PLANNED', record: candidateRecord, generationRunId };
   }
 
   const insertResult = await pool.query(
@@ -203,10 +210,24 @@ export async function generateReplaySnapshot({
       'SELECT * FROM historical_validation.replay_snapshots WHERE prediction_id=$1 AND research_availability_rule_version=$2',
       [predictionId, RESEARCH_AVAILABILITY_RULE_VERSION]
     );
+    if (existing.rowCount !== 1) {
+      const error = Object.assign(new Error(`Replay snapshot conflict row could not be loaded: ${predictionId}`), {
+        code: 'REPLAY_SNAPSHOT_CONFLICT_ROW_MISSING', predictionId
+      });
+      await recordGenerationRun(pool, { generationRunId, validationRunId, instrument, horizon, historicalAsOfTime, status: 'FAILED', errorCode: error.code, startedAt, finishedAt: now() });
+      throw error;
+    }
+    let comparison;
+    try {
+      comparison = assertReplaySnapshotIdentity(existing.rows[0], candidateRecord);
+    } catch (error) {
+      await recordGenerationRun(pool, { generationRunId, validationRunId, instrument, horizon, historicalAsOfTime, status: 'FAILED', errorCode: error.code, startedAt, finishedAt: now() });
+      throw error;
+    }
     await recordGenerationRun(pool, { generationRunId, validationRunId, instrument, horizon, historicalAsOfTime, status: 'SUCCEEDED', dedupedCount: 1, startedAt, finishedAt: now() });
-    return { status: 'DEDUPED', record: existing.rows[0], generationRunId };
+    return { status: 'REUSED_IDENTICAL', record: existing.rows[0], generationRunId, comparison };
   }
 
   await recordGenerationRun(pool, { generationRunId, validationRunId, instrument, horizon, historicalAsOfTime, status: 'SUCCEEDED', generatedCount: 1, startedAt, finishedAt: now() });
-  return { status: 'INSERTED', record: { ...snapshotInput, predictionId, contentHash }, generationRunId };
+  return { status: 'INSERTED', record: candidateRecord, generationRunId };
 }

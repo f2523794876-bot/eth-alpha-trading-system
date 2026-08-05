@@ -82,6 +82,7 @@ test('P0-2：dry-run显式内存快照通道在到期后执行真实locator/outc
   });
   assert.equal(queries.length, 3, '必须执行pending扫描、reference定位和完整path读取');
   assert.ok(queries.every(sql => /^\s*SELECT\b/.test(sql)), 'dry-run不得发出INSERT/UPDATE/DELETE');
+  assert.match(queries[0], /g\.validation_run_id=\$4/, 'persisted pending扫描必须绑定当前validation_run，不能评估其他run的旧Snapshot');
 });
 
 test('P0-2：非dry-run拒绝内存快照通道，保持持久化生产语义不变', async () => {

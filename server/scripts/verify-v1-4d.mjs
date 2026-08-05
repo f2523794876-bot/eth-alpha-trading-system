@@ -5,6 +5,7 @@ import {
   classifyReplayFailure, deriveVerificationStatus, exitCodeForStatus,
   extractChildErrorCode, redactSensitiveText
 } from './v1-4d-verification-contract.mjs';
+import { parseResearchCostArgument } from '../src/validation-replay/research-scorecard.js';
 
 const FROZEN_REF = 'dc6e573cdbc5aece7b932ab1cbbbe3daa3623437';
 const FROZEN_DOCS = Object.freeze([
@@ -21,10 +22,21 @@ const valueArg = name => {
   const index = argv.indexOf(`--${name}`);
   return index >= 0 ? argv[index + 1] : undefined;
 };
+const costValueArg = name => {
+  const inline = argv.find(value => value.startsWith(`--${name}=`));
+  if (inline) return inline.slice(name.length + 3);
+  const index = argv.indexOf(`--${name}`);
+  if (index < 0) return undefined;
+  const next = argv[index + 1];
+  return next == null || next.startsWith('--') ? true : next;
+};
 const hasArg = name => argv.includes(`--${name}`);
 const replayDays = parseReplayDays(valueArg('replay-days'));
 const replayTo = valueArg('replay-to');
 const mode = hasArg('lightweight') ? 'OFFLINE_LIGHTWEIGHT' : 'FULL';
+const feeBpsArg = costValueArg('fee-bps');
+const slippageBpsArg = costValueArg('slippage-bps');
+let formalCosts = null;
 if (replayTo != null) computeReplayWindow({ days: 7, replayTo });
 
 const startedAt = new Date().toISOString();
@@ -86,7 +98,8 @@ function replayArgs(days) {
     '--dataset-version', process.env.V14D_DATASET_VERSION,
     '--rule-version', process.env.V14D_RULE_VERSION,
     '--weight-version', process.env.V14D_WEIGHT_VERSION,
-    '--evaluation-version', process.env.V14D_EVALUATION_VERSION
+    '--evaluation-version', process.env.V14D_EVALUATION_VERSION,
+    '--authenticity-mode', 'fresh'
   ];
 }
 
@@ -122,6 +135,17 @@ try {
     throw Object.assign(new Error('Full V1.4D verification requires --replay-days=both'), {
       code: 'FULL_REPLAY_PLAN_REQUIRED', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
     });
+  }
+  if (mode === 'FULL') {
+    try {
+      formalCosts = {
+        feeBps: parseResearchCostArgument(feeBpsArg, 'feeBps'),
+        slippageBps: parseResearchCostArgument(slippageBpsArg, 'slippageBps')
+      };
+    } catch (error) {
+      Object.assign(error, { classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED' });
+      throw error;
+    }
   }
   if (mode === 'FULL' && hasArg('offline-only')) {
     throw Object.assign(new Error('--offline-only is valid only with --lightweight; full verification cannot omit PostgreSQL'), {
@@ -176,7 +200,7 @@ try {
         'scripts/v1-4d-scorecard-cli.mjs', `--validation-run-id=${validationRunId}`,
         `--evaluation-version=${process.env.V14D_EVALUATION_VERSION}`,
         `--output=${scorecardJson}`, `--markdown-output=${scorecardMarkdown}`,
-        `--fee-bps=${valueArg('fee-bps') || 8}`, `--slippage-bps=${valueArg('slippage-bps') || 4}`,
+        `--fee-bps=${formalCosts.feeBps}`, `--slippage-bps=${formalCosts.slippageBps}`,
         `--seed=${valueArg('seed') || 1404}`
       ], { env: { V14D_REPLAY_DATABASE_URL: process.env.V14D_REPLAY_DATABASE_URL } });
       const scorecard = JSON.parse(await readFile(scorecardJson, 'utf8'));

@@ -1,6 +1,15 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { Pool } from 'pg';
-import { buildResearchScorecard, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
+import { buildResearchScorecard, normalizeResearchCosts, parseResearchCostArgument, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
+import { createGuardedResearchPgPool } from '../src/db/research-database-guard.js';
+import { canonicalTrendOrNull } from '../src/domain/trend.js';
+import { assertScorecardRunAuthenticity } from '../src/validation-replay/replay-authenticity.js';
+
+// V1.4D unified fix: this CLI previously connected with a bare `new Pool()`, bypassing the
+// declared-name + post-connect current_database() protection every other Phase 2/4/4.5/5 CLI
+// gets via createGuardedResearchPgPool(). It still reads only V14D_REPLAY_DATABASE_URL (generic
+// DATABASE_URL remains intentionally ignored — unchanged, tested contract), but the connection
+// itself now goes through the same fail-closed guard as the rest of the pipeline.
 
 function parseArgs(argv) {
   const parsed = {};
@@ -20,9 +29,15 @@ function markdownPathFor(jsonPath) {
 }
 
 const args = parseArgs(process.argv.slice(2));
+const costOptions = normalizeResearchCosts({
+  feeBps: parseResearchCostArgument(args['fee-bps'], 'feeBps'),
+  slippageBps: parseResearchCostArgument(args['slippage-bps'], 'slippageBps')
+});
+console.error(`cost_assumption explicit ${JSON.stringify({ feeBps: costOptions.feeBps, slippageBps: costOptions.slippageBps })}`);
 const output = args.output || 'v1-4d-research-scorecard.json';
 const markdownOutput = args['markdown-output'] || markdownPathFor(output);
 let rows;
+let rerunAuthenticity = null;
 if (args.input) {
   const payload = JSON.parse(await readFile(args.input, 'utf8'));
   rows = Array.isArray(payload) ? payload : payload.rows;
@@ -31,8 +46,25 @@ if (args.input) {
   const databaseUrl = process.env.V14D_REPLAY_DATABASE_URL;
   if (!databaseUrl) throw Object.assign(new Error('V14D_REPLAY_DATABASE_URL is required with --validation-run-id; generic DATABASE_URL is intentionally ignored'), { code: 'REPLAY_DATABASE_URL_MISSING' });
   if (!args['evaluation-version']) throw new Error('--evaluation-version is required with --validation-run-id');
-  const pool = new Pool({ connectionString: databaseUrl, max: 2 });
+  const pool = await createGuardedResearchPgPool(
+    { databaseUrl, dbSsl: false },
+    { createPgPool: async config => new Pool({ connectionString: config.databaseUrl, max: 2 }) }
+  );
   try {
+    const runResult = await pool.query(
+      `SELECT status, horizons FROM historical_validation.validation_runs WHERE validation_run_id=$1`,
+      [args['validation-run-id']]
+    );
+    const reportResult = await pool.query(
+      `SELECT horizon, report_scope AS "reportScope", formal_proxy_disclosure AS "formalProxyDisclosure"
+       FROM historical_validation.validation_reports WHERE validation_run_id=$1`,
+      [args['validation-run-id']]
+    );
+    rerunAuthenticity = assertScorecardRunAuthenticity({
+      runStatus: runResult.rows[0]?.status,
+      horizons: runResult.rows[0]?.horizons,
+      reportRows: reportResult.rows
+    });
     const result = await pool.query(
       `SELECT s.prediction_id AS "predictionId", s.horizon, s.expected_direction AS "predictedDirection", s.feature_values_used AS "featureValuesUsed",
               s.proxy_state_at_generation AS "proxyStateAtGeneration", s.target_start_time AS "targetStartTime",
@@ -67,7 +99,7 @@ if (args.input) {
         actualReturn: row.actualReturn == null ? null : Number(row.actualReturn),
         mfe: row.mfe == null ? null : Number(row.mfe),
         mae: row.mae == null ? null : Number(row.mae),
-        trend4hDirection: trend === 'up' ? 'UP' : trend === 'down' ? 'DOWN' : trend === 'flat' ? 'RANGE' : null,
+        trend4hDirection: canonicalTrendOrNull(trend),
         proxyStateAtGeneration: row.proxyStateAtGeneration ?? null,
         marketRegime: row.featureValuesUsed?.marketRegime ?? null,
         trainEnd: row.trainEnd,
@@ -86,20 +118,14 @@ if (args.input) {
   throw new Error('--input=<JSON file> or --validation-run-id=<UUID> is required');
 }
 
-if (args['round-trip-cost-bps'] != null && (args['fee-bps'] != null || args['slippage-bps'] != null)) {
-  throw new Error('--round-trip-cost-bps cannot be combined with --fee-bps or --slippage-bps');
-}
-const costOptions = args['round-trip-cost-bps'] != null
-  ? { roundTripCostBps: Number(args['round-trip-cost-bps']) }
-  : { feeBps: args['fee-bps'] == null ? 8 : Number(args['fee-bps']), slippageBps: args['slippage-bps'] == null ? 4 : Number(args['slippage-bps']) };
 const trainEnd = rows.find(row => row.trainEnd != null)?.trainEnd ?? null;
 const validationEnd = rows.find(row => row.validationEnd != null)?.validationEnd ?? null;
-const scorecard = buildResearchScorecard(rows, {
+const scorecard = { ...buildResearchScorecard(rows, {
   ...costOptions,
   randomSeed: args.seed == null ? 1404 : Number(args.seed),
   trainEnd,
   validationEnd
-});
+}), rerunAuthenticity };
 await writeFile(output, `${JSON.stringify(scorecard, null, 2)}\n`);
 await writeFile(markdownOutput, renderResearchScorecardMarkdown(scorecard));
 console.log(`research_scorecard_status ${scorecard.status}`);

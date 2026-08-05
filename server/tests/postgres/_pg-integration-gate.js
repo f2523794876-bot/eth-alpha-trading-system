@@ -7,14 +7,14 @@
 // 恰好已经配置了TEST_DATABASE_URL，就会静默把这些测试当成普通单元测试执行。
 //
 // 因此这里新增一个独立于TEST_DATABASE_URL是否存在的第二重开关：ALLOW_POSTGRES_INTEGRATION_TESTS
-// 必须精确等于字符串'1'。两个条件（开关+URL）以及URL声明的库名必须精确等于
-// research-database-guard.js里唯一被生产CLI认可的RESEARCH_DATABASE_NAME，三者同时满足才视为已授权；
+// 必须精确等于字符串'1'。固定研究库仍需开关；固定CI库还必须满足NODE_ENV=test、test身份，
+// 并由research-database-guard.js的同一套不可覆盖目标规则授权；
 // 任一条件不满足都必须回退到"未授权"，与"TEST_DATABASE_URL完全缺失"等价（即skip，不建连、不查询、
 // 不执行migration/fixture写入）。
 //
 // 本模块只做布尔判定，不创建任何数据库连接、不导入pg/postgres相关模块，本身可以被安全地
 // import到任何测试文件（包括不希望连接真实数据库的静态/mock测试）里做验证。
-import { RESEARCH_DATABASE_NAME } from '../../src/db/research-database-guard.js';
+import { parseResearchDatabaseTarget } from '../../src/db/research-database-guard.js';
 
 export const ALLOW_POSTGRES_INTEGRATION_TESTS_ENV = 'ALLOW_POSTGRES_INTEGRATION_TESTS';
 
@@ -31,11 +31,10 @@ export function isPostgresIntegrationTestsSwitchOn(env = process.env) {
 export function isPostgresIntegrationTestAuthorized(rawUrl, env = process.env) {
   if (!isPostgresIntegrationTestsSwitchOn(env)) return false;
   if (!rawUrl) return false;
-  let declaredDatabaseName;
   try {
-    declaredDatabaseName = new URL(rawUrl).pathname.slice(1);
+    parseResearchDatabaseTarget(rawUrl, env);
+    return true;
   } catch {
     return false;
   }
-  return declaredDatabaseName === RESEARCH_DATABASE_NAME;
 }

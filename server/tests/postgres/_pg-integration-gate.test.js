@@ -16,9 +16,24 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const VALID_TEST_DB_URL = 'postgresql://eth_alpha_test:secret@127.0.0.1:5432/eth_alpha_v14d_test';
+const VALID_CI_DB_URL = 'postgresql://eth_alpha_test:secret@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci';
 
 test('ALLOW_POSTGRES_INTEGRATION_TESTS_ENV 精确等于约定的环境变量名', () => {
   assert.equal(ALLOW_POSTGRES_INTEGRATION_TESTS_ENV, 'ALLOW_POSTGRES_INTEGRATION_TESTS');
+});
+
+test('isPostgresIntegrationTestAuthorized：固定CI库要求NODE_ENV、开关和test身份全部满足，且环境覆盖不能授权生产库', () => {
+  const valid = { NODE_ENV: 'test', ALLOW_POSTGRES_INTEGRATION_TESTS: '1', V14D_DATABASE_IDENTITY: 'test' };
+  assert.equal(isPostgresIntegrationTestAuthorized(VALID_CI_DB_URL, valid), true);
+  for (const missing of ['NODE_ENV', 'ALLOW_POSTGRES_INTEGRATION_TESTS', 'V14D_DATABASE_IDENTITY']) {
+    const env = { ...valid };
+    delete env[missing];
+    assert.equal(isPostgresIntegrationTestAuthorized(VALID_CI_DB_URL, env), false, missing);
+  }
+  assert.equal(isPostgresIntegrationTestAuthorized(
+    'postgresql://u:p@localhost:5432/eth_alpha',
+    { ...valid, V14D_RESEARCH_DATABASE_NAME: 'eth_alpha' }
+  ), false);
 });
 
 test('isPostgresIntegrationTestsSwitchOn：只有精确等于字符串"1"才算开启，"true"/"01"/未设置/其他任何值都不算', () => {

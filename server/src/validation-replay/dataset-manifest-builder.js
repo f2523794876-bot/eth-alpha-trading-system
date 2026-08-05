@@ -12,6 +12,7 @@ import { checkIntegrity, toManifestIntegrityCheckResult } from '../backfill/inte
 import { buildCanonicalManifestContent, computeDatasetVersion } from './canonical-manifest-content.js';
 import { canonicalJsonHash } from '../domain/hash.js';
 import { buildDatasetManifestV2, canonicalV2LogicalWindow, computeV2ManifestContentForRange } from './dataset-manifest-v2.js';
+import { Pool } from 'pg';
 
 export { canonicalV2LogicalWindow, computeV2ManifestContentForRange };
 
@@ -142,7 +143,7 @@ export async function computeManifestContentForRange({ pool, symbol, intervals, 
   return { ...built, perIntervalRecordCount, datasetVersion, fixedAsOf, groupStatistics };
 }
 
-async function persistGovernedManifest(pool, { datasetVersion, contentObject, symbol, sortedIntervals, from, to, fixedAsOf, backfillBatchIds, recordCount, perIntervalRecordCount, manifestMembers, logicalWindowHash }) {
+export async function persistGovernedManifest(pool, { datasetVersion, contentObject, symbol, sortedIntervals, from, to, fixedAsOf, backfillBatchIds, recordCount, perIntervalRecordCount, manifestMembers, logicalWindowHash }) {
   const execute = async client => {
     await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`dataset-manifest:${logicalWindowHash}`]);
     const existing = await client.query(
@@ -170,7 +171,10 @@ async function persistGovernedManifest(pool, { datasetVersion, contentObject, sy
     }
     return inserted.rowCount > 0;
   };
-  if (typeof pool.connect !== 'function') return execute(pool);
+  // 只有真正的pg.Pool才由本函数取得/释放连接并管理本地事务。PoolClient、已连接Client及调用方事务内
+  // query executor都可能暴露connect()，不能再以“存在connect函数”作为Pool判据；这些对象必须直接
+  // 复用，由调用方独占BEGIN/COMMIT/ROLLBACK/release责任。
+  if (!(pool instanceof Pool)) return execute(pool);
   const client = await pool.connect();
   try { await client.query('BEGIN'); const inserted = await execute(client); await client.query('COMMIT'); return inserted; }
   catch (error) { await client.query('ROLLBACK'); throw error; }

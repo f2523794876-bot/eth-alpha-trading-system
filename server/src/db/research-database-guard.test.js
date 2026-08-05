@@ -3,8 +3,9 @@
 // 也不会泄漏未关闭的连接池。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
-  RESEARCH_DATABASE_NAME, parseResearchDatabaseTarget, createGuardedResearchPgPool,
+  RESEARCH_DATABASE_NAME, DEFAULT_RESEARCH_DATABASE_NAME, CI_RESEARCH_DATABASE_NAME, parseResearchDatabaseTarget, createGuardedResearchPgPool,
   DATABASE_FAILURE_EXIT_CODE, isDatabaseGuardErrorCode, exitCodeForCliError,
   ALLOWED_RESEARCH_DATABASE_IDENTITIES, assertExplicitResearchDatabaseIdentity,
   RESEARCH_DATABASE_IDENTITY_ENV
@@ -25,8 +26,86 @@ function fakePool({ queryImpl } = {}) {
   };
 }
 
-test('RESEARCH_DATABASE_NAME 精确等于 eth_alpha_v14d_test', () => {
+test('RESEARCH_DATABASE_NAME 精确等于 eth_alpha_v14d_test（V14D_RESEARCH_DATABASE_NAME未设置时的默认行为，不变）', () => {
   assert.equal(RESEARCH_DATABASE_NAME, 'eth_alpha_v14d_test');
+  assert.equal(DEFAULT_RESEARCH_DATABASE_NAME, 'eth_alpha_v14d_test');
+});
+
+test('V14D_RESEARCH_DATABASE_NAME不能覆盖固定安全目标，尤其不能把生产eth_alpha变成研究库', () => {
+  const probe = code => spawnSync(process.execPath, ['--input-type=module', '--eval', code], { encoding: 'utf8' });
+
+  const overridden = probe(`
+    process.env.V14D_RESEARCH_DATABASE_NAME = 'eth_alpha';
+    const { RESEARCH_DATABASE_NAME, parseResearchDatabaseTarget } = await import(${JSON.stringify(new URL('./research-database-guard.js', import.meta.url).href)});
+    console.log(RESEARCH_DATABASE_NAME);
+    try { parseResearchDatabaseTarget('postgres://u:p@127.0.0.1/eth_alpha'); console.log('ACCEPTED_PRODUCTION'); } catch { console.log('REJECTED_PRODUCTION'); }
+    try { parseResearchDatabaseTarget('postgres://u:p@127.0.0.1/eth_alpha_v14d_test'); console.log('ACCEPTED_FIXED_NAME'); } catch { console.log('REJECTED_FIXED_NAME'); }
+  `);
+  assert.equal(overridden.status, 0, overridden.stderr);
+  const overriddenLines = overridden.stdout.trim().split('\n');
+  assert.equal(overriddenLines[0], 'eth_alpha_v14d_test');
+  assert.equal(overriddenLines[1], 'REJECTED_PRODUCTION');
+  assert.equal(overriddenLines[2], 'ACCEPTED_FIXED_NAME');
+
+  const unset = probe(`
+    delete process.env.V14D_RESEARCH_DATABASE_NAME;
+    const { RESEARCH_DATABASE_NAME } = await import(${JSON.stringify(new URL('./research-database-guard.js', import.meta.url).href)});
+    console.log(RESEARCH_DATABASE_NAME);
+  `);
+  assert.equal(unset.status, 0, unset.stderr);
+  assert.equal(unset.stdout.trim(), 'eth_alpha_v14d_test');
+});
+
+test('CI例外仅接受固定真实性库名且要求四项条件同时成立', () => {
+  const url = `postgresql://u:p@localhost:5432/${CI_RESEARCH_DATABASE_NAME}`;
+  const valid = { NODE_ENV: 'test', ALLOW_POSTGRES_INTEGRATION_TESTS: '1', V14D_DATABASE_IDENTITY: 'test' };
+  assert.equal(parseResearchDatabaseTarget(url, valid), CI_RESEARCH_DATABASE_NAME);
+  for (const missing of ['NODE_ENV', 'ALLOW_POSTGRES_INTEGRATION_TESTS', 'V14D_DATABASE_IDENTITY']) {
+    const env = { ...valid };
+    delete env[missing];
+    assert.throws(() => parseResearchDatabaseTarget(url, env), error => error.code === 'DATABASE_TARGET_REJECTED', missing);
+  }
+  assert.throws(
+    () => parseResearchDatabaseTarget('postgresql://u:p@localhost:5432/eth_alpha', { ...valid, V14D_RESEARCH_DATABASE_NAME: 'eth_alpha' }),
+    error => error.code === 'DATABASE_TARGET_REJECTED'
+  );
+});
+
+test('createGuardedResearchPgPool完整核验合法CI声明名和current_database()', async () => {
+  const env = { NODE_ENV: 'test', ALLOW_POSTGRES_INTEGRATION_TESTS: '1', V14D_DATABASE_IDENTITY: 'test' };
+  const pool = fakePool({ queryImpl: async () => ({ rows: [{ database: CI_RESEARCH_DATABASE_NAME }] }) });
+  assert.equal(await createGuardedResearchPgPool(
+    { databaseUrl: `postgresql://u:p@localhost:5432/${CI_RESEARCH_DATABASE_NAME}` },
+    { createPgPool: async () => pool, env }
+  ), pool);
+  assert.equal(pool.calls.query.length, 1);
+  assert.equal(pool.calls.end, 0);
+});
+
+test('createGuardedResearchPgPool在任一CI例外条件缺失时连接前拒绝', async () => {
+  const valid = { NODE_ENV: 'test', ALLOW_POSTGRES_INTEGRATION_TESTS: '1', V14D_DATABASE_IDENTITY: 'test' };
+  for (const missing of ['NODE_ENV', 'ALLOW_POSTGRES_INTEGRATION_TESTS', 'V14D_DATABASE_IDENTITY']) {
+    const env = { ...valid };
+    delete env[missing];
+    let created = false;
+    await assert.rejects(createGuardedResearchPgPool(
+      { databaseUrl: `postgresql://u:p@localhost:5432/${CI_RESEARCH_DATABASE_NAME}` },
+      { createPgPool: async () => { created = true; return fakePool(); }, env }
+    ), error => error.code === 'DATABASE_TARGET_REJECTED');
+    assert.equal(created, false, missing);
+  }
+});
+
+test('createGuardedResearchPgPool拒绝连接后current_database()伪装，即使声明URL合法', async () => {
+  const pool = fakePool({ queryImpl: async () => ({ rows: [{ database: 'eth_alpha' }] }) });
+  await assert.rejects(
+    createGuardedResearchPgPool(
+      { databaseUrl: 'postgresql://u:p@localhost:5432/eth_alpha_v14d_test' },
+      { createPgPool: async () => pool, env: { V14D_RESEARCH_DATABASE_NAME: 'eth_alpha' } }
+    ),
+    error => error.code === 'DATABASE_TARGET_REJECTED' && error.actualDatabaseName === 'eth_alpha'
+  );
+  assert.equal(pool.calls.end, 1);
 });
 
 test('显式数据库身份只允许research/test，并按既有CLI惯例执行trim+小写归一化', () => {
@@ -150,10 +229,10 @@ test('parseResearchDatabaseTarget（P2-C文档化，已知与pg-connection-strin
   );
 });
 
-test('parseResearchDatabaseTarget（P2-C文档化，已知与pg-connection-string的分歧点之二）：百分号编码的下划线（%5F）在WHATWG URL中不会被解码，因此第一层按字面拒绝（fail-closed方向，不构成安全问题，只是可能误伤本应合法的连接串）', () => {
-  assert.throws(
-    () => parseResearchDatabaseTarget('postgresql://u:p@localhost:5432/eth%5Falpha_v14d_test'),
-    (e) => e.code === 'DATABASE_TARGET_REJECTED' && e.declaredDatabaseName === 'eth%5Falpha_v14d_test'
+test('parseResearchDatabaseTarget：百分号编码路径按连接驱动语义解码后仍须精确匹配固定库名', () => {
+  assert.equal(
+    parseResearchDatabaseTarget('postgresql://u:p@localhost:5432/eth%5Falpha_v14d_test'),
+    RESEARCH_DATABASE_NAME
   );
 });
 

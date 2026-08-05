@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   parseArgs, parseSplitRatio, computeSplitBoundaries, validateSplitOrder, validateReplayRange,
   checkResumeParamConsistency, enumerateRhythmPoints, STARTUP_BANNER,
-  validateEffectiveOptions, validateCliArgsBeforeDbAccess, main
+  validateEffectiveOptions, validateCliArgsBeforeDbAccess, main, runWalkForward
 } from './cli-entry.js';
 import { exitCodeForCliError, DATABASE_FAILURE_EXIT_CODE } from '../db/research-database-guard.js';
 
@@ -17,6 +17,11 @@ const DAY_MS = 86400000;
 test('parseArgs：解析--key value形式参数', () => {
   const args = parseArgs(['--symbol', 'ETHUSDT', '--dry-run']);
   assert.deepEqual(args, { symbol: 'ETHUSDT', 'dry-run': true });
+});
+
+test('rerun authenticity mode is explicit and fresh cannot be combined with resume', async () => {
+  await assert.rejects(runWalkForward({ pool: {}, authenticityMode: 'unknown' }), error => error.code === 'INVALID_REPLAY_AUTHENTICITY_MODE');
+  await assert.rejects(runWalkForward({ pool: {}, authenticityMode: 'fresh', resumeValidationRunId: 'run-id' }), error => error.code === 'FRESH_MODE_CANNOT_RESUME');
 });
 
 test('parseSplitRatio：接受合法的train%/validation%/test%且和为100', () => {

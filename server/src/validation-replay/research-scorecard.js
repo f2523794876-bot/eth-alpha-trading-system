@@ -179,14 +179,45 @@ function actionPermissionSummaries(rows, predictionField, costs) {
   return Object.fromEntries(values.map(value => [value, summarize(rows.filter(row => row.actionPermission === value), predictionField, costs)]));
 }
 
-function normalizeCosts(options) {
-  const hasCombined = options.roundTripCostBps != null;
+function costAssumptionsRequired(missing) {
+  return Object.assign(new TypeError('feeBps and slippageBps are both required'), {
+    code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED',
+    missing
+  });
+}
+
+function costAssumptionsInvalid() {
+  return Object.assign(new TypeError('feeBps and slippageBps must be finite non-negative numbers'), {
+    code: 'SCORECARD_COST_ASSUMPTIONS_INVALID'
+  });
+}
+
+const DECIMAL_NUMBER = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+export function parseResearchCostArgument(value, name) {
+  if (value == null || value === true || (typeof value === 'string' && value.trim() === '')) {
+    throw costAssumptionsRequired([name]);
+  }
+  if (typeof value !== 'string') throw costAssumptionsInvalid();
+  const normalized = value.trim();
+  if (!DECIMAL_NUMBER.test(normalized)) throw costAssumptionsInvalid();
+  const number = Number(normalized);
+  if (!Number.isFinite(number) || number < 0) throw costAssumptionsInvalid();
+  return number;
+}
+
+export function normalizeResearchCosts(options = {}) {
   const explicitFee = Object.hasOwn(options, 'feeBps');
   const explicitSlippage = Object.hasOwn(options, 'slippageBps');
-  const feeBps = explicitFee ? finiteNumber(options.feeBps) : hasCombined ? finiteNumber(options.roundTripCostBps) : 8;
-  const slippageBps = explicitSlippage ? finiteNumber(options.slippageBps) : hasCombined ? 0 : 4;
-  if (feeBps == null || slippageBps == null || feeBps < 0 || slippageBps < 0) {
-    throw new TypeError('feeBps and slippageBps must be finite non-negative numbers');
+  const missing = [
+    (!explicitFee || options.feeBps == null || (typeof options.feeBps === 'string' && options.feeBps.trim() === '')) && 'feeBps',
+    (!explicitSlippage || options.slippageBps == null || (typeof options.slippageBps === 'string' && options.slippageBps.trim() === '')) && 'slippageBps'
+  ].filter(Boolean);
+  if (missing.length) throw costAssumptionsRequired(missing);
+  const { feeBps, slippageBps } = options;
+  if (typeof feeBps !== 'number' || typeof slippageBps !== 'number' ||
+      !Number.isFinite(feeBps) || !Number.isFinite(slippageBps) || feeBps < 0 || slippageBps < 0) {
+    throw costAssumptionsInvalid();
   }
   return { feeBps, slippageBps, totalBps: feeBps + slippageBps };
 }
@@ -361,7 +392,7 @@ function buildHorizonStatisticalPipeline(inputRows, horizon, options) {
 export function buildResearchScorecard(inputRows, options = {}) {
   if (!Array.isArray(inputRows)) throw new TypeError('inputRows must be an array');
   const randomSeed = finiteNumber(options.randomSeed) ?? 1404;
-  const costs = normalizeCosts(options);
+  const costs = normalizeResearchCosts(options);
   const pipelines = Object.fromEntries(['24h', '72h'].map(horizon => [horizon, buildHorizonStatisticalPipeline(inputRows, horizon, options)]));
   const rows = Object.values(pipelines).flatMap(pipeline => pipeline.direction.rows)
     .filter(row => DIRECTIONS.includes(row.actualDirection) && DIRECTIONS.includes(row.predictedDirection));
@@ -476,6 +507,7 @@ export function renderResearchScorecardMarkdown(scorecard) {
     '# V1.4D research scorecard', '',
     `- Status: **${scorecard.status}**`,
     `- Generated at: ${scorecard.generatedAt}`,
+    `- Rerun authenticity: ${scorecard.rerunAuthenticity ? `${scorecard.rerunAuthenticity.gate_status} (${scorecard.rerunAuthenticity.mode}; inserted=${scorecard.rerunAuthenticity.inserted_count}, reused_identical=${scorecard.rerunAuthenticity.reused_identical_count}, conflicts=${scorecard.rerunAuthenticity.conflict_count})` : 'NOT_APPLICABLE (offline input)'}`,
     `- Fee/slippage/total cost (bps): ${scorecard.assumptions.feeBps}/${scorecard.assumptions.slippageBps}/${scorecard.assumptions.roundTripCostBps}`,
     `- Input/eligible/economic/path samples: ${scorecard.dataQuality.inputCount}/${scorecard.dataQuality.eligibleDirectionCount}/${scorecard.dataQuality.economicEligibleCount}/${scorecard.dataQuality.pathEligibleCount}`,
     `- Direction raw/effective samples: ${scorecard.dataQuality.directionRawSampleCount}/${scorecard.dataQuality.directionEffectiveSampleCount}`,

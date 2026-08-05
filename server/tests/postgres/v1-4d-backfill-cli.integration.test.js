@@ -34,15 +34,15 @@ function kline(openTime, closeTime, closeStr = '1000.00') {
 // 错误行为——现在必须改为真实模拟"进程在finalize之前被杀死"：直接创建status='RUNNING'的审计行，
 // 再直接调用底层backfillInterval()（不经过runBackfillForInterval的finalize包装）完成"抓取+落库+
 // 推进游标"，使批次行精确停留在真实中断时的状态（status仍是RUNNING，last_completed_open_time已推进）。
-async function createRunningBatch(client, { symbol, interval, requestedStart, requestedEnd, pages, serverTimeMs, calls }) {
+async function createRunningBatch(client, { symbol, interval, requestedStart, requestedEnd, fixedAsOf = requestedEnd - 1, pages, serverTimeMs, calls }) {
   const backfillBatchId = randomUUID();
   await client.query(
-    `INSERT INTO historical_validation.backfill_batches(backfill_batch_id,symbol,interval_name,requested_start_utc,requested_end_utc,status,started_at)
-     VALUES($1,$2,$3,to_timestamp($4/1000.0),to_timestamp($5/1000.0),'RUNNING',now())`,
-    [backfillBatchId, symbol, interval, requestedStart, requestedEnd]
+    `INSERT INTO historical_validation.backfill_batches(backfill_batch_id,symbol,interval_name,requested_start_utc,requested_end_utc,fixed_as_of,status,started_at)
+     VALUES($1,$2,$3,to_timestamp($4/1000.0),to_timestamp($5/1000.0),to_timestamp($6/1000.0),'RUNNING',now())`,
+    [backfillBatchId, symbol, interval, requestedStart, requestedEnd, fixedAsOf]
   );
   const adapter = makeMockAdapter({ pages, serverTimeMs, calls });
-  const result = await backfillInterval({ pool: client, adapter, symbol, interval, startTime: requestedStart, endTime: requestedEnd, backfillBatchId, now: () => serverTimeMs });
+  const result = await backfillInterval({ pool: client, adapter, symbol, interval, startTime: requestedStart, endTime: requestedEnd, fixedAsOf, backfillBatchId, now: () => serverTimeMs });
   return { backfillBatchId, result };
 }
 
@@ -68,7 +68,7 @@ test('R5：正常回填后batch标记SUCCEEDED，且integrity无异常', { skip 
 
     // requested_start_utc < requested_end_utc 是 backfill_batches 表的CHECK约束（审计请求区间，非单点），
     // 故此处endTime取下一根bar的open_time，即便本次mock只返回一页(一根bar)。
-    const result = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: openTime, endTime: openTime + 900000, now: () => nowMs });
+    const result = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: openTime, endTime: openTime + 900000, fixedAsOf: closeTime, now: () => nowMs });
     assert.equal(result.status, 'SUCCEEDED');
 
     const batch = (await client.query('SELECT status, rows_inserted FROM historical_validation.backfill_batches WHERE backfill_batch_id=$1', [result.backfillBatchId])).rows[0];
@@ -84,7 +84,7 @@ test('R7.1a：回填后完整性检测发现缺口时batch标记ATTENTION_REQUIR
     const nowMs = bar2Close + 60000;
     const adapter = makeMockAdapter({ pages: [[kline(bar0Open, bar0Close), kline(bar2Open, bar2Close)]], serverTimeMs: nowMs });
 
-    const result = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar2Close, now: () => nowMs });
+    const result = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar2Close + 1, fixedAsOf: bar2Close, now: () => nowMs });
     assert.equal(result.status, 'ATTENTION_REQUIRED');
     assert.equal(result.integrity.gapCount, 1);
 
@@ -97,7 +97,7 @@ test('R7.1a：回填后完整性检测发现缺口时batch标记ATTENTION_REQUIR
 test('R2.3：serverTime校时失败时batch标记FAILED', { skip }, async () => {
   await withTxClient(async (client) => {
     const adapter = { serverTime: async () => { throw Object.assign(new Error('down'), { code: 'NETWORK_ERROR' }); }, spotKlines: async () => { throw new Error('must not be called'); } };
-    const result = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: 0, endTime: 900000 });
+    const result = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: 0, endTime: 900000, fixedAsOf: 899999 });
     assert.equal(result.status, 'FAILED');
     const batch = (await client.query('SELECT status FROM historical_validation.backfill_batches WHERE backfill_batch_id=$1', [result.backfillBatchId])).rows[0];
     assert.equal(batch.status, 'FAILED');
@@ -116,7 +116,7 @@ test('resume：携带已有backfill_batch_id时从last_completed_open_time之后
     // 不经过runBackfillForInterval的finalize（那会立刻把它转成ATTENTION_REQUIRED终态）。
     const calls1 = [];
     const first = await createRunningBatch(client, {
-      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close,
+      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close + 1,
       pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1, calls: calls1
     });
     // resume校验的重点是：续跑时 backfillInterval 传给 adapter.spotKlines 的 startTime 已经推进到 bar0之后，而不是从bar0Open重新拉取。
@@ -127,9 +127,9 @@ test('resume：携带已有backfill_batch_id时从last_completed_open_time之后
     const nowMs2 = bar1Close + 60000;
     const calls2 = [];
     const adapter2 = makeMockAdapter({ pages: [[kline(bar1Open, bar1Close)]], serverTimeMs: nowMs2, calls: calls2 });
-    const second = await runBackfillForInterval({ pool: client, adapter: adapter2, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close, resumeBatchId: first.backfillBatchId, now: () => nowMs2 });
+    const second = await runBackfillForInterval({ pool: client, adapter: adapter2, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close + 1, fixedAsOf: bar1Close, resumeBatchId: first.backfillBatchId, now: () => nowMs2 });
     assert.equal(second.status, 'SUCCEEDED');
-    assert.equal(calls2[0].startTime, bar0Open + 1, 'resume游标必须推进到last_completed_open_time之后，不得从bar0Open重新拉取');
+    assert.equal(calls2[0].startTime, bar1Open, 'resume游标必须推进到下一根15m K线的open_time，不得从bar0Open重新拉取');
 
     const bar0Count = (await client.query(`SELECT count(*)::int AS n FROM market_bars WHERE close_time=to_timestamp($1/1000.0)`, [bar0Close])).rows[0].n;
     const bar1Count = (await client.query(`SELECT count(*)::int AS n FROM market_bars WHERE close_time=to_timestamp($1/1000.0)`, [bar1Close])).rows[0].n;
@@ -149,13 +149,13 @@ test('P1-6：正确symbol和interval恢复成功（回归——修复前的合�
 
     // R11.4修复后，resume只接受真正仍处于RUNNING的批次——用createRunningBatch模拟真实中断。
     const first = await createRunningBatch(client, {
-      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close,
+      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close + 1,
       pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1
     });
 
     const nowMs2 = bar1Close + 60000;
     const adapter2 = makeMockAdapter({ pages: [[kline(bar1Open, bar1Close)]], serverTimeMs: nowMs2 });
-    const second = await runBackfillForInterval({ pool: client, adapter: adapter2, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close, resumeBatchId: first.backfillBatchId, now: () => nowMs2 });
+    const second = await runBackfillForInterval({ pool: client, adapter: adapter2, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close + 1, fixedAsOf: bar1Close, resumeBatchId: first.backfillBatchId, now: () => nowMs2 });
     assert.equal(second.status, 'SUCCEEDED');
   });
 });
@@ -166,14 +166,14 @@ test('P1-6红线：resume batch的symbol与当前请求不一致——拒绝(BAC
     const bar0Open = base, bar0Close = base + 900000 - 1;
     const nowMs = bar0Close + 60000;
     const adapter = makeMockAdapter({ pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs });
-    const first = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, now: () => nowMs });
+    const first = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, fixedAsOf: bar0Close, now: () => nowMs });
     assert.equal(first.status, 'SUCCEEDED');
 
     const beforeMarketBars = (await client.query('SELECT count(*)::int AS n FROM market_bars')).rows[0].n;
 
     const wrongSymbolAdapter = { serverTime: async () => { throw new Error('must not be called — rejection must happen before any adapter interaction'); } };
     await assert.rejects(
-      runBackfillForInterval({ pool: client, adapter: wrongSymbolAdapter, symbol: 'BTCUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
+      runBackfillForInterval({ pool: client, adapter: wrongSymbolAdapter, symbol: 'BTCUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, fixedAsOf: bar0Close, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
       (e) => e.code === 'BACKFILL_RESUME_SYMBOL_INTERVAL_MISMATCH' && e.expectedSymbol === 'ETHUSDT' && e.actualSymbol === 'BTCUSDT'
     );
 
@@ -191,13 +191,13 @@ test('P1-6红线：resume batch的interval_name与当前请求不一致——拒
     const bar0Open = base, bar0Close = base + 900000 - 1;
     const nowMs = bar0Close + 60000;
     const adapter = makeMockAdapter({ pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs });
-    const first = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, now: () => nowMs });
+    const first = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, fixedAsOf: bar0Close, now: () => nowMs });
     assert.equal(first.status, 'SUCCEEDED');
 
     const beforeMarketBars = (await client.query('SELECT count(*)::int AS n FROM market_bars')).rows[0].n;
     const mustNotBeCalledAdapter = { serverTime: async () => { throw new Error('must not be called'); } };
     await assert.rejects(
-      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '4h', startTime: bar0Open, endTime: bar0Open + 900000, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
+      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '4h', startTime: bar0Open, endTime: bar0Open + 14400000, fixedAsOf: bar0Open + 14400000 - 1, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
       (e) => e.code === 'BACKFILL_RESUME_SYMBOL_INTERVAL_MISMATCH' && e.expectedInterval === '15m' && e.actualInterval === '4h'
     );
     const afterMarketBars = (await client.query('SELECT count(*)::int AS n FROM market_bars')).rows[0].n;
@@ -211,12 +211,12 @@ test('P1-6：resume batch请求区间与当前请求不一致——拒绝(BACKFI
     const bar0Open = base, bar0Close = base + 900000 - 1;
     const nowMs = bar0Close + 60000;
     const adapter = makeMockAdapter({ pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs });
-    const first = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, now: () => nowMs });
+    const first = await runBackfillForInterval({ pool: client, adapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000, fixedAsOf: bar0Close, now: () => nowMs });
     assert.equal(first.status, 'SUCCEEDED');
 
     const mustNotBeCalledAdapter = { serverTime: async () => { throw new Error('must not be called'); } };
     await assert.rejects(
-      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000 + 900000, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
+      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar0Open + 900000 + 900000, fixedAsOf: bar0Close, resumeBatchId: first.backfillBatchId, now: () => nowMs }),
       (e) => e.code === 'BACKFILL_RESUME_RANGE_MISMATCH'
     );
   });
@@ -226,7 +226,7 @@ test('P1-6：不存在的resume batch——拒绝(BACKFILL_BATCH_NOT_FOUND)', { 
   await withTxClient(async (client) => {
     const mustNotBeCalledAdapter = { serverTime: async () => { throw new Error('must not be called'); } };
     await assert.rejects(
-      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: 0, endTime: 900000, resumeBatchId: randomUUID(), now: () => Date.now() }),
+      runBackfillForInterval({ pool: client, adapter: mustNotBeCalledAdapter, symbol: 'ETHUSDT', interval: '15m', startTime: 0, endTime: 900000, fixedAsOf: 899999, resumeBatchId: randomUUID(), now: () => Date.now() }),
       (e) => e.code === 'BACKFILL_BATCH_NOT_FOUND'
     );
   });
@@ -246,6 +246,25 @@ test('P1-6：main()——单个--resume加多个--intervals必须拒绝(RESUME_I
   }
 });
 
+test('P1-6：校验优先级——无resume冲突时缺少--as-of仍稳定返回AS_OF_REQUIRED', async () => {
+  const originalDatabaseUrl = process.env.DATABASE_URL;
+  delete process.env.DATABASE_URL;
+  try {
+    const common = ['--symbol', 'ETHUSDT', '--from', '2026-02-01T00:00:00Z', '--to', '2026-02-02T00:00:00Z'];
+    await assert.rejects(
+      backfillMain([...common, '--intervals', '15m', '--resume', randomUUID()]),
+      error => error.code === 'AS_OF_REQUIRED'
+    );
+    await assert.rejects(
+      backfillMain([...common, '--intervals', '15m,4h']),
+      error => error.code === 'AS_OF_REQUIRED'
+    );
+  } finally {
+    if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalDatabaseUrl;
+  }
+});
+
 test('P1-6：单个--resume加单个interval不受影响——runBackfillForInterval正常resume路径不回归', { skip }, async () => {
   await withTxClient(async (client) => {
     const base = Date.UTC(2026, 1, 14, 0, 0, 0);
@@ -254,7 +273,7 @@ test('P1-6：单个--resume加单个interval不受影响——runBackfillForInte
     const nowMs1 = bar0Close + 60000;
     // R11.4修复后，resume只接受真正仍处于RUNNING的批次——用createRunningBatch模拟真实中断。
     const first = await createRunningBatch(client, {
-      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close,
+      symbol: 'ETHUSDT', interval: '15m', requestedStart: bar0Open, requestedEnd: bar1Close + 1,
       pages: [[kline(bar0Open, bar0Close)]], serverTimeMs: nowMs1
     });
 
@@ -263,7 +282,7 @@ test('P1-6：单个--resume加单个interval不受影响——runBackfillForInte
     // runBackfillForInterval（main()对单interval时实际调用的同一底层函数）resume路径本身未被破坏。
     const nowMs2 = bar1Close + 60000;
     const adapter2 = makeMockAdapter({ pages: [[kline(bar1Open, bar1Close)]], serverTimeMs: nowMs2 });
-    const second = await runBackfillForInterval({ pool: client, adapter: adapter2, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close, resumeBatchId: first.backfillBatchId, now: () => nowMs2 });
+    const second = await runBackfillForInterval({ pool: client, adapter: adapter2, symbol: 'ETHUSDT', interval: '15m', startTime: bar0Open, endTime: bar1Close + 1, fixedAsOf: bar1Close, resumeBatchId: first.backfillBatchId, now: () => nowMs2 });
     assert.equal(second.status, 'SUCCEEDED');
     assert.equal(second.backfillBatchId, first.backfillBatchId, '单interval resume必须复用同一个backfill_batch_id');
   });
@@ -278,9 +297,9 @@ test('P1-6：main()——正常非resume多interval流程不回归（不传--res
     // 镜像main()循环体：不传resumeBatchId，对多个interval依次各自独立调用runBackfillForInterval——
     // 验证P1-6新增的symbol/interval一致性校验不会误伤"本来就没有resume"的正常多interval流程。
     const adapter15m = makeMockAdapter({ pages: [[kline(bar15mOpen, bar15mClose)]], serverTimeMs: bar15mClose + 60000 });
-    const result15m = await runBackfillForInterval({ pool: client, adapter: adapter15m, symbol: 'ETHUSDT', interval: '15m', startTime: bar15mOpen, endTime: bar15mOpen + 900000, now: () => bar15mClose + 60000 });
+    const result15m = await runBackfillForInterval({ pool: client, adapter: adapter15m, symbol: 'ETHUSDT', interval: '15m', startTime: bar15mOpen, endTime: bar15mOpen + 900000, fixedAsOf: bar15mClose, now: () => bar15mClose + 60000 });
     const adapter4h = makeMockAdapter({ pages: [[kline(bar4hOpen, bar4hClose)]], serverTimeMs: bar4hClose + 60000 });
-    const result4h = await runBackfillForInterval({ pool: client, adapter: adapter4h, symbol: 'ETHUSDT', interval: '4h', startTime: bar4hOpen, endTime: bar4hOpen + 14400000, now: () => bar4hClose + 60000 });
+    const result4h = await runBackfillForInterval({ pool: client, adapter: adapter4h, symbol: 'ETHUSDT', interval: '4h', startTime: bar4hOpen, endTime: bar4hOpen + 14400000, fixedAsOf: bar4hClose, now: () => bar4hClose + 60000 });
 
     assert.equal(result15m.status, 'SUCCEEDED');
     assert.equal(result4h.status, 'SUCCEEDED');

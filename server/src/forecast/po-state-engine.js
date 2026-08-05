@@ -8,6 +8,7 @@
 // 这是基于§4.1既有红线的一致性解释，未改变规范文本，已在V1_4C_IMPLEMENTATION_REPORT.md中记录。
 import { isNearSupport, isNearResistance, isFalseBreakoutVetoed, btcAlignmentServer } from './po-feature-mapping.js';
 import { PO_RULE_VERSION } from './forecast-version.js';
+import { TREND, isCanonicalTrend } from '../domain/trend.js';
 
 export const PO_STATES = Object.freeze([
   'PO_RANGE_LOW_STRUCTURE', 'PO_BREAKOUT_UP_STRUCTURE', 'PO_TREND_UP_STRUCTURE', 'PO_STALL_HIGH_STRUCTURE',
@@ -49,9 +50,11 @@ export function evaluatePoState(inputs) {
   if (!Number.isFinite(px) || !Number.isFinite(atr14FourHour) || atr14FourHour <= 0 || !Number.isFinite(n(swingHigh)) || !Number.isFinite(n(swingLow))) {
     return { proxyState: null, operatingMode: 'INSUFFICIENT_DATA', stateConfidence: 0, stateEvidence: ['[PRICE_ONLY] 关键结构字段缺失，无法判定'], opposingEvidence: [], poRuleVersion: PO_RULE_VERSION };
   }
-  const trendAligned = trend4h && trend1h && trend4h === trend1h;
-  const btcUp = btcAlignmentServer('up', btcTrendState, ethBtcRollingCorrelation);
-  const btcDown = btcAlignmentServer('down', btcTrendState, ethBtcRollingCorrelation);
+  const trend4hCanonical = isCanonicalTrend(trend4h);
+  const trend1hCanonical = isCanonicalTrend(trend1h);
+  const trendAligned = trend4hCanonical && trend1hCanonical && trend4h === trend1h;
+  const btcUp = btcAlignmentServer(TREND.UP, btcTrendState, ethBtcRollingCorrelation);
+  const btcDown = btcAlignmentServer(TREND.DOWN, btcTrendState, ethBtcRollingCorrelation);
 
   // 突破/跌破否决条件（映射三）：当根拒绝证据
   const falseBreakoutVeto = isFalseBreakoutVetoed(falseBreakoutRisk);
@@ -69,15 +72,15 @@ export function evaluatePoState(inputs) {
     stateEvidence.push(`[PRICE_ONLY] 价格结构显示向下突破，已持续${breakdownCount}根4H K线`);
     return finalize('PO_BREAKDOWN_STRUCTURE', { bonusMet: volumeRatio20 >= 1.2 && btcDown === 'SUPPORT', trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
   }
-  // PO_TREND_UP_STRUCTURE：trend4h='up' 且 count>=M(=3，见§8.3/§8.4)
-  if (!dataInsufficientForCount && trend4h === 'up' && breakoutCount >= 3 && !falseBreakoutVeto) {
+  // PO_TREND_UP_STRUCTURE：trend4h=UP 且 count>=M(=3，见§8.3/§8.4)
+  if (!dataInsufficientForCount && trend4h === TREND.UP && breakoutCount >= 3 && !falseBreakoutVeto) {
     stateEvidence.push('[PRICE_ONLY] 价格结构延续上行（连续突破根数已超过2根）');
-    return finalize('PO_TREND_UP_STRUCTURE', { bonusMet: n(closeToEma5) > 0 && trend1h === 'up', trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
+    return finalize('PO_TREND_UP_STRUCTURE', { bonusMet: n(closeToEma5) > 0 && trend1h === TREND.UP, trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
   }
   // PO_TREND_DOWN_STRUCTURE：对称
-  if (!dataInsufficientForCount && trend4h === 'down' && breakdownCount >= 3 && !falseBreakoutVeto) {
+  if (!dataInsufficientForCount && trend4h === TREND.DOWN && breakdownCount >= 3 && !falseBreakoutVeto) {
     stateEvidence.push('[PRICE_ONLY] 价格结构延续下行（连续跌破根数已超过2根）');
-    return finalize('PO_TREND_DOWN_STRUCTURE', { bonusMet: n(closeToEma5) < 0 && trend1h === 'down', trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
+    return finalize('PO_TREND_DOWN_STRUCTURE', { bonusMet: n(closeToEma5) < 0 && trend1h === TREND.DOWN, trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
   }
 
   // PO_SHARP_DROP_STRUCTURE：单根4H急跌，§4.2原文绝对阈值语义：单根跌幅相对ATR达到3倍，且放量>=1.8（绝对阈值，非相对阈值，同GMKG§7.1极值判定原则）
@@ -90,18 +93,18 @@ export function evaluatePoState(inputs) {
     }
   }
 
-  // PO_RANGE_LOW_STRUCTURE：贴近支撑 且 trend4h∈{flat,down}
-  if (isNearSupport(distanceToSupportAtr) && (trend4h === 'flat' || trend4h === 'down') && !(breakoutState === 'BREAKOUT_DOWN' && breakdownCount >= 2)) {
+  // PO_RANGE_LOW_STRUCTURE：贴近支撑 且 trend4h∈{RANGE,DOWN}
+  if (isNearSupport(distanceToSupportAtr) && (trend4h === TREND.RANGE || trend4h === TREND.DOWN) && !(breakoutState === 'BREAKOUT_DOWN' && breakdownCount >= 2)) {
     stateEvidence.push('[PRICE_ONLY] 价格结构显示贴近支撑位，未确认破位');
     return finalize('PO_RANGE_LOW_STRUCTURE', { bonusMet: volumeRatio20 >= 0.8 && volumeRatio20 <= 1.2, trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
   }
-  // PO_STALL_HIGH_STRUCTURE：贴近压力 且 之前为上行趋势（滞涨代理：closeToEma5<=0但trend4h仍非down）
-  if (isNearResistance(distanceToResistanceAtr) && trend4h !== 'down' && n(closeToEma5) <= 0) {
+  // PO_STALL_HIGH_STRUCTURE：贴近压力 且 之前为非下行Canonical趋势（滞涨代理：closeToEma5<=0）
+  if (isNearResistance(distanceToResistanceAtr) && trend4hCanonical && trend4h !== TREND.DOWN && n(closeToEma5) <= 0) {
     stateEvidence.push('[PRICE_ONLY] 价格结构显示高位滞涨，未创新高');
     return finalize('PO_STALL_HIGH_STRUCTURE', { bonusMet: volumeRatio20 < 1.0 && n(upperWickRatio) > 0.3, trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
   }
-  // PO_RANGE_RECOVERY_STRUCTURE：波动收窄后的修复代理（无法直接得知"是否曾发生SHARP_DROP"跨快照状态，保守只用价格結構本身：trend4h='flat'且贴近支撑与压力之间）
-  if (trend4h === 'flat' && !isNearSupport(distanceToSupportAtr) && !isNearResistance(distanceToResistanceAtr)) {
+  // PO_RANGE_RECOVERY_STRUCTURE：波动收窄后的修复代理（无法直接得知"是否曾发生SHARP_DROP"跨快照状态，保守只用价格結構本身：trend4h=RANGE且贴近支撑与压力之间）
+  if (trend4h === TREND.RANGE && !isNearSupport(distanceToSupportAtr) && !isNearResistance(distanceToResistanceAtr)) {
     stateEvidence.push('[PRICE_ONLY] 价格结构在区间内往复，无持续方向');
     return finalize('PO_RANGE_RECOVERY_STRUCTURE', { bonusMet: false, trendAligned, completeness, qualityState, stateEvidence, opposingEvidence });
   }
