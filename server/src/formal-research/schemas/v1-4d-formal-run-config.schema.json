@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-formal-run-config-1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": "v1.4d-formal-run-config/1" },
+    "validationRunId": { "type": "string", "format": "uuid" },
+    "artifactMode": { "enum": ["DRY_RUN", "FORMAL"] },
+    "databaseIdentity": { "enum": ["research", "test"] },
+    "researchFrom": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+    "researchTo": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+    "fixedAsOf": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$" },
+    "symbols": {
+      "type": "array",
+      "prefixItems": [{ "const": "ETHUSDT" }, { "const": "BTCUSDT" }],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "intervals": {
+      "type": "array",
+      "prefixItems": [{ "const": "15m" }, { "const": "1h" }, { "const": "4h" }],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "horizons": {
+      "type": "array",
+      "prefixItems": [{ "const": "24h" }, { "const": "72h" }],
+      "items": false,
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "datasetVersion": { "type": "string", "pattern": "^v1\\.4d-sha256-[0-9a-f]{64}$" },
+    "algorithmVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "ruleVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "weightVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "evaluationVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "gitObjectFormat": { "enum": ["SHA1", "SHA256"] },
+    "sourceCommit": { "type": "string" },
+    "costs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "feeBps": { "type": "number", "minimum": 0 },
+        "slippageBps": { "type": "number", "minimum": 0 }
+      },
+      "required": ["feeBps", "slippageBps"]
+    },
+    "thresholds": { "$ref": "https://eth-alpha.invalid/schema/v1.4d-thresholds-1.json" }
+  },
+  "required": [
+    "schemaVersion", "validationRunId", "artifactMode", "databaseIdentity",
+    "researchFrom", "researchTo", "fixedAsOf", "symbols", "intervals", "horizons",
+    "datasetVersion", "algorithmVersion", "ruleVersion", "weightVersion", "evaluationVersion",
+    "gitObjectFormat", "sourceCommit", "costs", "thresholds"
+  ],
+  "allOf": [
+    {
+      "if": { "properties": { "gitObjectFormat": { "const": "SHA1" } }, "required": ["gitObjectFormat"] },
+      "then": { "properties": { "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" } } }
+    },
+    {
+      "if": { "properties": { "gitObjectFormat": { "const": "SHA256" } }, "required": ["gitObjectFormat"] },
+      "then": { "properties": { "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } }
+    }
+  ]
+}

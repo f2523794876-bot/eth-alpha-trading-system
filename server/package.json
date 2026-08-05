@@ -32,8 +32,9 @@
     "validation:walk-forward": "node src/validation-replay/cli-entry.js",
     "verify:v1.4d": "node scripts/verify-v1-4d.mjs",
     "scorecard:v1.4d": "node scripts/v1-4d-scorecard-cli.mjs",
+    "test:r3-batch1": "node --test src/formal-research/*.test.js src/validation-replay/formal-run-config.test.js",
     "test:verification-bundle": "node --test src/validation-replay/research-scorecard.test.js scripts/v1-4d-scorecard-cli.test.mjs",
     "check": "node --check src/index.js && node --test tests/*.test.js tests/forecast/*.test.js"
   },
-  "dependencies": { "pg": "^8.16.3" }
+  "dependencies": { "ajv": "8.20.0", "canonicalize": "3.0.0", "pg": "^8.16.3" }
 }

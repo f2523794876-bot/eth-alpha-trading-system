@@ -1,0 +1,78 @@
+{
+  "$defs": {
+    "thresholds": {
+      "additionalProperties": false,
+      "properties": {
+        "minClassEffectiveTest": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": { "minimum": 0, "type": "integer" },
+            "72h": { "minimum": 0, "type": "integer" }
+          },
+          "required": ["24h", "72h"],
+          "type": "object"
+        },
+        "minDirectionalCoverage": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": { "maximum": 1, "minimum": 0, "type": "number" },
+            "72h": { "maximum": 1, "minimum": 0, "type": "number" }
+          },
+          "required": ["24h", "72h"],
+          "type": "object"
+        },
+        "minEffectiveTest": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": { "minimum": 1, "type": "integer" },
+            "72h": { "minimum": 1, "type": "integer" }
+          },
+          "required": ["24h", "72h"],
+          "type": "object"
+        },
+        "minMarketRegimeCoverage": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": { "maximum": 1, "minimum": 0, "type": "number" },
+            "72h": { "maximum": 1, "minimum": 0, "type": "number" }
+          },
+          "required": ["24h", "72h"],
+          "type": "object"
+        },
+        "minPostCostLift": {
+          "additionalProperties": false,
+          "properties": { "24h": { "type": "number" }, "72h": { "type": "number" } },
+          "required": ["24h", "72h"],
+          "type": "object"
+        },
+        "minPreCostLift": {
+          "additionalProperties": false,
+          "properties": { "24h": { "type": "number" }, "72h": { "type": "number" } },
+          "required": ["24h", "72h"],
+          "type": "object"
+        },
+        "minWilsonLowerBound": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": { "maximum": 1, "minimum": 0, "type": "number" },
+            "72h": { "maximum": 1, "minimum": 0, "type": "number" }
+          },
+          "required": ["24h", "72h"],
+          "type": "object"
+        },
+        "requireAllBaselines": { "const": true },
+        "requireMarketRegime": { "const": true },
+        "schemaVersion": { "const": "v1.4d-go-no-go-thresholds/1" }
+      },
+      "required": [
+        "schemaVersion", "minEffectiveTest", "minClassEffectiveTest",
+        "minDirectionalCoverage", "minMarketRegimeCoverage", "minWilsonLowerBound",
+        "minPreCostLift", "minPostCostLift", "requireAllBaselines", "requireMarketRegime"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-thresholds-1.json",
+  "$ref": "#/$defs/thresholds",
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}
