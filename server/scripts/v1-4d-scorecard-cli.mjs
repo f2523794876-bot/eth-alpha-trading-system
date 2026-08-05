@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { Pool } from 'pg';
-import { buildResearchScorecard, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
+import { buildResearchScorecard, normalizeResearchCosts, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
 import { createGuardedResearchPgPool } from '../src/db/research-database-guard.js';
 import { canonicalTrendOrNull } from '../src/domain/trend.js';
 import { assertScorecardRunAuthenticity } from '../src/validation-replay/replay-authenticity.js';
@@ -29,6 +29,13 @@ function markdownPathFor(jsonPath) {
 }
 
 const args = parseArgs(process.argv.slice(2));
+if (args['fee-bps'] == null || args['slippage-bps'] == null) {
+  throw Object.assign(new Error('--fee-bps and --slippage-bps are both required'), {
+    code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED'
+  });
+}
+const costOptions = normalizeResearchCosts({ feeBps: Number(args['fee-bps']), slippageBps: Number(args['slippage-bps']) });
+console.error(`cost_assumption explicit ${JSON.stringify({ feeBps: costOptions.feeBps, slippageBps: costOptions.slippageBps })}`);
 const output = args.output || 'v1-4d-research-scorecard.json';
 const markdownOutput = args['markdown-output'] || markdownPathFor(output);
 let rows;
@@ -113,23 +120,6 @@ if (args.input) {
   throw new Error('--input=<JSON file> or --validation-run-id=<UUID> is required');
 }
 
-if (args['round-trip-cost-bps'] != null && (args['fee-bps'] != null || args['slippage-bps'] != null)) {
-  throw new Error('--round-trip-cost-bps cannot be combined with --fee-bps or --slippage-bps');
-}
-// V1.4D unified fix: cost/fee/slippage assumptions are explicitly PRE_EXECUTION_DECISION_REQUIRED
-// (V1_4D_DATA_BACKFILL_SPEC.md / V1_4D_180D_FORMAL_RESEARCH_PLAN.md §B — outcome-engine.js and
-// forecast-contract.js model zero cost). This CLI previously defaulted silently to feeBps=8/
-// slippageBps=4 when none of the three cost flags were given, which would have produced a
-// "cost-adjusted" scorecard using invented numbers nobody approved. The default is now the
-// pre-cost baseline (0/0), and any non-zero cost assumption must be passed explicitly and is
-// echoed to stderr so it is never silent.
-const costFlagsProvided = args['round-trip-cost-bps'] != null || args['fee-bps'] != null || args['slippage-bps'] != null;
-const costOptions = args['round-trip-cost-bps'] != null
-  ? { roundTripCostBps: Number(args['round-trip-cost-bps']) }
-  : { feeBps: args['fee-bps'] == null ? 0 : Number(args['fee-bps']), slippageBps: args['slippage-bps'] == null ? 0 : Number(args['slippage-bps']) };
-console.error(costFlagsProvided
-  ? `cost_assumption explicit ${JSON.stringify(costOptions)}`
-  : `cost_assumption default_pre_cost ${JSON.stringify(costOptions)} (no --round-trip-cost-bps/--fee-bps/--slippage-bps given; see V1_4D_180D_FORMAL_RESEARCH_PLAN.md §K.1 item 2)`);
 const trainEnd = rows.find(row => row.trainEnd != null)?.trainEnd ?? null;
 const validationEnd = rows.find(row => row.validationEnd != null)?.validationEnd ?? null;
 const scorecard = { ...buildResearchScorecard(rows, {

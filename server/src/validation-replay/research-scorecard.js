@@ -179,14 +179,21 @@ function actionPermissionSummaries(rows, predictionField, costs) {
   return Object.fromEntries(values.map(value => [value, summarize(rows.filter(row => row.actionPermission === value), predictionField, costs)]));
 }
 
-function normalizeCosts(options) {
-  const hasCombined = options.roundTripCostBps != null;
+export function normalizeResearchCosts(options = {}) {
   const explicitFee = Object.hasOwn(options, 'feeBps');
   const explicitSlippage = Object.hasOwn(options, 'slippageBps');
-  const feeBps = explicitFee ? finiteNumber(options.feeBps) : hasCombined ? finiteNumber(options.roundTripCostBps) : 8;
-  const slippageBps = explicitSlippage ? finiteNumber(options.slippageBps) : hasCombined ? 0 : 4;
+  if (!explicitFee || !explicitSlippage) {
+    throw Object.assign(new TypeError('feeBps and slippageBps are both required'), {
+      code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED',
+      missing: [!explicitFee && 'feeBps', !explicitSlippage && 'slippageBps'].filter(Boolean)
+    });
+  }
+  const feeBps = finiteNumber(options.feeBps);
+  const slippageBps = finiteNumber(options.slippageBps);
   if (feeBps == null || slippageBps == null || feeBps < 0 || slippageBps < 0) {
-    throw new TypeError('feeBps and slippageBps must be finite non-negative numbers');
+    throw Object.assign(new TypeError('feeBps and slippageBps must be finite non-negative numbers'), {
+      code: 'SCORECARD_COST_ASSUMPTIONS_INVALID'
+    });
   }
   return { feeBps, slippageBps, totalBps: feeBps + slippageBps };
 }
@@ -361,7 +368,7 @@ function buildHorizonStatisticalPipeline(inputRows, horizon, options) {
 export function buildResearchScorecard(inputRows, options = {}) {
   if (!Array.isArray(inputRows)) throw new TypeError('inputRows must be an array');
   const randomSeed = finiteNumber(options.randomSeed) ?? 1404;
-  const costs = normalizeCosts(options);
+  const costs = normalizeResearchCosts(options);
   const pipelines = Object.fromEntries(['24h', '72h'].map(horizon => [horizon, buildHorizonStatisticalPipeline(inputRows, horizon, options)]));
   const rows = Object.values(pipelines).flatMap(pipeline => pipeline.direction.rows)
     .filter(row => DIRECTIONS.includes(row.actualDirection) && DIRECTIONS.includes(row.predictedDirection));

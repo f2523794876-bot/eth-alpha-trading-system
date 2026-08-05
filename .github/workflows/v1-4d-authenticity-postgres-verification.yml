@@ -56,7 +56,6 @@ jobs:
       - name: Record immutable source and isolated database evidence
         shell: bash
         env:
-          V14D_RESEARCH_DATABASE_NAME: eth_alpha_v14d_authenticity_ci
           V14D_DATABASE_IDENTITY: test
         run: |
           set -euo pipefail
@@ -90,7 +89,7 @@ jobs:
               "console.log(decodeURIComponent(new URL(process.env.TEST_DATABASE_URL).pathname.slice(1)))"
           )"
           test "$database_name" = "$test_database_url_name"
-          test "$database_name" = "$V14D_RESEARCH_DATABASE_NAME"
+          test "$database_name" = "eth_alpha_v14d_authenticity_ci"
           test "$V14D_DATABASE_IDENTITY" = "test"
 
           postgres_version="$(
@@ -110,8 +109,8 @@ jobs:
             echo "PostgreSQL version: $postgres_version"
             echo "Workflow PostgreSQL database name: $database_name"
             echo "TEST_DATABASE_URL database name: $test_database_url_name"
-            echo "V14D_RESEARCH_DATABASE_NAME: $V14D_RESEARCH_DATABASE_NAME"
-            echo "Database-name consistency: PASS (all three names match exactly)"
+            echo "Authorized fixed CI database name: eth_alpha_v14d_authenticity_ci"
+            echo "Database-name consistency: PASS (service, URL and fixed CI allowlist match exactly)"
             echo "TEST_DATABASE_URL target: postgresql://v14d_authenticity_ci:***@127.0.0.1:5432/eth_alpha_v14d_authenticity_ci"
             echo "DATABASE_URL usage: NOT USED (variable is unset and no secrets are referenced)"
             echo "Lifecycle: the PostgreSQL service container is destroyed automatically when this job ends"
@@ -130,7 +129,6 @@ jobs:
         working-directory: server
         shell: bash
         env:
-          V14D_RESEARCH_DATABASE_NAME: eth_alpha_v14d_authenticity_ci
           V14D_DATABASE_IDENTITY: test
         run: |
           set -euo pipefail
@@ -173,7 +171,6 @@ jobs:
             set +e
             if [ "$environment_scope" = "postgres" ]; then
               env -u DATABASE_URL \
-                V14D_RESEARCH_DATABASE_NAME=eth_alpha_v14d_authenticity_ci \
                 V14D_DATABASE_IDENTITY=test \
                 node --test --test-reporter=tap --test-concurrency=1 "$@" 2>&1 | tee "$log"
               rc=${PIPESTATUS[0]}
@@ -201,12 +198,15 @@ jobs:
           run_group postgres complete_v1_4d_postgres tests/postgres/v1-4d-*.integration.test.js
 
           run_group offline authenticity_report_scorecard \
+            src/db/research-database-guard.test.js \
             src/validation-replay/replay-authenticity.test.js \
             src/validation-replay/cli-entry.test.js \
             src/validation-replay/replay-evaluator.test.js \
             src/validation-replay/report-builder.test.js \
             src/validation-replay/research-scorecard.test.js \
-            scripts/v1-4d-scorecard-cli.test.mjs
+            scripts/v1-4d-scorecard-cli.test.mjs \
+            scripts/v1-4d-workflow-gate.test.mjs \
+            tests/postgres/_pg-integration-gate.test.js
 
       - name: Run explicit Report and Scorecard rejection probes
         id: rejection_probes
@@ -219,61 +219,15 @@ jobs:
           log="../$EVIDENCE_DIR/logs/report-scorecard-rejection-probes.tap"
           set +e
           env -u DATABASE_URL -u V14D_RESEARCH_DATABASE_NAME -u V14D_DATABASE_IDENTITY \
-            node --input-type=module <<'NODE' 2>&1 | tee "$log"
-          import assert from 'node:assert/strict';
-          import {
-            assertScorecardRunAuthenticity,
-            createReplayAuthenticitySummary,
-            recordGenerationAuthenticity,
-            assertReplayAuthenticity
-          } from './src/validation-replay/replay-authenticity.js';
-          import { buildValidationReports } from './src/validation-replay/report-builder.js';
-
-          const passed = createReplayAuthenticitySummary({ mode: 'fresh', expectedCount: 1 });
-          recordGenerationAuthenticity(passed, 'INSERTED');
-          assertReplayAuthenticity(passed);
-
-          for (const status of ['FAILED', 'BLOCKED']) {
-            const pool = { query: async () => ({ rowCount: 1, rows: [{ status }] }) };
-            await assert.rejects(
-              buildValidationReports({
-                pool, validationRunId: `probe-${status}`, datasetVersion: 'probe-dataset',
-                algorithmVersion: 'probe-algorithm', ruleVersion: 'probe-rule',
-                researchAvailabilityRuleVersion: 'probe-availability',
-                evaluationVersion: 'probe-evaluation', authenticitySummary: passed
-              }),
-              error => error.code === 'REPORT_VALIDATION_RUN_NOT_ELIGIBLE' && error.status === status
-            );
-            console.log(`SCENARIO PASS | Report rejects ${status} validation run`);
-            assert.throws(
-              () => assertScorecardRunAuthenticity({ runStatus: status, horizons: ['24h'], reportRows: [] }),
-              error => error.code === 'SCORECARD_VALIDATION_RUN_NOT_ELIGIBLE'
-            );
-            console.log(`SCENARIO PASS | Scorecard rejects ${status} validation run`);
-          }
-
-          const report = horizon => ({
-            horizon, reportScope: 'ALL',
-            formalProxyDisclosure: { rerunAuthenticity: passed }
-          });
-          const inconsistent = structuredClone(passed);
-          inconsistent.mode = 'resume';
-          assert.throws(
-            () => assertScorecardRunAuthenticity({
-              runStatus: 'SUCCEEDED', horizons: ['24h', '72h'],
-              reportRows: [report('24h'), {
-                horizon: '72h', reportScope: 'ALL',
-                formalProxyDisclosure: { rerunAuthenticity: inconsistent }
-              }]
-            }),
-            error => error.code === 'SCORECARD_RERUN_AUTHENTICITY_INCONSISTENT'
-          );
-          console.log('SCENARIO PASS | Scorecard rejects inconsistent authenticity evidence');
-          NODE
+            node --test --test-reporter=tap --test-concurrency=1 \
+            src/validation-replay/replay-authenticity-rejection-probes.test.js 2>&1 | tee "$log"
           rc=${PIPESTATUS[0]}
           set -e
+          pass="$(awk '/^# pass / { value=$3 } END { print value+0 }' "$log")"
+          fail="$(awk '/^# fail / { value=$3 } END { print value+0 }' "$log")"
+          skip="$(awk '/^# skipped / { value=$3 } END { print value+0 }' "$log")"
           printf 'report_scorecard_rejection_probes\t%s\t%s\t%s\t%s\n' \
-            "$rc" "$([ "$rc" -eq 0 ] && echo 5 || echo 0)" "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" 0 \
+            "$rc" "$pass" "$fail" "$skip" \
             >> "../$EVIDENCE_DIR/group-results.tsv"
 
       - name: Verify P1-6 backfill regression
@@ -306,6 +260,18 @@ jobs:
             "$rc" "$pass" "$fail" "$skip" \
             >> "../$EVIDENCE_DIR/group-results.tsv"
 
+      - name: Build and self-test structured verification gate
+        working-directory: server
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset DATABASE_URL
+          node scripts/v1-4d-workflow-gate.mjs --self-test | tee "../$EVIDENCE_DIR/logs/workflow-gate-self-test.log"
+          node scripts/v1-4d-workflow-gate.mjs --collect-scenarios \
+            "../$EVIDENCE_DIR/logs" "../$EVIDENCE_DIR/scenario-results.tsv"
+          node scripts/v1-4d-workflow-gate.mjs --validate \
+            "../$EVIDENCE_DIR/group-results.tsv" "../$EVIDENCE_DIR/scenario-results.tsv"
+
       - name: Build acceptance and scenario summary
         if: always()
         shell: bash
@@ -315,19 +281,6 @@ jobs:
           results="$EVIDENCE_DIR/group-results.tsv"
           summary="$EVIDENCE_DIR/verification-summary.md"
           backfill_classification="$(cat "$EVIDENCE_DIR/backfill-p1-6-classification.txt" 2>/dev/null || echo NOT_RUN)"
-
-          group_status() {
-            local group="$1"
-            local rc
-            rc="$(awk -F '\t' -v wanted="$group" '$1 == wanted { print $2 }' "$results" 2>/dev/null || true)"
-            if [ "$rc" = "0" ]; then echo PASS
-            elif [ -n "$rc" ]; then echo FAIL
-            else echo NOT_RUN
-            fi
-          }
-          targeted_status="$(group_status targeted_postgres)"
-          authenticity_status="$(group_status authenticity_report_scorecard)"
-          rejection_status="$(group_status report_scorecard_rejection_probes)"
 
           {
             echo "# V1.4D isolated PostgreSQL authenticity verification"
@@ -351,15 +304,11 @@ jobs:
             echo
             echo "| Scenario | Result | Evidence |"
             echo "|---|---|---|"
-            echo "| New Snapshot insert | $targeted_status | targeted PostgreSQL: INSERTED full generation flow |"
-            echo "| Identical rerun | $targeted_status | targeted PostgreSQL: REUSED_IDENTICAL and one retained Snapshot |"
-            echo "| Different-content collision | $targeted_status | targeted PostgreSQL: REPLAY_SNAPSHOT_IDENTITY_CONFLICT |"
-            echo "| Fresh zero inserts blocked | $authenticity_status | authenticity matrix: ZERO_FRESH_INSERTS |"
-            echo "| Fresh partial insert/reuse blocked | $authenticity_status | authenticity matrix: FRESH_REUSE_FORBIDDEN/FRESH_INSERT_COUNT_MISMATCH |"
-            echo "| Fresh all inserted; Evaluation allowed | $targeted_status | CLI PostgreSQL run: authenticity PASSED, evaluation/report path allowed |"
-            echo "| Report rejects FAILED/BLOCKED or authenticity not PASS | $rejection_status | unit tests plus explicit rejection probes |"
-            echo "| Scorecard rejects ineligible run/inconsistent evidence | $rejection_status | unit tests plus explicit rejection probes |"
-            echo "| Conflict aftermath | $targeted_status | CLI PostgreSQL assertions cover validation FAILED, generation FAILED/error_code, blocked reasons, and zero new Evaluation/Report while Snapshot remains single |"
+            if [ -f "$EVIDENCE_DIR/scenario-results.tsv" ]; then
+              while IFS=$'\t' read -r scenario result; do
+                echo "| $scenario | $result | exact test/assertion evidence recorded in TAP and conflict JSON diagnostics |"
+              done < "$EVIDENCE_DIR/scenario-results.tsv"
+            fi
             echo
             echo "## Backfill P1-6 regression"
             echo
@@ -390,21 +339,12 @@ jobs:
           results="$EVIDENCE_DIR/group-results.tsv"
           test -f "$results"
 
-          failed=0
-          while IFS=$'\t' read -r group rc pass fail skip; do
-            if [ "$rc" -ne 0 ]; then
-              echo "::error title=Test group failed::$group (pass=$pass fail=$fail skip=$skip)"
-              failed=1
-            fi
-          done < "$results"
-
-          backfill_classification="$(cat "$EVIDENCE_DIR/backfill-p1-6-classification.txt" 2>/dev/null || echo NOT_RUN)"
-          if [ "$backfill_classification" != "P1_6_REGRESSION_PASSED" ]; then
-            echo "::error title=P1-6 regression failed::$backfill_classification"
-            failed=1
-          fi
-
-          if [ "$failed" -ne 0 ]; then
+          set +e
+          node server/scripts/v1-4d-workflow-gate.mjs --validate \
+            "$results" "$EVIDENCE_DIR/scenario-results.tsv"
+          gate_rc=$?
+          set -e
+          if [ "$gate_rc" -ne 0 ]; then
             echo "GITHUB_ACTIONS_POSTGRES_VERIFICATION_FAILED"
             exit 1
           fi

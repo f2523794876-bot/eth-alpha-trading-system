@@ -11,14 +11,11 @@
 //     而不是直接调用createPgPool()，保护即自动生效，不存在"忘记调用校验函数"的操作员责任。
 //   - 校验失败时，连接（如果已经建立）必须被关闭，不得泄漏。
 
-// V1.4D unified fix: the allowed target name is now overridable via V14D_RESEARCH_DATABASE_NAME
-// so a genuinely separate, freshly-provisioned research database (e.g. for a specific 180-day run)
-// can be recognized without touching this constant's default and without weakening protection for
-// any existing deployment that doesn't set the override — unset behaves exactly as before.
-// The override itself is read once at module load, not re-read per call, so a single process's
-// notion of "the allowed research database" cannot drift mid-run.
+// 正式研究目标不可由环境变量重定义。CI例外也是固定名称，并且还需同时满足测试环境、显式开关
+// 和test身份；生产名eth_alpha无论如何设置V14D_RESEARCH_DATABASE_NAME都不会进入允许集合。
 export const DEFAULT_RESEARCH_DATABASE_NAME = 'eth_alpha_v14d_test';
-export const RESEARCH_DATABASE_NAME = process.env.V14D_RESEARCH_DATABASE_NAME || DEFAULT_RESEARCH_DATABASE_NAME;
+export const RESEARCH_DATABASE_NAME = DEFAULT_RESEARCH_DATABASE_NAME;
+export const CI_RESEARCH_DATABASE_NAME = 'eth_alpha_v14d_authenticity_ci';
 export const ALLOWED_RESEARCH_DATABASE_IDENTITIES = Object.freeze(['research', 'test']);
 export const RESEARCH_DATABASE_IDENTITY_ENV = 'V14D_DATABASE_IDENTITY';
 
@@ -77,7 +74,14 @@ export function assertExplicitResearchDatabaseIdentity(value) {
 }
 
 // 仅根据连接串声明的库名做格式与身份校验，不发起任何网络/数据库连接。
-export function parseResearchDatabaseTarget(databaseUrl) {
+function isAuthorizedCiTarget(databaseName, env) {
+  return databaseName === CI_RESEARCH_DATABASE_NAME &&
+    env.NODE_ENV === 'test' &&
+    env.ALLOW_POSTGRES_INTEGRATION_TESTS === '1' &&
+    env.V14D_DATABASE_IDENTITY === 'test';
+}
+
+export function parseResearchDatabaseTarget(databaseUrl, env = process.env) {
   if (!databaseUrl) {
     throw Object.assign(new Error('DATABASE_URL is required'), { code: 'DATABASE_URL_REQUIRED' });
   }
@@ -87,10 +91,13 @@ export function parseResearchDatabaseTarget(databaseUrl) {
   } catch {
     throw Object.assign(new Error('DATABASE_URL is invalid'), { code: 'DATABASE_URL_INVALID' });
   }
-  const declaredDatabaseName = parsed.pathname.slice(1);
-  if (declaredDatabaseName !== RESEARCH_DATABASE_NAME) {
+  if (!['postgres:', 'postgresql:'].includes(parsed.protocol)) {
+    throw Object.assign(new Error('DATABASE_URL is invalid'), { code: 'DATABASE_URL_INVALID' });
+  }
+  const declaredDatabaseName = decodeURIComponent(parsed.pathname.slice(1));
+  if (declaredDatabaseName !== RESEARCH_DATABASE_NAME && !isAuthorizedCiTarget(declaredDatabaseName, env)) {
     throw Object.assign(
-      new Error(`DATABASE_URL must target ${RESEARCH_DATABASE_NAME}`),
+      new Error(`DATABASE_URL must target the fixed research database ${RESEARCH_DATABASE_NAME}`),
       { code: 'DATABASE_TARGET_REJECTED', declaredDatabaseName }
     );
   }
@@ -99,13 +106,13 @@ export function parseResearchDatabaseTarget(databaseUrl) {
 
 // createPgPool由调用方注入（依赖注入，避免本模块与具体pg Pool实现耦合，也便于单元测试用假连接池
 // 验证fail-closed路径，不需要真实PostgreSQL）。
-export async function createGuardedResearchPgPool(config, { createPgPool }) {
-  const declaredDatabaseName = parseResearchDatabaseTarget(config.databaseUrl);
+export async function createGuardedResearchPgPool(config, { createPgPool, env = process.env }) {
+  const declaredDatabaseName = parseResearchDatabaseTarget(config.databaseUrl, env);
   const pool = await createPgPool(config);
   try {
     const identity = await pool.query('SELECT current_database() AS database');
     const actualDatabaseName = identity.rows?.[0]?.database;
-    if (actualDatabaseName !== RESEARCH_DATABASE_NAME) {
+    if (actualDatabaseName !== declaredDatabaseName) {
       throw Object.assign(
         new Error('Connected database identity rejected'),
         { code: 'DATABASE_TARGET_REJECTED', declaredDatabaseName, actualDatabaseName }

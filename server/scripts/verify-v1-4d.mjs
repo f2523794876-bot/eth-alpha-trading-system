@@ -25,6 +25,11 @@ const hasArg = name => argv.includes(`--${name}`);
 const replayDays = parseReplayDays(valueArg('replay-days'));
 const replayTo = valueArg('replay-to');
 const mode = hasArg('lightweight') ? 'OFFLINE_LIGHTWEIGHT' : 'FULL';
+const feeBpsArg = valueArg('fee-bps');
+const slippageBpsArg = valueArg('slippage-bps');
+const formalCosts = feeBpsArg == null || slippageBpsArg == null ? null : {
+  feeBps: Number(feeBpsArg), slippageBps: Number(slippageBpsArg)
+};
 if (replayTo != null) computeReplayWindow({ days: 7, replayTo });
 
 const startedAt = new Date().toISOString();
@@ -124,6 +129,16 @@ try {
       code: 'FULL_REPLAY_PLAN_REQUIRED', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
     });
   }
+  if (mode === 'FULL' && (feeBpsArg == null || slippageBpsArg == null)) {
+    throw Object.assign(new Error('--fee-bps and --slippage-bps are both required for full verification'), {
+      code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
+    });
+  }
+  if (mode === 'FULL' && (!Number.isFinite(formalCosts.feeBps) || formalCosts.feeBps < 0 || !Number.isFinite(formalCosts.slippageBps) || formalCosts.slippageBps < 0)) {
+    throw Object.assign(new Error('--fee-bps and --slippage-bps must be finite non-negative numbers'), {
+      code: 'SCORECARD_COST_ASSUMPTIONS_INVALID', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
+    });
+  }
   if (mode === 'FULL' && hasArg('offline-only')) {
     throw Object.assign(new Error('--offline-only is valid only with --lightweight; full verification cannot omit PostgreSQL'), {
       code: 'FULL_OFFLINE_MODE_INVALID', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
@@ -177,7 +192,7 @@ try {
         'scripts/v1-4d-scorecard-cli.mjs', `--validation-run-id=${validationRunId}`,
         `--evaluation-version=${process.env.V14D_EVALUATION_VERSION}`,
         `--output=${scorecardJson}`, `--markdown-output=${scorecardMarkdown}`,
-        `--fee-bps=${valueArg('fee-bps') || 8}`, `--slippage-bps=${valueArg('slippage-bps') || 4}`,
+        `--fee-bps=${formalCosts.feeBps}`, `--slippage-bps=${formalCosts.slippageBps}`,
         `--seed=${valueArg('seed') || 1404}`
       ], { env: { V14D_REPLAY_DATABASE_URL: process.env.V14D_REPLAY_DATABASE_URL } });
       const scorecard = JSON.parse(await readFile(scorecardJson, 'utf8'));
