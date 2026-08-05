@@ -1,8 +1,8 @@
 # V1.4D 正式研究执行契约 v8（最终统一正文 R3）
 
-状态：`READY_TO_IMPLEMENT`（D7自包含协议与全部契约机器验证已通过；正式研究尚未获授权）  
-契约状态的前置状态：`BLOCKED_PENDING_CONTRACT_FIX`  
-适用范围：V1.4D 正式研究的工程执行、D8 决策、D7 artifact 发布与 T1–T19 编排。  
+状态：`READY_TO_IMPLEMENT`（D7自包含协议与全部契约机器验证已通过；正式研究尚未获授权）
+契约状态的前置状态：`BLOCKED_PENDING_CONTRACT_FIX`
+适用范围：V1.4D 正式研究的工程执行、D8 决策、D7 artifact 发布与 T1–T19 编排。
 规范用语：“必须/不得”为强制；“应”为除非本契约明确例外否则强制；“可”为许可。
 
 本文件是唯一、自包含的执行契约。实施者仅依据本文件和本文列出的仓库事实实施；其他历史契约不构成补充语义。
@@ -115,8 +115,8 @@ Migration 005 和 `historical_validation` 表是现有基础；本文不创建 m
 
 固定 `z=1.959963984540054`，`p=successes/n`，`z2=z*z`：
 
-`center=(p+z2/(2n))/(1+z2/n)`  
-`margin=z*sqrt((p(1-p)+z2/(4n))/n)/(1+z2/n)`  
+`center=(p+z2/(2n))/(1+z2/n)`
+`margin=z*sqrt((p(1-p)+z2/(4n))/n)/(1+z2/n)`
 `lower=max(0,center-margin)`，`upper=min(1,center+margin)`。
 
 - `n=0`：lower/upper 均 null；随后 `EFFECTIVE_TEST_ZERO`。
@@ -14401,7 +14401,7 @@ R3_SCAN_POLICY_END -->
 - T1–T19结构与24字段、禁止旧语义/旧依赖扫描由最终正文检查器实际执行并在本节后续字段记录。
 - 最终结构检查实际结果：`R3_TASK_CHECK_RESULT=19/19 PASS; EACH=24/24; EXIT=0`。
 - 最终禁止扫描实际结果：`R3_FORBIDDEN_SCAN_RESULT=0 hits / PASS; LOCATIONS=NONE; EXIT=0`。
-- 自归一化SHA-256：`FINAL_R3_DOCUMENT_SHA256_ZEROED=b502a0334937ea211bebcf3a7aa2667eafcbd5120bbb68f5572e9aa628e86f9a`；只把本字段值替换为64个0后计算，其他bytes含末尾换行不变。完整文件SHA在交付时另报。
+- 自归一化SHA-256：`FINAL_R3_DOCUMENT_SHA256_ZEROED=23c72a5006482e1212e238d35a9e505abc46ad4c8b98b317adec0d6a3e07305a`；只把本字段值替换为64个0后计算，其他bytes含末尾换行不变。完整文件SHA在交付时另报。
 ## 8. 最终范围表
 
 ### READY_TO_IMPLEMENT
