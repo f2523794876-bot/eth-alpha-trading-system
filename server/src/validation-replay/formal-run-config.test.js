@@ -134,9 +134,15 @@ test('T1 rejects every missing or invalid artifact publication control', () => {
     { lockTimeoutMs: 1.5 },
     { staleLockRecovery: 'AUTO' },
     { maxArtifactBytes: 0 },
-    { maxArtifactBytes: 1.5 },
-    { maxArtifactBytes: Number.MAX_SAFE_INTEGER + 1 }
+    { maxArtifactBytes: 1.5 }
   ]) assert.throws(() => freezeFormalRunConfig(input(overrides)), { code: 'RUN_CONFIG_INVALID' });
+});
+
+test('T1 does not impose an unfrozen MAX_SAFE_INTEGER ceiling on maxArtifactBytes', () => {
+  const value = Number.MAX_SAFE_INTEGER + 1;
+  const result = freezeFormalRunConfig(input({ maxArtifactBytes: value }));
+  assert.equal(result.config.maxArtifactBytes, value);
+  assert.match(result.sha256, /^[0-9a-f]{64}$/);
 });
 
 test('T1 rejects accessors and Proxy input without executing user code or leaking its error', () => {

@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import Ajv2020 from 'ajv/dist/2020.js';
+import { canonicalJson } from './canonical-json.js';
 
 const RFC3339_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -60,41 +61,97 @@ export function loadJsonSchema(pathOrUrl) {
   return JSON.parse(readFileSync(pathOrUrl, 'utf8'));
 }
 
-export class Draft202012SchemaRegistry {
-  constructor({ schemas = [] } = {}) {
-    this.ajv = new Ajv2020({ allErrors: true, strict: true, validateFormats: true });
-    this.schemaIds = new Set();
-    this.ajv.addFormat('date-time', { type: 'string', validate: isRfc3339DateTime });
-    this.ajv.addFormat('uuid', { type: 'string', validate: (value) => UUID.test(value) });
-    for (const schema of schemas) this.addSchema(schema);
-    this.resolveAll();
-  }
+function registryError(code, message) {
+  return Object.assign(new TypeError(message), { code });
+}
 
-  addSchema(schema) {
-    if (!schema || typeof schema !== 'object' || Array.isArray(schema) || typeof schema.$id !== 'string') {
-      throw Object.assign(new TypeError('Schema must be an object with a non-empty $id'), { code: 'SCHEMA_ID_REQUIRED' });
-    }
-    if (schema.$id.length === 0) {
-      throw Object.assign(new TypeError('Schema must be an object with a non-empty $id'), { code: 'SCHEMA_ID_REQUIRED' });
-    }
-    if (schema.$schema !== 'https://json-schema.org/draft/2020-12/schema') {
-      throw Object.assign(new TypeError(`Schema ${schema.$id} must declare Draft 2020-12`), { code: 'SCHEMA_DIALECT_INVALID' });
-    }
-    if (this.schemaIds.has(schema.$id) || this.ajv.getSchema(schema.$id)) {
-      throw Object.assign(new TypeError('Schema identifier is already registered'), { code: 'SCHEMA_DUPLICATE' });
-    }
+function snapshotSchema(schema) {
+  try {
+    return JSON.parse(canonicalJson(schema));
+  } catch {
+    throw registryError('SCHEMA_INVALID', 'Schema must be safe JSON data');
+  }
+}
+
+function createAjv() {
+  const ajv = new Ajv2020({ allErrors: true, strict: true, validateFormats: true });
+  ajv.addFormat('date-time', { type: 'string', validate: isRfc3339DateTime });
+  ajv.addFormat('uuid', { type: 'string', validate: (value) => UUID.test(value) });
+  return ajv;
+}
+
+function assertSchemaHeader(schema) {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema) ||
+      typeof schema.$id !== 'string' || schema.$id.length === 0) {
+    throw registryError('SCHEMA_ID_REQUIRED', 'Schema must have a non-empty identifier');
+  }
+  if (schema.$schema !== 'https://json-schema.org/draft/2020-12/schema') {
+    throw registryError('SCHEMA_DIALECT_INVALID', 'Schema must declare Draft 2020-12');
+  }
+}
+
+function buildCandidateAjv(schemas) {
+  const ajv = createAjv();
+  for (const schema of schemas) {
     let schemaIsValid = false;
     try {
-      schemaIsValid = this.ajv.validateSchema(schema);
+      schemaIsValid = ajv.validateSchema(schema);
     } catch {
       schemaIsValid = false;
     }
     if (!schemaIsValid) {
-      throw Object.assign(new TypeError('Schema does not satisfy the Draft 2020-12 meta-schema'), { code: 'SCHEMA_INVALID' });
+      throw registryError('SCHEMA_INVALID', 'Schema does not satisfy the Draft 2020-12 meta-schema');
     }
-    this.ajv.addSchema(schema);
-    this.schemaIds.add(schema.$id);
+  }
+  try {
+    for (const schema of schemas) ajv.addSchema(schema);
+  } catch {
+    throw registryError('SCHEMA_INVALID', 'Schema could not be registered');
+  }
+  try {
+    for (const schema of schemas) {
+      if (!ajv.getSchema(schema.$id)) {
+        throw new Error('Schema did not compile');
+      }
+    }
+  } catch {
+    throw registryError('SCHEMA_REFERENCE_INVALID', 'Schema references could not be resolved');
+  }
+  return ajv;
+}
+
+export class Draft202012SchemaRegistry {
+  #schemaSnapshots = new Map();
+
+  constructor({ schemas = [] } = {}) {
+    this.ajv = createAjv();
+    this.schemaIds = new Set();
+    if (schemas.length > 0) this.#registerSchemas(schemas);
+  }
+
+  addSchema(schema) {
+    this.#registerSchemas([schema]);
     return this;
+  }
+
+  #registerSchemas(schemas) {
+    const snapshots = schemas.map(snapshotSchema);
+    const candidateSnapshots = new Map(this.#schemaSnapshots);
+    for (const schema of snapshots) {
+      assertSchemaHeader(schema);
+      if (candidateSnapshots.has(schema.$id)) {
+        throw registryError('SCHEMA_DUPLICATE', 'Schema identifier is already registered');
+      }
+      candidateSnapshots.set(schema.$id, schema);
+    }
+
+    // Build and fully compile an isolated candidate first. The live Registry and
+    // Ajv instance are replaced only after every schema and reference succeeds.
+    const candidateAjv = buildCandidateAjv([...candidateSnapshots.values()]);
+    this.ajv = candidateAjv;
+    this.#schemaSnapshots = candidateSnapshots;
+    this.schemaIds = new Set(candidateSnapshots.keys());
+    return snapshots;
   }
 
   resolveAll() {
@@ -105,15 +162,12 @@ export class Draft202012SchemaRegistry {
   compile(schemaOrId) {
     if (typeof schemaOrId === 'string') {
       const validator = this.ajv.getSchema(schemaOrId);
-      if (!validator) throw Object.assign(new Error(`Unknown schema: ${schemaOrId}`), { code: 'SCHEMA_NOT_FOUND' });
+      if (!validator) throw registryError('SCHEMA_NOT_FOUND', 'Schema identifier is not registered');
       return validator;
     }
-    // Object schemas are never compiled through a shortcut. They must pass the
-    // same id, dialect, meta-schema and duplicate-registration gates as schemas
-    // supplied to the constructor.
-    this.addSchema(schemaOrId);
-    const validator = this.ajv.getSchema(schemaOrId.$id);
-    if (!validator) throw Object.assign(new Error('Registered schema could not be compiled'), { code: 'SCHEMA_NOT_FOUND' });
+    const [snapshot] = this.#registerSchemas([schemaOrId]);
+    const validator = this.ajv.getSchema(snapshot.$id);
+    if (!validator) throw registryError('SCHEMA_NOT_FOUND', 'Registered schema could not be compiled');
     return validator;
   }
 

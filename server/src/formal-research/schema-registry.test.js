@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { Draft202012SchemaRegistry, isRfc3339DateTime, SchemaValidationError } from './schema-registry.js';
+import { Draft202012SchemaRegistry, isRfc3339DateTime, loadJsonSchema, SchemaValidationError } from './schema-registry.js';
 
 const addressSchema = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
@@ -118,7 +118,7 @@ test('unknown cross-schema references fail at schema registration', () => {
     $schema: 'https://json-schema.org/draft/2020-12/schema',
     $id: 'https://example.invalid/broken.json',
     $ref: 'https://example.invalid/missing.json'
-  }] }), /can't resolve reference|MissingRefError/);
+  }] }), { code: 'SCHEMA_REFERENCE_INVALID' });
 });
 
 test('registry rejects schemas that do not explicitly declare Draft 2020-12', () => {
@@ -164,7 +164,7 @@ test('direct object schemas cannot bypass id, dialect, meta-schema, duplicate, o
     $schema: 'https://json-schema.org/draft/2020-12/schema',
     $id: 'https://example.invalid/direct-missing-ref.json',
     $ref: 'https://example.invalid/not-registered.json'
-  }), /can't resolve reference|MissingRefError/);
+  }), { code: 'SCHEMA_REFERENCE_INVALID' });
 });
 
 test('direct object schema gate errors do not echo caller-controlled schema content', () => {
@@ -208,4 +208,131 @@ test('public schema errors redact caller-controlled property names and values', 
     assert.deepEqual(Object.keys(error.errors[0]).sort(), ['instancePath', 'keyword', 'message']);
   }
   assert.equal(Object.hasOwn(new SchemaValidationError([]), 'schemaId'), false);
+});
+
+function publicErrorText(error) {
+  return JSON.stringify({
+    message: error?.message,
+    code: error?.code,
+    path: error?.path,
+    details: error?.details,
+    cause: error?.cause,
+    enumerable: error
+  });
+}
+
+test('direct object schemas reject accessors recursively without executing getters', () => {
+  for (const build of [
+    (counter) => {
+      const schema = { $schema: 'https://json-schema.org/draft/2020-12/schema', type: 'integer' };
+      Object.defineProperty(schema, '$id', { enumerable: true, get() { counter.calls += 1; return 'https://example.invalid/top-getter.json'; } });
+      return schema;
+    },
+    (counter) => {
+      const nested = {};
+      Object.defineProperty(nested, 'type', { enumerable: true, get() { counter.calls += 1; return 'integer'; } });
+      return { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: 'https://example.invalid/nested-getter.json', properties: { value: nested } };
+    },
+    (counter) => {
+      const required = ['value'];
+      Object.defineProperty(required, '0', { enumerable: true, get() { counter.calls += 1; return 'value'; } });
+      return { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: 'https://example.invalid/array-getter.json', required };
+    }
+  ]) {
+    const counter = { calls: 0 };
+    assert.throws(() => new Draft202012SchemaRegistry().compile(build(counter)), { code: 'SCHEMA_INVALID' });
+    assert.equal(counter.calls, 0);
+  }
+});
+
+test('direct object schemas reject Proxy values recursively without executing traps', () => {
+  const proxy = (value, counter) => new Proxy(value, {
+    get() { counter.calls += 1; throw new Error('proxy-secret'); },
+    getPrototypeOf() { counter.calls += 1; throw new Error('proxy-secret'); },
+    ownKeys() { counter.calls += 1; throw new Error('proxy-secret'); },
+    getOwnPropertyDescriptor() { counter.calls += 1; throw new Error('proxy-secret'); }
+  });
+  for (const build of [
+    (counter) => proxy({ $schema: 'https://json-schema.org/draft/2020-12/schema', $id: 'https://example.invalid/top-proxy.json', type: 'integer' }, counter),
+    (counter) => ({ $schema: 'https://json-schema.org/draft/2020-12/schema', $id: 'https://example.invalid/nested-proxy.json', properties: { value: proxy({ type: 'integer' }, counter) } }),
+    (counter) => ({ $schema: 'https://json-schema.org/draft/2020-12/schema', $id: 'https://example.invalid/array-proxy.json', required: [proxy({ value: 'secret' }, counter)] })
+  ]) {
+    const counter = { calls: 0 };
+    const schema = build(counter);
+    assert.throws(() => new Draft202012SchemaRegistry().compile(schema), { code: 'SCHEMA_INVALID' });
+    assert.equal(counter.calls, 0);
+  }
+});
+
+test('schema registration errors redact secret ids, refs and invalid schema content', () => {
+  const vectors = [
+    {
+      secret: 'secret-schema-id',
+      schema: { $schema: 'http://json-schema.org/draft-07/schema#', $id: 'https://example.invalid/secret-schema-id', type: 'integer' },
+      code: 'SCHEMA_DIALECT_INVALID'
+    },
+    {
+      secret: 'secret-reference-url',
+      schema: { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: 'https://example.invalid/ref.json', $ref: 'https://example.invalid/secret-reference-url' },
+      code: 'SCHEMA_REFERENCE_INVALID'
+    },
+    {
+      secret: 'secret-invalid-type',
+      schema: { $schema: 'https://json-schema.org/draft/2020-12/schema', $id: 'https://example.invalid/meta.json', type: 'secret-invalid-type' },
+      code: 'SCHEMA_INVALID'
+    }
+  ];
+  for (const { secret, schema, code } of vectors) {
+    let error;
+    try { new Draft202012SchemaRegistry().compile(schema); } catch (caught) { error = caught; }
+    assert.equal(error.code, code);
+    assert.doesNotMatch(publicErrorText(error), new RegExp(secret));
+    for (const key of ['missingRef', 'missingSchema', 'details', 'cause']) {
+      assert.equal(Object.hasOwn(error, key), false);
+    }
+  }
+
+  const duplicateSecret = 'secret-duplicate-id';
+  const duplicateRegistry = new Draft202012SchemaRegistry();
+  const duplicateSchema = {
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    $id: `https://example.invalid/${duplicateSecret}`,
+    type: 'integer'
+  };
+  duplicateRegistry.addSchema(duplicateSchema);
+  let duplicateError;
+  try { duplicateRegistry.addSchema(duplicateSchema); } catch (caught) { duplicateError = caught; }
+  assert.equal(duplicateError.code, 'SCHEMA_DUPLICATE');
+  assert.doesNotMatch(publicErrorText(duplicateError), new RegExp(duplicateSecret));
+});
+
+test('failed direct registration is atomic and does not pollute Registry or Ajv', () => {
+  const id = 'https://example.invalid/atomic.json';
+  const registry = new Draft202012SchemaRegistry();
+  assert.throws(() => registry.compile({
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    $id: id,
+    $ref: 'https://example.invalid/secret-missing.json'
+  }), { code: 'SCHEMA_REFERENCE_INVALID' });
+  assert.equal(registry.schemaIds.has(id), false);
+  assert.equal(registry.ajv.getSchema(id), undefined);
+  assert.throws(() => registry.compile(id), { code: 'SCHEMA_NOT_FOUND' });
+
+  registry.addSchema({
+    $schema: 'https://json-schema.org/draft/2020-12/schema',
+    $id: id,
+    type: 'integer'
+  });
+  assert.equal(registry.validate(id, 7), 7);
+});
+
+test('file-loaded and direct object schemas use the same safe registration gate', () => {
+  const fileSchema = loadJsonSchema(new URL('./schemas/v1-4d-thresholds.schema.json', import.meta.url));
+  const directSchema = JSON.parse(JSON.stringify(fileSchema));
+  const fromFile = new Draft202012SchemaRegistry({ schemas: [fileSchema] });
+  const fromDirect = new Draft202012SchemaRegistry();
+  fromDirect.addSchema(directSchema);
+  assert.deepEqual([...fromFile.schemaIds], [...fromDirect.schemaIds]);
+  assert.ok(fromFile.compile(fileSchema.$id));
+  assert.ok(fromDirect.compile(directSchema.$id));
 });
