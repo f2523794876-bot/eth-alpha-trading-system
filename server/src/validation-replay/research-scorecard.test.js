@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildResearchScorecard, classificationMetrics, renderResearchScorecardMarkdown } from './research-scorecard.js';
+import {
+  buildResearchScorecard, classificationMetrics, normalizeResearchCosts,
+  parseResearchCostArgument, renderResearchScorecardMarkdown
+} from './research-scorecard.js';
 import { buildValidationReports } from './report-builder.js';
 import { assertReplayAuthenticity, createReplayAuthenticitySummary, recordGenerationAuthenticity } from './replay-authenticity.js';
 
@@ -125,16 +128,47 @@ test('Markdown report contains horizon, baseline, data-quality and explicit NOT_
   assert.doesNotMatch(markdown, /undefined/);
 });
 
-test('invalid costs fail closed instead of producing NaN scorecard values', () => {
-  for (const options of [{}, { feeBps: 1 }, { slippageBps: 1 }]) {
+test('missing and empty costs fail closed with the required error code', () => {
+  for (const options of [
+    {}, { feeBps: 1 }, { slippageBps: 1 },
+    { feeBps: undefined, slippageBps: 0 }, { feeBps: 0, slippageBps: undefined },
+    { feeBps: null, slippageBps: 0 }, { feeBps: 0, slippageBps: null },
+    { feeBps: '', slippageBps: 0 }, { feeBps: 0, slippageBps: '' },
+    { feeBps: '   ', slippageBps: 0 }, { feeBps: 0, slippageBps: '\t' }
+  ]) {
     assert.throws(() => buildResearchScorecard(completeRows(), options), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_REQUIRED');
   }
+});
+
+test('normalizer and builder reject every non-number cost type without coercion', () => {
   for (const options of [
     { feeBps: -1, slippageBps: 0 }, { feeBps: 0, slippageBps: -1 },
-    { feeBps: Number.NaN, slippageBps: 0 }, { feeBps: 0, slippageBps: Number.POSITIVE_INFINITY }
+    { feeBps: Number.NaN, slippageBps: 0 }, { feeBps: 0, slippageBps: Number.POSITIVE_INFINITY },
+    { feeBps: true, slippageBps: 0 }, { feeBps: false, slippageBps: 0 },
+    { feeBps: 0, slippageBps: true }, { feeBps: 0, slippageBps: false },
+    { feeBps: '8', slippageBps: 4 }, { feeBps: 8, slippageBps: '4' },
+    { feeBps: {}, slippageBps: 0 }, { feeBps: 0, slippageBps: [] }
   ]) {
+    assert.throws(() => normalizeResearchCosts(options), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_INVALID');
     assert.throws(() => buildResearchScorecard(completeRows(), options), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_INVALID');
   }
+});
+
+test('CLI cost parser distinguishes missing values from invalid values and accepts decimal strings', () => {
+  for (const value of [undefined, null, '', '   ', true]) {
+    assert.throws(() => parseResearchCostArgument(value, 'feeBps'), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_REQUIRED');
+  }
+  for (const value of [false, 0, {}, [], 'true', 'false', 'null', 'undefined', 'NaN', 'Infinity', '-1', 'not-a-number']) {
+    assert.throws(() => parseResearchCostArgument(value, 'feeBps'), error => error.code === 'SCORECARD_COST_ASSUMPTIONS_INVALID');
+  }
+  assert.equal(parseResearchCostArgument('0', 'feeBps'), 0);
+  assert.equal(parseResearchCostArgument(' 8 ', 'feeBps'), 8);
+  assert.equal(parseResearchCostArgument('4.5', 'slippageBps'), 4.5);
+});
+
+test('explicit numeric 0/0 and 8/4 remain valid at the bottom-level contract', () => {
+  assert.deepEqual(normalizeResearchCosts({ feeBps: 0, slippageBps: 0 }), { feeBps: 0, slippageBps: 0, totalBps: 0 });
+  assert.deepEqual(normalizeResearchCosts({ feeBps: 8, slippageBps: 4 }), { feeBps: 8, slippageBps: 4, totalBps: 12 });
 });
 
 function statisticalRow({ id, horizon = '24h', start, end, split = 'TEST' }) {

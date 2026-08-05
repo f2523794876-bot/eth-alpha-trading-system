@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { Pool } from 'pg';
-import { buildResearchScorecard, normalizeResearchCosts, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
+import { buildResearchScorecard, normalizeResearchCosts, parseResearchCostArgument, renderResearchScorecardMarkdown } from '../src/validation-replay/research-scorecard.js';
 import { createGuardedResearchPgPool } from '../src/db/research-database-guard.js';
 import { canonicalTrendOrNull } from '../src/domain/trend.js';
 import { assertScorecardRunAuthenticity } from '../src/validation-replay/replay-authenticity.js';
@@ -29,12 +29,10 @@ function markdownPathFor(jsonPath) {
 }
 
 const args = parseArgs(process.argv.slice(2));
-if (args['fee-bps'] == null || args['slippage-bps'] == null) {
-  throw Object.assign(new Error('--fee-bps and --slippage-bps are both required'), {
-    code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED'
-  });
-}
-const costOptions = normalizeResearchCosts({ feeBps: Number(args['fee-bps']), slippageBps: Number(args['slippage-bps']) });
+const costOptions = normalizeResearchCosts({
+  feeBps: parseResearchCostArgument(args['fee-bps'], 'feeBps'),
+  slippageBps: parseResearchCostArgument(args['slippage-bps'], 'slippageBps')
+});
 console.error(`cost_assumption explicit ${JSON.stringify({ feeBps: costOptions.feeBps, slippageBps: costOptions.slippageBps })}`);
 const output = args.output || 'v1-4d-research-scorecard.json';
 const markdownOutput = args['markdown-output'] || markdownPathFor(output);

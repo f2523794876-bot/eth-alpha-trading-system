@@ -179,21 +179,45 @@ function actionPermissionSummaries(rows, predictionField, costs) {
   return Object.fromEntries(values.map(value => [value, summarize(rows.filter(row => row.actionPermission === value), predictionField, costs)]));
 }
 
+function costAssumptionsRequired(missing) {
+  return Object.assign(new TypeError('feeBps and slippageBps are both required'), {
+    code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED',
+    missing
+  });
+}
+
+function costAssumptionsInvalid() {
+  return Object.assign(new TypeError('feeBps and slippageBps must be finite non-negative numbers'), {
+    code: 'SCORECARD_COST_ASSUMPTIONS_INVALID'
+  });
+}
+
+const DECIMAL_NUMBER = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+export function parseResearchCostArgument(value, name) {
+  if (value == null || value === true || (typeof value === 'string' && value.trim() === '')) {
+    throw costAssumptionsRequired([name]);
+  }
+  if (typeof value !== 'string') throw costAssumptionsInvalid();
+  const normalized = value.trim();
+  if (!DECIMAL_NUMBER.test(normalized)) throw costAssumptionsInvalid();
+  const number = Number(normalized);
+  if (!Number.isFinite(number) || number < 0) throw costAssumptionsInvalid();
+  return number;
+}
+
 export function normalizeResearchCosts(options = {}) {
   const explicitFee = Object.hasOwn(options, 'feeBps');
   const explicitSlippage = Object.hasOwn(options, 'slippageBps');
-  if (!explicitFee || !explicitSlippage) {
-    throw Object.assign(new TypeError('feeBps and slippageBps are both required'), {
-      code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED',
-      missing: [!explicitFee && 'feeBps', !explicitSlippage && 'slippageBps'].filter(Boolean)
-    });
-  }
-  const feeBps = finiteNumber(options.feeBps);
-  const slippageBps = finiteNumber(options.slippageBps);
-  if (feeBps == null || slippageBps == null || feeBps < 0 || slippageBps < 0) {
-    throw Object.assign(new TypeError('feeBps and slippageBps must be finite non-negative numbers'), {
-      code: 'SCORECARD_COST_ASSUMPTIONS_INVALID'
-    });
+  const missing = [
+    (!explicitFee || options.feeBps == null || (typeof options.feeBps === 'string' && options.feeBps.trim() === '')) && 'feeBps',
+    (!explicitSlippage || options.slippageBps == null || (typeof options.slippageBps === 'string' && options.slippageBps.trim() === '')) && 'slippageBps'
+  ].filter(Boolean);
+  if (missing.length) throw costAssumptionsRequired(missing);
+  const { feeBps, slippageBps } = options;
+  if (typeof feeBps !== 'number' || typeof slippageBps !== 'number' ||
+      !Number.isFinite(feeBps) || !Number.isFinite(slippageBps) || feeBps < 0 || slippageBps < 0) {
+    throw costAssumptionsInvalid();
   }
   return { feeBps, slippageBps, totalBps: feeBps + slippageBps };
 }

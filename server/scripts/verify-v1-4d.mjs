@@ -5,6 +5,7 @@ import {
   classifyReplayFailure, deriveVerificationStatus, exitCodeForStatus,
   extractChildErrorCode, redactSensitiveText
 } from './v1-4d-verification-contract.mjs';
+import { parseResearchCostArgument } from '../src/validation-replay/research-scorecard.js';
 
 const FROZEN_REF = 'dc6e573cdbc5aece7b932ab1cbbbe3daa3623437';
 const FROZEN_DOCS = Object.freeze([
@@ -21,15 +22,21 @@ const valueArg = name => {
   const index = argv.indexOf(`--${name}`);
   return index >= 0 ? argv[index + 1] : undefined;
 };
+const costValueArg = name => {
+  const inline = argv.find(value => value.startsWith(`--${name}=`));
+  if (inline) return inline.slice(name.length + 3);
+  const index = argv.indexOf(`--${name}`);
+  if (index < 0) return undefined;
+  const next = argv[index + 1];
+  return next == null || next.startsWith('--') ? true : next;
+};
 const hasArg = name => argv.includes(`--${name}`);
 const replayDays = parseReplayDays(valueArg('replay-days'));
 const replayTo = valueArg('replay-to');
 const mode = hasArg('lightweight') ? 'OFFLINE_LIGHTWEIGHT' : 'FULL';
-const feeBpsArg = valueArg('fee-bps');
-const slippageBpsArg = valueArg('slippage-bps');
-const formalCosts = feeBpsArg == null || slippageBpsArg == null ? null : {
-  feeBps: Number(feeBpsArg), slippageBps: Number(slippageBpsArg)
-};
+const feeBpsArg = costValueArg('fee-bps');
+const slippageBpsArg = costValueArg('slippage-bps');
+let formalCosts = null;
 if (replayTo != null) computeReplayWindow({ days: 7, replayTo });
 
 const startedAt = new Date().toISOString();
@@ -129,15 +136,16 @@ try {
       code: 'FULL_REPLAY_PLAN_REQUIRED', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
     });
   }
-  if (mode === 'FULL' && (feeBpsArg == null || slippageBpsArg == null)) {
-    throw Object.assign(new Error('--fee-bps and --slippage-bps are both required for full verification'), {
-      code: 'SCORECARD_COST_ASSUMPTIONS_REQUIRED', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
-    });
-  }
-  if (mode === 'FULL' && (!Number.isFinite(formalCosts.feeBps) || formalCosts.feeBps < 0 || !Number.isFinite(formalCosts.slippageBps) || formalCosts.slippageBps < 0)) {
-    throw Object.assign(new Error('--fee-bps and --slippage-bps must be finite non-negative numbers'), {
-      code: 'SCORECARD_COST_ASSUMPTIONS_INVALID', classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED'
-    });
+  if (mode === 'FULL') {
+    try {
+      formalCosts = {
+        feeBps: parseResearchCostArgument(feeBpsArg, 'feeBps'),
+        slippageBps: parseResearchCostArgument(slippageBpsArg, 'slippageBps')
+      };
+    } catch (error) {
+      Object.assign(error, { classification: 'CONFIG_MISSING', verificationStatus: 'BLOCKED' });
+      throw error;
+    }
   }
   if (mode === 'FULL' && hasArg('offline-only')) {
     throw Object.assign(new Error('--offline-only is valid only with --lightweight; full verification cannot omit PostgreSQL'), {
