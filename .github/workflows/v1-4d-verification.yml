@@ -26,6 +26,9 @@ jobs:
           cache-dependency-path: server/package-lock.json
       - working-directory: server
         run: npm ci
+      - name: Run R3 Batch 1 foundation tests
+        working-directory: server
+        run: npm run test:r3-batch1
       - name: Run offline/lightweight checks only (no DB or replay claim)
         working-directory: server
         run: npm run verify:v1.4d -- --offline-only --lightweight
