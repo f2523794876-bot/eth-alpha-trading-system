@@ -1,0 +1,419 @@
+{
+  "$defs": {
+    "baselineAvailabilityResult": {
+      "additionalProperties": false,
+      "properties": {
+        "postCostReferenceBaseline": {
+          "enum": [
+            "alwaysRange",
+            "follow4hTrend",
+            "historicalProportionRandom",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preCostReferenceBaseline": {
+          "enum": [
+            "alwaysRange",
+            "follow4hTrend",
+            "historicalProportionRandom",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primaryReasonCode": {
+          "enum": [
+            "NONE",
+            "ALWAYS_RANGE_NOT_EVALUABLE",
+            "BASELINE_NOT_EVALUABLE"
+          ]
+        },
+        "reasonCodes": {
+          "items": {
+            "enum": [
+              "ALWAYS_RANGE_NOT_EVALUABLE",
+              "BASELINE_NOT_EVALUABLE"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "status": {
+          "enum": [
+            "AVAILABLE",
+            "NOT_EVALUABLE"
+          ]
+        },
+        "usableBaselines": {
+          "items": {
+            "enum": [
+              "alwaysRange",
+              "follow4hTrend",
+              "historicalProportionRandom"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "status",
+        "primaryReasonCode",
+        "reasonCodes",
+        "usableBaselines",
+        "preCostReferenceBaseline",
+        "postCostReferenceBaseline"
+      ],
+      "type": "object"
+    },
+    "horizonResult": {
+      "additionalProperties": false,
+      "properties": {
+        "directionalCoverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "effectiveTest": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "marketRegimeCoverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "postCostLift": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "preCostLift": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "primaryReasonCode": {
+          "enum": [
+            "NONE",
+            "INPUT_CONSISTENCY_FAILED",
+            "AUDIT_RUN_NOT_SUCCEEDED",
+            "AUDIT_AUTHENTICITY_NOT_PASSED",
+            "MANIFEST_COVERAGE_INCOMPLETE",
+            "FEATURE_COVERAGE_INCOMPLETE",
+            "EFFECTIVE_TEST_ZERO",
+            "COVERAGE_NULL",
+            "LIFT_NULL",
+            "ALWAYS_RANGE_NOT_EVALUABLE",
+            "BASELINE_NOT_EVALUABLE",
+            "EFFECTIVE_TEST_BELOW_THRESHOLD",
+            "CLASS_SAMPLE_BELOW_THRESHOLD",
+            "RANGE_CLASS_ABSENT",
+            "RANGE_PREDICTION_DEGENERATE",
+            "WILSON_BELOW_THRESHOLD",
+            "PRE_COST_LIFT_BELOW_THRESHOLD",
+            "POST_COST_LIFT_BELOW_THRESHOLD",
+            "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+            "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+          ]
+        },
+        "reasonCodes": {
+          "items": {
+            "enum": [
+              "INPUT_CONSISTENCY_FAILED",
+              "AUDIT_RUN_NOT_SUCCEEDED",
+              "AUDIT_AUTHENTICITY_NOT_PASSED",
+              "MANIFEST_COVERAGE_INCOMPLETE",
+              "FEATURE_COVERAGE_INCOMPLETE",
+              "EFFECTIVE_TEST_ZERO",
+              "COVERAGE_NULL",
+              "LIFT_NULL",
+              "ALWAYS_RANGE_NOT_EVALUABLE",
+              "BASELINE_NOT_EVALUABLE",
+              "EFFECTIVE_TEST_BELOW_THRESHOLD",
+              "CLASS_SAMPLE_BELOW_THRESHOLD",
+              "RANGE_CLASS_ABSENT",
+              "RANGE_PREDICTION_DEGENERATE",
+              "WILSON_BELOW_THRESHOLD",
+              "PRE_COST_LIFT_BELOW_THRESHOLD",
+              "POST_COST_LIFT_BELOW_THRESHOLD",
+              "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+              "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "status": {
+          "enum": [
+            "GO",
+            "CONDITIONAL_GO",
+            "NO_GO",
+            "DATA_GATE_FAILED",
+            "BASELINE_NOT_EVALUABLE"
+          ]
+        },
+        "wilson95": {
+          "$ref": "#/$defs/wilson"
+        }
+      },
+      "required": [
+        "status",
+        "primaryReasonCode",
+        "reasonCodes",
+        "effectiveTest",
+        "directionalCoverage",
+        "marketRegimeCoverage",
+        "preCostLift",
+        "postCostLift",
+        "wilson95"
+      ],
+      "type": "object"
+    },
+    "wilson": {
+      "additionalProperties": false,
+      "properties": {
+        "confidenceLevel": {
+          "const": 0.95
+        },
+        "lower": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "successes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trials": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "upper": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "z": {
+          "const": 1.959963984540054
+        }
+      },
+      "required": [
+        "confidenceLevel",
+        "z",
+        "successes",
+        "trials",
+        "lower",
+        "upper"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-go-no-go-output-2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "baselineAvailability": {
+      "additionalProperties": false,
+      "properties": {
+        "24h": {
+          "$ref": "#/$defs/baselineAvailabilityResult"
+        },
+        "72h": {
+          "$ref": "#/$defs/baselineAvailabilityResult"
+        }
+      },
+      "required": [
+        "24h",
+        "72h"
+      ],
+      "type": "object"
+    },
+    "evaluatedAt": {
+      "format": "date-time",
+      "pattern": "Z$",
+      "type": "string"
+    },
+    "evaluationVersion": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "horizonResults": {
+      "additionalProperties": false,
+      "properties": {
+        "24h": {
+          "$ref": "#/$defs/horizonResult"
+        },
+        "72h": {
+          "$ref": "#/$defs/horizonResult"
+        }
+      },
+      "required": [
+        "24h",
+        "72h"
+      ],
+      "type": "object"
+    },
+    "overall": {
+      "additionalProperties": false,
+      "properties": {
+        "primaryReasonCode": {
+          "enum": [
+            "NONE",
+            "INPUT_CONSISTENCY_FAILED",
+            "AUDIT_RUN_NOT_SUCCEEDED",
+            "AUDIT_AUTHENTICITY_NOT_PASSED",
+            "MANIFEST_COVERAGE_INCOMPLETE",
+            "FEATURE_COVERAGE_INCOMPLETE",
+            "EFFECTIVE_TEST_ZERO",
+            "COVERAGE_NULL",
+            "LIFT_NULL",
+            "ALWAYS_RANGE_NOT_EVALUABLE",
+            "BASELINE_NOT_EVALUABLE",
+            "EFFECTIVE_TEST_BELOW_THRESHOLD",
+            "CLASS_SAMPLE_BELOW_THRESHOLD",
+            "RANGE_CLASS_ABSENT",
+            "RANGE_PREDICTION_DEGENERATE",
+            "WILSON_BELOW_THRESHOLD",
+            "PRE_COST_LIFT_BELOW_THRESHOLD",
+            "POST_COST_LIFT_BELOW_THRESHOLD",
+            "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+            "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+          ]
+        },
+        "reasonCodes": {
+          "items": {
+            "enum": [
+              "INPUT_CONSISTENCY_FAILED",
+              "AUDIT_RUN_NOT_SUCCEEDED",
+              "AUDIT_AUTHENTICITY_NOT_PASSED",
+              "MANIFEST_COVERAGE_INCOMPLETE",
+              "FEATURE_COVERAGE_INCOMPLETE",
+              "EFFECTIVE_TEST_ZERO",
+              "COVERAGE_NULL",
+              "LIFT_NULL",
+              "ALWAYS_RANGE_NOT_EVALUABLE",
+              "BASELINE_NOT_EVALUABLE",
+              "EFFECTIVE_TEST_BELOW_THRESHOLD",
+              "CLASS_SAMPLE_BELOW_THRESHOLD",
+              "RANGE_CLASS_ABSENT",
+              "RANGE_PREDICTION_DEGENERATE",
+              "WILSON_BELOW_THRESHOLD",
+              "PRE_COST_LIFT_BELOW_THRESHOLD",
+              "POST_COST_LIFT_BELOW_THRESHOLD",
+              "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+              "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "status": {
+          "enum": [
+            "GO",
+            "CONDITIONAL_GO",
+            "NO_GO",
+            "DATA_GATE_FAILED",
+            "BASELINE_NOT_EVALUABLE"
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "primaryReasonCode",
+        "reasonCodes"
+      ],
+      "type": "object"
+    },
+    "primaryReasonCode": {
+      "enum": [
+        "NONE",
+        "INPUT_CONSISTENCY_FAILED",
+        "AUDIT_RUN_NOT_SUCCEEDED",
+        "AUDIT_AUTHENTICITY_NOT_PASSED",
+        "MANIFEST_COVERAGE_INCOMPLETE",
+        "FEATURE_COVERAGE_INCOMPLETE",
+        "EFFECTIVE_TEST_ZERO",
+        "COVERAGE_NULL",
+        "LIFT_NULL",
+        "ALWAYS_RANGE_NOT_EVALUABLE",
+        "BASELINE_NOT_EVALUABLE",
+        "EFFECTIVE_TEST_BELOW_THRESHOLD",
+        "CLASS_SAMPLE_BELOW_THRESHOLD",
+        "RANGE_CLASS_ABSENT",
+        "RANGE_PREDICTION_DEGENERATE",
+        "WILSON_BELOW_THRESHOLD",
+        "PRE_COST_LIFT_BELOW_THRESHOLD",
+        "POST_COST_LIFT_BELOW_THRESHOLD",
+        "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+        "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+      ]
+    },
+    "reasonCodes": {
+      "items": {
+        "enum": [
+          "INPUT_CONSISTENCY_FAILED",
+          "AUDIT_RUN_NOT_SUCCEEDED",
+          "AUDIT_AUTHENTICITY_NOT_PASSED",
+          "MANIFEST_COVERAGE_INCOMPLETE",
+          "FEATURE_COVERAGE_INCOMPLETE",
+          "EFFECTIVE_TEST_ZERO",
+          "COVERAGE_NULL",
+          "LIFT_NULL",
+          "ALWAYS_RANGE_NOT_EVALUABLE",
+          "BASELINE_NOT_EVALUABLE",
+          "EFFECTIVE_TEST_BELOW_THRESHOLD",
+          "CLASS_SAMPLE_BELOW_THRESHOLD",
+          "RANGE_CLASS_ABSENT",
+          "RANGE_PREDICTION_DEGENERATE",
+          "WILSON_BELOW_THRESHOLD",
+          "PRE_COST_LIFT_BELOW_THRESHOLD",
+          "POST_COST_LIFT_BELOW_THRESHOLD",
+          "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+          "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+        ]
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "schemaVersion": {
+      "const": "v1.4d-go-no-go-output/2"
+    },
+    "validationRunId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "validationRunId",
+    "evaluationVersion",
+    "evaluatedAt",
+    "baselineAvailability",
+    "horizonResults",
+    "overall",
+    "primaryReasonCode",
+    "reasonCodes"
+  ],
+  "type": "object"
+}
