@@ -183,3 +183,37 @@ test('空batches数组：拒绝', () => {
     );
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });
+
+test('真实结构DRY_RUN：无GO模板/无assemble hook，逐行数据组装D8并完成D7发布回读', () => {
+  const root = makeRoot();
+  const statusRoot = makeRoot();
+  try {
+    const validationRunId = randomUUID();
+    const trainEnd = Date.parse('2026-01-04T00:00:00Z');
+    const validationEnd = Date.parse('2026-01-07T00:00:00Z');
+    const make = (horizon, index, split, actual) => {
+      const origin = { TRAIN: Date.parse('2026-01-01T00:00:00Z'), VALIDATION: trainEnd, TEST: validationEnd }[split];
+      const width = horizon === '24h' ? 86400000 : 259200000;
+      return { predictionId: `${horizon}-${split}-${index}`, horizon, targetStartTime: origin + index * width, targetEndTime: origin + (index + 1) * width,
+        actualDirection: actual, predictedDirection: actual, trend4hDirection: actual, trend4hAtGeneration: actual,
+        directionCorrect: true, directionEligibleForStatistics: true, pathEligibleForStatistics: true, isDirectionSample: true, isMarketRegimeSample: true,
+        actualReturn: actual === 'UP' ? .02 : actual === 'DOWN' ? -.02 : .001, mfe: .02, mae: .01, endpointDataComplete: true, pathDataComplete: true };
+    };
+    const rows = [];
+    for (const horizon of ['24h', '72h']) for (const split of ['TRAIN', 'VALIDATION', 'TEST']) {
+      rows.push(make(horizon, 0, split, 'UP'), make(horizon, 1, split, 'DOWN'), make(horizon, 2, split, 'RANGE'));
+    }
+    const opts = baseOptions(root, statusRoot, validationRunId, {
+      batches: [{ batchIndex: 0, governanceRows: rows, scorecardRows: rows }], assembleD8Input: null,
+      trainEnd, validationEnd, thresholds: GO_INPUT.thresholds,
+      auditTrail: { ...GO_INPUT.auditTrail, datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`, manifestContentHash: 'c'.repeat(64), backfillBatchIds: [], vintageIds: [] }
+    });
+    const result = runFormalResearchOrchestrator(opts);
+    assert.equal(result.published, true);
+    assert.equal(result.runStatus.runState, 'COMPLETED');
+    assert.equal(result.decision.validationRunId, validationRunId);
+    assert.equal(result.decision.horizonResults['24h'].effectiveTest, 3);
+    const dir = targetDirFor(root, 'dry-run', validationRunId, opts.evaluationVersion);
+    assert.equal(readArtifactPair(dir).readerStatus, 'ACCEPTED');
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});

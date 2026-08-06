@@ -18,6 +18,8 @@ import { buildDeterministicScorecard } from './deterministic-scorecard.js';
 import { evaluateGoNoGo } from '../formal-research/go-no-go-evaluator.js';
 import { resolveGovernanceAuthorizationRef } from './governance-authorization.js';
 import { publishArtifact } from './artifact-publisher.js';
+import { assembleD8InputFromResearchRows } from './d8-input-assembler.js';
+import { loadFormalResearchRows } from './formal-research-data-repository.js';
 import {
   readRunStatus, writeRunStatus, initialRunStatus, withBatchCompleted, withBlocked, withCompleted, withFailed
 } from './research-run-status.js';
@@ -34,15 +36,17 @@ export function runFormalResearchOrchestrator(options) {
   const {
     statusRoot, artifactRoot, validationRunId, evaluationVersion, artifactMode,
     batches, scorecardOptions, validationRunFinishedAt,
-    assembleD8Input, buildArtifactCore,
+    assembleD8Input = null, buildArtifactCore,
+    trainEnd, validationEnd, thresholds, auditTrail,
     governanceRecord = null, expectedThresholdsSha256 = null,
     manifestContentHash, lockTimeoutMs
   } = options;
 
   if (!Array.isArray(batches) || batches.length === 0) throw fail('ORCHESTRATOR_INVALID_INPUT', 'batches must be a non-empty array');
   if (artifactMode !== 'FORMAL' && artifactMode !== 'DRY_RUN') throw fail('ORCHESTRATOR_INVALID_INPUT', 'artifactMode must be FORMAL or DRY_RUN');
-  if (typeof assembleD8Input !== 'function' || typeof buildArtifactCore !== 'function') {
-    throw fail('ORCHESTRATOR_INVALID_INPUT', 'assembleD8Input and buildArtifactCore hooks are required');
+  if (assembleD8Input !== null && typeof assembleD8Input !== 'function') throw fail('ORCHESTRATOR_INVALID_INPUT', 'assembleD8Input must be a function');
+  if (typeof buildArtifactCore !== 'function') {
+    throw fail('ORCHESTRATOR_INVALID_INPUT', 'buildArtifactCore hook is required');
   }
 
   let status = readRunStatus(statusRoot, artifactMode, validationRunId);
@@ -70,7 +74,12 @@ export function runFormalResearchOrchestrator(options) {
   try {
     statistics = computeMarketRegimeStatistics(accumulatedGovernanceRows);
     scorecardResult = buildDeterministicScorecard(accumulatedScorecardRows, scorecardOptions, { validationRunFinishedAt });
-    d8Input = assembleD8Input({ statistics, scorecardResult, validationRunId, evaluationVersion, validationRunFinishedAt });
+    d8Input = assembleD8Input
+      ? assembleD8Input({ statistics, scorecardResult, validationRunId, evaluationVersion, validationRunFinishedAt })
+      : assembleD8InputFromResearchRows({
+          rows: accumulatedScorecardRows, scorecardResult, validationRunId, evaluationVersion,
+          evaluatedAt: validationRunFinishedAt, trainEnd, validationEnd, thresholds, auditTrail
+        });
     decision = evaluateGoNoGo(d8Input);
     governanceRef = resolveGovernanceAuthorizationRef({
       artifactMode, record: governanceRecord,
@@ -104,4 +113,20 @@ export function runFormalResearchOrchestrator(options) {
   status = withCompleted(status);
   writeRunStatus(statusRoot, status);
   return { runStatus: status, published: true, publishResult, decision, statistics, scorecardResult };
+}
+
+// Production wiring for T13/T19.  The caller still supplies all governance,
+// thresholds and publishing identity inputs; this function only replaces the
+// former external DB/read/assembly hooks with the reviewed repository path.
+export async function runFormalResearchFromDatabase(options) {
+  const { pool, validationRunId, evaluationVersion, batchSize = 1000 } = options;
+  if (!Number.isInteger(batchSize) || batchSize < 1) throw fail('ORCHESTRATOR_INVALID_INPUT', 'batchSize must be a positive integer');
+  const rows = await loadFormalResearchRows(pool, { validationRunId, evaluationVersion });
+  if (!rows.length) throw fail('ORCHESTRATOR_NO_RESEARCH_ROWS', 'no evaluated research rows found for validation run');
+  const batches = [];
+  for (let offset = 0; offset < rows.length; offset += batchSize) {
+    const slice = rows.slice(offset, offset + batchSize);
+    batches.push({ batchIndex: batches.length, governanceRows: slice, scorecardRows: slice });
+  }
+  return runFormalResearchOrchestrator({ ...options, batches, assembleD8Input: null });
 }
