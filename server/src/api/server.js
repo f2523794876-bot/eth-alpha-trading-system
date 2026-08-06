@@ -2,6 +2,7 @@ import http from 'node:http';
 import { HEALTH_STATES, INTERVALS, MARKET_TYPES, MAX_QUERY_RANGE_MS, MAX_QUERY_ROWS, SYMBOLS } from '../domain/constants.js';
 import { buildRealtimeDashboard } from '../dashboard/build-realtime-dashboard.js';
 import { REALTIME_DASHBOARD_PAGE_HTML } from '../dashboard/realtime-page.js';
+import { readD8DisplayStatus } from '../validation-replay/d8-status-reader.js';
 
 const json=(res,status,body)=>{const payload=JSON.stringify(body);res.writeHead(status,{'content-type':'application/json; charset=utf-8','content-length':Buffer.byteLength(payload),'cache-control':'no-store'});res.end(payload);};
 const html=(res,status,body)=>{res.writeHead(status,{'content-type':'text/html; charset=utf-8','content-length':Buffer.byteLength(body),'cache-control':'no-store'});res.end(body);};
@@ -10,7 +11,7 @@ const oneOf=(value,allowed,name)=>{if(!allowed.includes(value))throw Object.assi
 const integer=(value,fallback,min,max,name)=>{const n=value===null?fallback:Number(value);if(!Number.isSafeInteger(n)||n<min||n>max)throw Object.assign(new Error(`${name}超出范围`),{status:400,code:`INVALID_${name.toUpperCase()}`});return n;};
 function range(params){const now=Date.now();const to=integer(params.get('to'),now,0,Number.MAX_SAFE_INTEGER,'to');const from=integer(params.get('from'),to-7*86400000,0,to,'from');if(to-from>MAX_QUERY_RANGE_MS)throw Object.assign(new Error('时间范围超过366天'),{status:400,code:'RANGE_TOO_LARGE'});return{from,to};}
 
-export function createApiServer({collector,repository,host='127.0.0.1',port=8787}){
+export function createApiServer({collector,repository,host='127.0.0.1',port=8787,d8ArtifactRoot,d8RunStatusRoot}){
   const server=http.createServer(async(req,res)=>{
     try{
       if(req.method!=='GET')return error(res,405,'METHOD_NOT_ALLOWED','仅支持只读GET请求');
@@ -33,6 +34,9 @@ export function createApiServer({collector,repository,host='127.0.0.1',port=8787
       // server/src/dashboard/*.js顶部说明）。本路由只读repository.latestBars/latestProvisionalBar/
       // latestForecastSnapshot与collector.readiness()，不触发采集或预测生成，不写入任何行。
       if(p==='/api/v1/dashboard/realtime'){const instrument=oneOf(url.searchParams.get('instrument')||'ETHUSDT',SYMBOLS,'instrument');return json(res,200,{ok:true,data:await buildRealtimeDashboard({repository,collector,instrument})});}
+      // D8正式研究只读展示：只读取D7已发布产物+编排运行状态遥测，不查询业务表、不调用D8求值函数、
+      // 不触发任何研究/发布/交易动作（见d8-status-reader.js头部红线）。json()统一设置no-store。
+      if(p==='/api/v1/research/d8/status')return json(res,200,{ok:true,data:readD8DisplayStatus({artifactRoot:d8ArtifactRoot,statusRoot:d8RunStatusRoot})});
       return error(res,404,'NOT_FOUND','接口不存在');
     }catch(e){return error(res,e.status||500,e.code||'INTERNAL_ERROR',e.status?e.message:'服务暂时不可用');}
   });

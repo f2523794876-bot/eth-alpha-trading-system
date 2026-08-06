@@ -1,0 +1,298 @@
+{
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-artifact-publish-result-4.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operationStatus": {
+            "enum": [
+              "PUBLISHED",
+              "REUSED_IDENTICAL"
+            ]
+          }
+        },
+        "required": [
+          "operationStatus"
+        ]
+      },
+      "then": {
+        "properties": {
+          "postPublishStatus": {
+            "enum": [
+              "COMPLETE",
+              "WARNING",
+              "ERROR"
+            ]
+          },
+          "reasonCode": {
+            "const": "NONE"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "operationStatus": {
+            "const": "FAILED"
+          }
+        },
+        "required": [
+          "operationStatus"
+        ]
+      },
+      "then": {
+        "properties": {
+          "postPublishCode": {
+            "const": "NONE"
+          },
+          "postPublishStatus": {
+            "const": "NOT_APPLICABLE"
+          },
+          "reasonCode": {
+            "enum": [
+              "ARTIFACT_SCHEMA_INVALID",
+              "ARTIFACT_CANONICALIZATION_FAILED",
+              "ARTIFACT_TEMP_WRITE_FAILED",
+              "ARTIFACT_FSYNC_FAILED",
+              "ARTIFACT_RENAME_FAILED",
+              "ARTIFACT_DIRECTORY_FSYNC_FAILED",
+              "ARTIFACT_PAIR_INCOMPLETE",
+              "ARTIFACT_HASH_MISMATCH",
+              "ARTIFACT_CONTENT_CONFLICT",
+              "ARTIFACT_RECOVERY_REQUIRED",
+              "D8_INPUT_HASH_MISSING",
+              "D8_INPUT_HASH_MISMATCH",
+              "D8_INPUT_CANONICALIZATION_FAILED",
+              "GOVERNANCE_AUTHORIZATION_MISSING",
+              "GOVERNANCE_AUTHORIZATION_INVALID",
+              "GOVERNANCE_AUTHORIZATION_MISMATCH",
+              "ARTIFACT_ROOT_INVALID",
+              "ARTIFACT_PATH_ESCAPE",
+              "ARTIFACT_SYMLINK_REJECTED",
+              "ARTIFACT_LOCK_ACQUIRE_FAILED",
+              "ARTIFACT_LOCK_TIMEOUT",
+              "ARTIFACT_LOCK_INVALID",
+              "ARTIFACT_LOCK_OWNERSHIP_LOST",
+              "ARTIFACT_TEMP_NAME_INVALID",
+              "ARTIFACT_TEMP_VERIFY_FAILED",
+              "ARTIFACT_READER_VALIDATION_FAILED",
+              "ARTIFACT_AUDIT_INTENT_WRITE_FAILED",
+              "ARTIFACT_LOCK_IDENTITY_CHANGED",
+              "ARTIFACT_STALE_LOCK_QUARANTINE_COLLISION",
+              "ARTIFACT_STALE_LOCK_QUARANTINE_UNSUPPORTED",
+              "ARTIFACT_STALE_LOCK_QUARANTINE_INVALID",
+              "ARTIFACT_STALE_LOCK_QUARANTINE_SYMLINK",
+              "ARTIFACT_STALE_LOCK_QUARANTINE_UNVERIFIED",
+              "ARTIFACT_STALE_LOCK_QUARANTINE_DELETE_FAILED",
+              "ARTIFACT_STALE_LOCK_QUARANTINE_FSYNC_FAILED",
+              "ARTIFACT_UNEXPECTED_DIRECTORY_ENTRY"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "postPublishStatus": {
+            "const": "COMPLETE"
+          }
+        },
+        "required": [
+          "postPublishStatus"
+        ]
+      },
+      "then": {
+        "properties": {
+          "postPublishCode": {
+            "const": "NONE"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "postPublishStatus": {
+            "const": "WARNING"
+          }
+        },
+        "required": [
+          "postPublishStatus"
+        ]
+      },
+      "then": {
+        "properties": {
+          "postPublishCode": {
+            "enum": [
+              "POST_PUBLISH_AUDIT_COMPLETION_FAILED",
+              "POST_PUBLISH_LOCK_RELEASE_FAILED",
+              "POST_PUBLISH_AUDIT_AND_LOCK_FAILED"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "postPublishStatus": {
+            "const": "ERROR"
+          }
+        },
+        "required": [
+          "postPublishStatus"
+        ]
+      },
+      "then": {
+        "properties": {
+          "postPublishCode": {
+            "enum": [
+              "POST_PUBLISH_DIRECTORY_FSYNC_FAILED",
+              "POST_PUBLISH_REREAD_IO_FAILED",
+              "POST_PUBLISH_REREAD_SCHEMA_FAILED",
+              "POST_PUBLISH_REREAD_CANONICAL_FAILED",
+              "POST_PUBLISH_REREAD_HASH_MISMATCH",
+              "POST_PUBLISH_REREAD_IDENTITY_MISMATCH"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "operationStatus": {
+      "enum": [
+        "PUBLISHED",
+        "REUSED_IDENTICAL",
+        "FAILED"
+      ]
+    },
+    "postPublishCode": {
+      "enum": [
+        "NONE",
+        "POST_PUBLISH_DIRECTORY_FSYNC_FAILED",
+        "POST_PUBLISH_REREAD_IO_FAILED",
+        "POST_PUBLISH_REREAD_SCHEMA_FAILED",
+        "POST_PUBLISH_REREAD_CANONICAL_FAILED",
+        "POST_PUBLISH_REREAD_HASH_MISMATCH",
+        "POST_PUBLISH_REREAD_IDENTITY_MISMATCH",
+        "POST_PUBLISH_AUDIT_COMPLETION_FAILED",
+        "POST_PUBLISH_LOCK_RELEASE_FAILED",
+        "POST_PUBLISH_AUDIT_AND_LOCK_FAILED"
+      ]
+    },
+    "postPublishStatus": {
+      "enum": [
+        "NOT_APPLICABLE",
+        "COMPLETE",
+        "WARNING",
+        "ERROR"
+      ]
+    },
+    "reasonCode": {
+      "enum": [
+        "NONE",
+        "ARTIFACT_SCHEMA_INVALID",
+        "ARTIFACT_CANONICALIZATION_FAILED",
+        "ARTIFACT_TEMP_WRITE_FAILED",
+        "ARTIFACT_FSYNC_FAILED",
+        "ARTIFACT_RENAME_FAILED",
+        "ARTIFACT_DIRECTORY_FSYNC_FAILED",
+        "ARTIFACT_PAIR_INCOMPLETE",
+        "ARTIFACT_HASH_MISMATCH",
+        "ARTIFACT_CONTENT_CONFLICT",
+        "ARTIFACT_RECOVERY_REQUIRED",
+        "D8_INPUT_HASH_MISSING",
+        "D8_INPUT_HASH_MISMATCH",
+        "D8_INPUT_CANONICALIZATION_FAILED",
+        "GOVERNANCE_AUTHORIZATION_MISSING",
+        "GOVERNANCE_AUTHORIZATION_INVALID",
+        "GOVERNANCE_AUTHORIZATION_MISMATCH",
+        "ARTIFACT_ROOT_INVALID",
+        "ARTIFACT_PATH_ESCAPE",
+        "ARTIFACT_SYMLINK_REJECTED",
+        "ARTIFACT_LOCK_ACQUIRE_FAILED",
+        "ARTIFACT_LOCK_TIMEOUT",
+        "ARTIFACT_LOCK_INVALID",
+        "ARTIFACT_LOCK_OWNERSHIP_LOST",
+        "ARTIFACT_TEMP_NAME_INVALID",
+        "ARTIFACT_TEMP_VERIFY_FAILED",
+        "ARTIFACT_READER_VALIDATION_FAILED",
+        "ARTIFACT_AUDIT_INTENT_WRITE_FAILED",
+        "ARTIFACT_LOCK_IDENTITY_CHANGED",
+        "ARTIFACT_STALE_LOCK_QUARANTINE_COLLISION",
+        "ARTIFACT_STALE_LOCK_QUARANTINE_UNSUPPORTED",
+        "ARTIFACT_STALE_LOCK_QUARANTINE_INVALID",
+        "ARTIFACT_STALE_LOCK_QUARANTINE_SYMLINK",
+        "ARTIFACT_STALE_LOCK_QUARANTINE_UNVERIFIED",
+        "ARTIFACT_STALE_LOCK_QUARANTINE_DELETE_FAILED",
+        "ARTIFACT_STALE_LOCK_QUARANTINE_FSYNC_FAILED",
+        "ARTIFACT_UNEXPECTED_DIRECTORY_ENTRY"
+      ]
+    },
+    "runtimeEvents": {
+      "items": {
+        "enum": [
+          "ARTIFACT_PREFLIGHT_PASSED",
+          "ARTIFACT_LOCK_ACQUIRED",
+          "ARTIFACT_LOCK_WAITING",
+          "ARTIFACT_LOCK_TIMEOUT",
+          "ARTIFACT_STALE_LOCK_QUARANTINED",
+          "ARTIFACT_TEMP_RECOVERY_STARTED",
+          "ARTIFACT_TEMP_RECOVERY_COMPLETED",
+          "ARTIFACT_TEMP_MAIN_DURABLE",
+          "ARTIFACT_TEMP_SIDECAR_DURABLE",
+          "ARTIFACT_MAIN_RENAMED",
+          "ARTIFACT_MAIN_DIRECTORY_SYNCED",
+          "ARTIFACT_SIDECAR_RENAMED",
+          "ARTIFACT_PAIR_DIRECTORY_SYNCED",
+          "ARTIFACT_READER_VALIDATED",
+          "ARTIFACT_REUSED_IDENTICAL",
+          "ARTIFACT_PUBLISH_COMPLETED",
+          "ARTIFACT_PUBLISH_FAILED",
+          "ARTIFACT_LOCK_RELEASED",
+          "ARTIFACT_AUDIT_INTENT_WRITTEN",
+          "ARTIFACT_COMMIT_POINT_REACHED",
+          "ARTIFACT_AUDIT_COMPLETION_WRITTEN",
+          "ARTIFACT_AUDIT_COMPLETION_FAILED",
+          "ARTIFACT_LOCK_RELEASE_FAILED",
+          "ARTIFACT_POST_PUBLISH_WARNING",
+          "ARTIFACT_LOCK_CLEANUP_RETRY_STARTED",
+          "ARTIFACT_LOCK_CLEANUP_RETRY_COMPLETED",
+          "ARTIFACT_LOCK_CLEANUP_RETRY_FAILED",
+          "ARTIFACT_STALE_LOCK_IDENTITY_RECHECKED",
+          "ARTIFACT_STALE_LOCK_QUARANTINE_COLLISION",
+          "ARTIFACT_STALE_LOCK_QUARANTINE_RETRY",
+          "ARTIFACT_STALE_LOCK_QUARANTINE_RETRY_EXHAUSTED",
+          "ARTIFACT_STALE_LOCK_QUARANTINE_DELETED",
+          "ARTIFACT_STALE_LOCK_QUARANTINE_DIRECTORY_SYNCED",
+          "ARTIFACT_STALE_LOCK_RECOVERY_BLOCKED",
+          "ARTIFACT_SIDECAR_RENAME_COMMIT_POINT",
+          "ARTIFACT_POST_PUBLISH_DIRECTORY_FSYNC_FAILED",
+          "ARTIFACT_POST_PUBLISH_REREAD_STARTED",
+          "ARTIFACT_POST_PUBLISH_REREAD_IO_FAILED",
+          "ARTIFACT_POST_PUBLISH_REREAD_SCHEMA_FAILED",
+          "ARTIFACT_POST_PUBLISH_REREAD_CANONICAL_FAILED",
+          "ARTIFACT_POST_PUBLISH_REREAD_HASH_MISMATCH",
+          "ARTIFACT_POST_PUBLISH_REREAD_IDENTITY_MISMATCH",
+          "ARTIFACT_POST_PUBLISH_REREAD_COMPLETED",
+          "ARTIFACT_COMMITTED_PAIR_RECOVERED"
+        ]
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "operationStatus",
+    "reasonCode",
+    "postPublishStatus",
+    "postPublishCode",
+    "runtimeEvents"
+  ],
+  "type": "object"
+}

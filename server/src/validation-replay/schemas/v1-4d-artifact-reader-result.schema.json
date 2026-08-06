@@ -1,0 +1,78 @@
+{
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-artifact-reader-result-1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "readerStatus": {
+            "const": "ACCEPTED"
+          }
+        },
+        "required": [
+          "readerStatus"
+        ]
+      },
+      "then": {
+        "properties": {
+          "readerReasonCode": {
+            "const": "NONE"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "readerStatus": {
+            "const": "REJECTED"
+          }
+        },
+        "required": [
+          "readerStatus"
+        ]
+      },
+      "then": {
+        "properties": {
+          "readerReasonCode": {
+            "enum": [
+              "ARTIFACT_NOT_FOUND",
+              "ARTIFACT_PAIR_INCOMPLETE",
+              "ARTIFACT_READER_IO_FAILED",
+              "ARTIFACT_SCHEMA_INVALID",
+              "ARTIFACT_CANONICALIZATION_FAILED",
+              "ARTIFACT_HASH_MISMATCH",
+              "ARTIFACT_IDENTITY_MISMATCH"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "readerReasonCode": {
+      "enum": [
+        "NONE",
+        "ARTIFACT_NOT_FOUND",
+        "ARTIFACT_PAIR_INCOMPLETE",
+        "ARTIFACT_READER_IO_FAILED",
+        "ARTIFACT_SCHEMA_INVALID",
+        "ARTIFACT_CANONICALIZATION_FAILED",
+        "ARTIFACT_HASH_MISMATCH",
+        "ARTIFACT_IDENTITY_MISMATCH"
+      ]
+    },
+    "readerStatus": {
+      "enum": [
+        "ACCEPTED",
+        "REJECTED"
+      ]
+    }
+  },
+  "required": [
+    "readerStatus",
+    "readerReasonCode"
+  ],
+  "type": "object"
+}

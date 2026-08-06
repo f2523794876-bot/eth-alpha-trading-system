@@ -1,0 +1,1323 @@
+{
+  "$defs": {
+    "artifactCore": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "gitObjectFormat": {
+                "const": "SHA1"
+              }
+            },
+            "required": [
+              "gitObjectFormat"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sourceCommit": {
+                "pattern": "^[0-9a-f]{40}$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "gitObjectFormat": {
+                "const": "SHA256"
+              }
+            },
+            "required": [
+              "gitObjectFormat"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sourceCommit": {
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "auditTrail": {
+          "$ref": "#/$defs/auditTrail"
+        },
+        "d8InputSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/decision"
+        },
+        "evaluationVersion": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "fixedAsOf": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "gitObjectFormat": {
+          "enum": [
+            "SHA1",
+            "SHA256"
+          ]
+        },
+        "governanceAuthorizationRef": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/governanceAuthorizationRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "researchFrom": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "researchTo": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "scorecard": {
+          "$ref": "#/$defs/scorecard"
+        },
+        "sourceCommit": {
+          "type": "string"
+        },
+        "thresholds": {
+          "$ref": "#/$defs/thresholds"
+        },
+        "validationRunId": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "validationRunId",
+        "evaluationVersion",
+        "gitObjectFormat",
+        "sourceCommit",
+        "d8InputSha256",
+        "researchFrom",
+        "researchTo",
+        "fixedAsOf",
+        "thresholds",
+        "scorecard",
+        "auditTrail",
+        "decision",
+        "governanceAuthorizationRef"
+      ],
+      "type": "object"
+    },
+    "auditTrail": {
+      "additionalProperties": false,
+      "properties": {
+        "authenticityGateStatus": {
+          "enum": [
+            "PASSED",
+            "FAILED",
+            "NOT_AVAILABLE"
+          ]
+        },
+        "backfillBatchIds": {
+          "items": {
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "datasetVersion": {
+          "pattern": "^v1\\.4d-sha256-[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "evaluatedAt": {
+          "format": "date-time",
+          "pattern": "Z$",
+          "type": "string"
+        },
+        "evaluationVersion": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "featureCoverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "generationSummary": {
+          "additionalProperties": false,
+          "properties": {
+            "attempted": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "blocked": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "conflicts": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "evaluated": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expected": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "inserted": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reusedIdentical": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "expected",
+            "attempted",
+            "inserted",
+            "reusedIdentical",
+            "conflicts",
+            "blocked",
+            "evaluated"
+          ],
+          "type": "object"
+        },
+        "manifestContentHash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "manifestCoverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "schemaVersion": {
+          "const": "v1.4d-audit-trail/1"
+        },
+        "validationRunId": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        },
+        "validationRunStatus": {
+          "enum": [
+            "SUCCEEDED",
+            "FAILED",
+            "RUNNING"
+          ]
+        },
+        "vintageIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "validationRunId",
+        "evaluationVersion",
+        "evaluatedAt",
+        "validationRunStatus",
+        "authenticityGateStatus",
+        "manifestCoverage",
+        "featureCoverage",
+        "datasetVersion",
+        "manifestContentHash",
+        "backfillBatchIds",
+        "vintageIds",
+        "generationSummary"
+      ],
+      "type": "object"
+    },
+    "baseline": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "AVAILABLE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "macroF1": {
+                "maximum": 1,
+                "minimum": 0,
+                "type": "number"
+              },
+              "postCostExpectedReturn": {
+                "type": "number"
+              },
+              "preCostExpectedReturn": {
+                "type": "number"
+              },
+              "reasonCode": {
+                "const": "NONE"
+              },
+              "sampleCount": {
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "NOT_EVALUABLE"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "macroF1": {
+                "type": "null"
+              },
+              "postCostExpectedReturn": {
+                "type": "null"
+              },
+              "preCostExpectedReturn": {
+                "type": "null"
+              },
+              "reasonCode": {
+                "not": {
+                  "const": "NONE"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "macroF1": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "postCostExpectedReturn": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "preCostExpectedReturn": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "reasonCode": {
+          "enum": [
+            "NONE",
+            "NO_TRAIN_SAMPLES",
+            "NO_VALID_TREND",
+            "NO_EVALUATION_ROWS",
+            "INPUT_MISSING"
+          ]
+        },
+        "sampleCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "AVAILABLE",
+            "NOT_EVALUABLE"
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "reasonCode",
+        "sampleCount",
+        "macroF1",
+        "preCostExpectedReturn",
+        "postCostExpectedReturn"
+      ],
+      "type": "object"
+    },
+    "baselineAvailabilityResult": {
+      "additionalProperties": false,
+      "properties": {
+        "postCostReferenceBaseline": {
+          "enum": [
+            "alwaysRange",
+            "follow4hTrend",
+            "historicalProportionRandom",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preCostReferenceBaseline": {
+          "enum": [
+            "alwaysRange",
+            "follow4hTrend",
+            "historicalProportionRandom",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primaryReasonCode": {
+          "enum": [
+            "NONE",
+            "ALWAYS_RANGE_NOT_EVALUABLE",
+            "BASELINE_NOT_EVALUABLE"
+          ]
+        },
+        "reasonCodes": {
+          "items": {
+            "enum": [
+              "ALWAYS_RANGE_NOT_EVALUABLE",
+              "BASELINE_NOT_EVALUABLE"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "status": {
+          "enum": [
+            "AVAILABLE",
+            "NOT_EVALUABLE"
+          ]
+        },
+        "usableBaselines": {
+          "items": {
+            "enum": [
+              "alwaysRange",
+              "follow4hTrend",
+              "historicalProportionRandom"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "status",
+        "primaryReasonCode",
+        "reasonCodes",
+        "usableBaselines",
+        "preCostReferenceBaseline",
+        "postCostReferenceBaseline"
+      ],
+      "type": "object"
+    },
+    "baselineSet": {
+      "additionalProperties": false,
+      "properties": {
+        "alwaysRange": {
+          "$ref": "#/$defs/baseline"
+        },
+        "follow4hTrend": {
+          "$ref": "#/$defs/baseline"
+        },
+        "historicalProportionRandom": {
+          "$ref": "#/$defs/baseline"
+        }
+      },
+      "required": [
+        "alwaysRange",
+        "follow4hTrend",
+        "historicalProportionRandom"
+      ],
+      "type": "object"
+    },
+    "classCounts": {
+      "additionalProperties": false,
+      "properties": {
+        "DOWN": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "RANGE": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "UP": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "UP",
+        "DOWN",
+        "RANGE"
+      ],
+      "type": "object"
+    },
+    "decision": {
+      "additionalProperties": false,
+      "properties": {
+        "baselineAvailability": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "$ref": "#/$defs/baselineAvailabilityResult"
+            },
+            "72h": {
+              "$ref": "#/$defs/baselineAvailabilityResult"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "evaluatedAt": {
+          "format": "date-time",
+          "pattern": "Z$",
+          "type": "string"
+        },
+        "evaluationVersion": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "horizonResults": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "$ref": "#/$defs/horizonResult"
+            },
+            "72h": {
+              "$ref": "#/$defs/horizonResult"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "overall": {
+          "additionalProperties": false,
+          "properties": {
+            "primaryReasonCode": {
+              "enum": [
+                "NONE",
+                "INPUT_CONSISTENCY_FAILED",
+                "AUDIT_RUN_NOT_SUCCEEDED",
+                "AUDIT_AUTHENTICITY_NOT_PASSED",
+                "MANIFEST_COVERAGE_INCOMPLETE",
+                "FEATURE_COVERAGE_INCOMPLETE",
+                "EFFECTIVE_TEST_ZERO",
+                "COVERAGE_NULL",
+                "LIFT_NULL",
+                "ALWAYS_RANGE_NOT_EVALUABLE",
+                "BASELINE_NOT_EVALUABLE",
+                "EFFECTIVE_TEST_BELOW_THRESHOLD",
+                "CLASS_SAMPLE_BELOW_THRESHOLD",
+                "RANGE_CLASS_ABSENT",
+                "RANGE_PREDICTION_DEGENERATE",
+                "WILSON_BELOW_THRESHOLD",
+                "PRE_COST_LIFT_BELOW_THRESHOLD",
+                "POST_COST_LIFT_BELOW_THRESHOLD",
+                "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+                "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+              ]
+            },
+            "reasonCodes": {
+              "items": {
+                "enum": [
+                  "INPUT_CONSISTENCY_FAILED",
+                  "AUDIT_RUN_NOT_SUCCEEDED",
+                  "AUDIT_AUTHENTICITY_NOT_PASSED",
+                  "MANIFEST_COVERAGE_INCOMPLETE",
+                  "FEATURE_COVERAGE_INCOMPLETE",
+                  "EFFECTIVE_TEST_ZERO",
+                  "COVERAGE_NULL",
+                  "LIFT_NULL",
+                  "ALWAYS_RANGE_NOT_EVALUABLE",
+                  "BASELINE_NOT_EVALUABLE",
+                  "EFFECTIVE_TEST_BELOW_THRESHOLD",
+                  "CLASS_SAMPLE_BELOW_THRESHOLD",
+                  "RANGE_CLASS_ABSENT",
+                  "RANGE_PREDICTION_DEGENERATE",
+                  "WILSON_BELOW_THRESHOLD",
+                  "PRE_COST_LIFT_BELOW_THRESHOLD",
+                  "POST_COST_LIFT_BELOW_THRESHOLD",
+                  "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+                  "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+                ]
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "status": {
+              "enum": [
+                "GO",
+                "CONDITIONAL_GO",
+                "NO_GO",
+                "DATA_GATE_FAILED",
+                "BASELINE_NOT_EVALUABLE"
+              ]
+            }
+          },
+          "required": [
+            "status",
+            "primaryReasonCode",
+            "reasonCodes"
+          ],
+          "type": "object"
+        },
+        "primaryReasonCode": {
+          "enum": [
+            "NONE",
+            "INPUT_CONSISTENCY_FAILED",
+            "AUDIT_RUN_NOT_SUCCEEDED",
+            "AUDIT_AUTHENTICITY_NOT_PASSED",
+            "MANIFEST_COVERAGE_INCOMPLETE",
+            "FEATURE_COVERAGE_INCOMPLETE",
+            "EFFECTIVE_TEST_ZERO",
+            "COVERAGE_NULL",
+            "LIFT_NULL",
+            "ALWAYS_RANGE_NOT_EVALUABLE",
+            "BASELINE_NOT_EVALUABLE",
+            "EFFECTIVE_TEST_BELOW_THRESHOLD",
+            "CLASS_SAMPLE_BELOW_THRESHOLD",
+            "RANGE_CLASS_ABSENT",
+            "RANGE_PREDICTION_DEGENERATE",
+            "WILSON_BELOW_THRESHOLD",
+            "PRE_COST_LIFT_BELOW_THRESHOLD",
+            "POST_COST_LIFT_BELOW_THRESHOLD",
+            "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+            "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+          ]
+        },
+        "reasonCodes": {
+          "items": {
+            "enum": [
+              "INPUT_CONSISTENCY_FAILED",
+              "AUDIT_RUN_NOT_SUCCEEDED",
+              "AUDIT_AUTHENTICITY_NOT_PASSED",
+              "MANIFEST_COVERAGE_INCOMPLETE",
+              "FEATURE_COVERAGE_INCOMPLETE",
+              "EFFECTIVE_TEST_ZERO",
+              "COVERAGE_NULL",
+              "LIFT_NULL",
+              "ALWAYS_RANGE_NOT_EVALUABLE",
+              "BASELINE_NOT_EVALUABLE",
+              "EFFECTIVE_TEST_BELOW_THRESHOLD",
+              "CLASS_SAMPLE_BELOW_THRESHOLD",
+              "RANGE_CLASS_ABSENT",
+              "RANGE_PREDICTION_DEGENERATE",
+              "WILSON_BELOW_THRESHOLD",
+              "PRE_COST_LIFT_BELOW_THRESHOLD",
+              "POST_COST_LIFT_BELOW_THRESHOLD",
+              "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+              "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "schemaVersion": {
+          "const": "v1.4d-go-no-go-output/2"
+        },
+        "validationRunId": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "validationRunId",
+        "evaluationVersion",
+        "evaluatedAt",
+        "baselineAvailability",
+        "horizonResults",
+        "overall",
+        "primaryReasonCode",
+        "reasonCodes"
+      ],
+      "type": "object"
+    },
+    "governanceAuthorizationRef": {
+      "additionalProperties": false,
+      "properties": {
+        "authorizationSchemaVersion": {
+          "const": "v1.4d-governance-authorization/1"
+        },
+        "authorizationScope": {
+          "const": "FORMAL_RESEARCH_EXECUTION"
+        },
+        "decision": {
+          "const": "APPROVE"
+        },
+        "hashAlgorithm": {
+          "const": "SHA-256"
+        },
+        "recordSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "thresholdsSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "validationRunId": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "authorizationSchemaVersion",
+        "recordSha256",
+        "hashAlgorithm",
+        "validationRunId",
+        "thresholdsSha256",
+        "authorizationScope",
+        "decision"
+      ],
+      "type": "object"
+    },
+    "groupMap": {
+      "additionalProperties": false,
+      "properties": {
+        "DOWN": {
+          "$ref": "#/$defs/groupStat"
+        },
+        "RANGE": {
+          "$ref": "#/$defs/groupStat"
+        },
+        "UP": {
+          "$ref": "#/$defs/groupStat"
+        }
+      },
+      "required": [
+        "UP",
+        "DOWN",
+        "RANGE"
+      ],
+      "type": "object"
+    },
+    "groupStat": {
+      "additionalProperties": false,
+      "properties": {
+        "directionCorrectCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sampleCount": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sampleCount",
+        "directionCorrectCount"
+      ],
+      "type": "object"
+    },
+    "horizonResult": {
+      "additionalProperties": false,
+      "properties": {
+        "directionalCoverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "effectiveTest": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "marketRegimeCoverage": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "postCostLift": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "preCostLift": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "primaryReasonCode": {
+          "enum": [
+            "NONE",
+            "INPUT_CONSISTENCY_FAILED",
+            "AUDIT_RUN_NOT_SUCCEEDED",
+            "AUDIT_AUTHENTICITY_NOT_PASSED",
+            "MANIFEST_COVERAGE_INCOMPLETE",
+            "FEATURE_COVERAGE_INCOMPLETE",
+            "EFFECTIVE_TEST_ZERO",
+            "COVERAGE_NULL",
+            "LIFT_NULL",
+            "ALWAYS_RANGE_NOT_EVALUABLE",
+            "BASELINE_NOT_EVALUABLE",
+            "EFFECTIVE_TEST_BELOW_THRESHOLD",
+            "CLASS_SAMPLE_BELOW_THRESHOLD",
+            "RANGE_CLASS_ABSENT",
+            "RANGE_PREDICTION_DEGENERATE",
+            "WILSON_BELOW_THRESHOLD",
+            "PRE_COST_LIFT_BELOW_THRESHOLD",
+            "POST_COST_LIFT_BELOW_THRESHOLD",
+            "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+            "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+          ]
+        },
+        "reasonCodes": {
+          "items": {
+            "enum": [
+              "INPUT_CONSISTENCY_FAILED",
+              "AUDIT_RUN_NOT_SUCCEEDED",
+              "AUDIT_AUTHENTICITY_NOT_PASSED",
+              "MANIFEST_COVERAGE_INCOMPLETE",
+              "FEATURE_COVERAGE_INCOMPLETE",
+              "EFFECTIVE_TEST_ZERO",
+              "COVERAGE_NULL",
+              "LIFT_NULL",
+              "ALWAYS_RANGE_NOT_EVALUABLE",
+              "BASELINE_NOT_EVALUABLE",
+              "EFFECTIVE_TEST_BELOW_THRESHOLD",
+              "CLASS_SAMPLE_BELOW_THRESHOLD",
+              "RANGE_CLASS_ABSENT",
+              "RANGE_PREDICTION_DEGENERATE",
+              "WILSON_BELOW_THRESHOLD",
+              "PRE_COST_LIFT_BELOW_THRESHOLD",
+              "POST_COST_LIFT_BELOW_THRESHOLD",
+              "DIRECTIONAL_COVERAGE_BELOW_THRESHOLD",
+              "MARKET_REGIME_COVERAGE_BELOW_THRESHOLD"
+            ]
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "status": {
+          "enum": [
+            "GO",
+            "CONDITIONAL_GO",
+            "NO_GO",
+            "DATA_GATE_FAILED",
+            "BASELINE_NOT_EVALUABLE"
+          ]
+        },
+        "wilson95": {
+          "$ref": "#/$defs/wilson"
+        }
+      },
+      "required": [
+        "status",
+        "primaryReasonCode",
+        "reasonCodes",
+        "effectiveTest",
+        "directionalCoverage",
+        "marketRegimeCoverage",
+        "preCostLift",
+        "postCostLift",
+        "wilson95"
+      ],
+      "type": "object"
+    },
+    "modelMetrics": {
+      "additionalProperties": false,
+      "properties": {
+        "directionCorrectCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "macroF1": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "postCostExpectedReturn": {
+          "type": "number"
+        },
+        "preCostExpectedReturn": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "directionCorrectCount",
+        "macroF1",
+        "preCostExpectedReturn",
+        "postCostExpectedReturn"
+      ],
+      "type": "object"
+    },
+    "rangeAttribution": {
+      "additionalProperties": false,
+      "properties": {
+        "allPredictionsRange": {
+          "type": "boolean"
+        },
+        "correctlyPredictedRangeCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "predictedRangeCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rangeTotal": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rangeTotal",
+        "predictedRangeCount",
+        "correctlyPredictedRangeCount",
+        "allPredictionsRange"
+      ],
+      "type": "object"
+    },
+    "sampleHorizon": {
+      "additionalProperties": false,
+      "properties": {
+        "classEffectiveTest": {
+          "$ref": "#/$defs/classCounts"
+        },
+        "effectiveTest": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "predictedDownCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "predictedRangeCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "predictedUpCount": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rawTest": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "rawTest",
+        "effectiveTest",
+        "classEffectiveTest",
+        "predictedUpCount",
+        "predictedDownCount",
+        "predictedRangeCount"
+      ],
+      "type": "object"
+    },
+    "scoreHorizon": {
+      "additionalProperties": false,
+      "properties": {
+        "baselines": {
+          "$ref": "#/$defs/baselineSet"
+        },
+        "model": {
+          "$ref": "#/$defs/modelMetrics"
+        }
+      },
+      "required": [
+        "model",
+        "baselines"
+      ],
+      "type": "object"
+    },
+    "scorecard": {
+      "additionalProperties": false,
+      "properties": {
+        "evaluatedAt": {
+          "format": "date-time",
+          "pattern": "Z$",
+          "type": "string"
+        },
+        "evaluationVersion": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "horizons": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "$ref": "#/$defs/scoreHorizon"
+            },
+            "72h": {
+              "$ref": "#/$defs/scoreHorizon"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "schemaVersion": {
+          "const": "v1.4d-research-scorecard/4-deterministic"
+        },
+        "validationRunId": {
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "validationRunId",
+        "evaluationVersion",
+        "evaluatedAt",
+        "horizons"
+      ],
+      "type": "object"
+    },
+    "thresholds": {
+      "additionalProperties": false,
+      "properties": {
+        "minClassEffectiveTest": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "72h": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "minDirectionalCoverage": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            "72h": {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "minEffectiveTest": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "72h": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "minMarketRegimeCoverage": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            "72h": {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "minPostCostLift": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "type": "number"
+            },
+            "72h": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "minPreCostLift": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "type": "number"
+            },
+            "72h": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "minWilsonLowerBound": {
+          "additionalProperties": false,
+          "properties": {
+            "24h": {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            "72h": {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "24h",
+            "72h"
+          ],
+          "type": "object"
+        },
+        "requireAllBaselines": {
+          "const": true
+        },
+        "requireMarketRegime": {
+          "const": true
+        },
+        "schemaVersion": {
+          "const": "v1.4d-go-no-go-thresholds/1"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "minEffectiveTest",
+        "minClassEffectiveTest",
+        "minDirectionalCoverage",
+        "minMarketRegimeCoverage",
+        "minWilsonLowerBound",
+        "minPreCostLift",
+        "minPostCostLift",
+        "requireAllBaselines",
+        "requireMarketRegime"
+      ],
+      "type": "object"
+    },
+    "wilson": {
+      "additionalProperties": false,
+      "properties": {
+        "confidenceLevel": {
+          "const": 0.95
+        },
+        "lower": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "successes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trials": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "upper": {
+          "maximum": 1,
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "z": {
+          "const": 1.959963984540054
+        }
+      },
+      "required": [
+        "confidenceLevel",
+        "z",
+        "successes",
+        "trials",
+        "lower",
+        "upper"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-formal-artifact-2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "artifactMode": {
+            "const": "FORMAL"
+          }
+        },
+        "required": [
+          "artifactMode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "core": {
+            "properties": {
+              "auditTrail": {
+                "properties": {
+                  "authenticityGateStatus": {
+                    "const": "PASSED"
+                  },
+                  "featureCoverage": {
+                    "const": 1
+                  },
+                  "manifestCoverage": {
+                    "const": 1
+                  },
+                  "validationRunStatus": {
+                    "const": "SUCCEEDED"
+                  }
+                }
+              },
+              "governanceAuthorizationRef": {
+                "$ref": "#/$defs/governanceAuthorizationRef"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "artifactMode": {
+            "const": "DRY_RUN"
+          }
+        },
+        "required": [
+          "artifactMode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "core": {
+            "properties": {
+              "governanceAuthorizationRef": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "artifactMode": {
+      "enum": [
+        "FORMAL",
+        "DRY_RUN"
+      ]
+    },
+    "core": {
+      "$ref": "#/$defs/artifactCore"
+    },
+    "deterministicProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "canonicalization": {
+          "const": "RFC8785"
+        },
+        "encoding": {
+          "const": "UTF-8"
+        },
+        "manifestContentHash": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "timeSource": {
+          "const": "VALIDATION_RUN_FINISHED_AT"
+        },
+        "trailingNewline": {
+          "const": false
+        },
+        "validationRunFinishedAt": {
+          "format": "date-time",
+          "pattern": "Z$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "canonicalization",
+        "encoding",
+        "trailingNewline",
+        "timeSource",
+        "validationRunFinishedAt",
+        "manifestContentHash"
+      ],
+      "type": "object"
+    },
+    "schemaVersion": {
+      "const": "v1.4d-formal-research-artifact/2"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "artifactMode",
+    "core",
+    "deterministicProvenance"
+  ],
+  "type": "object"
+}

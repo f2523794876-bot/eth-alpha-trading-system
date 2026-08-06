@@ -8,8 +8,9 @@
 // 是同一份源码——本文件只负责静态页面骨架、CSS与"调用这些渲染函数+写入DOM"的胶水代码，胶水代码本身
 // 不直接拼接任何来自API响应的原始字段（全部经上述已转义的渲染函数处理后才落地为HTML）。
 import { RENDER_FUNCTIONS } from './realtime-page-render.js';
+import { D8_RENDER_FUNCTIONS } from './d8-research-page-render.js';
 
-const RENDER_FUNCTIONS_SOURCE = RENDER_FUNCTIONS.map(fn => fn.toString()).join('\n');
+const RENDER_FUNCTIONS_SOURCE = RENDER_FUNCTIONS.concat(D8_RENDER_FUNCTIONS).map(fn => fn.toString()).join('\n');
 
 export const REALTIME_DASHBOARD_PAGE_HTML = `<!doctype html>
 <html lang="zh-CN">
@@ -52,6 +53,9 @@ export const REALTIME_DASHBOARD_PAGE_HTML = `<!doctype html>
   <div class="card"><h2>24H 预测</h2><div id="forecast24h">加载中…</div></div>
   <div class="card"><h2>72H 预测</h2><div id="forecast72h">加载中…</div></div>
 </div>
+<div class="grid" style="margin-top:16px;">
+  <div class="card"><h2>D8 正式研究结论（DISPLAY_ONLY，非交易许可，见下方说明）</h2><div id="d8Body">加载中…</div></div>
+</div>
 <div class="footer" id="footer"></div>
 <script>
 ${RENDER_FUNCTIONS_SOURCE}
@@ -74,6 +78,22 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 10000);
+
+// D8面板独立刷新循环——与realtime面板完全独立的fetch/渲染路径，互不阻塞、互不共享状态。
+// 诚实降级：fetch失败或响应ok:false时，明确展示"读取失败"文案，绝不保留上一次成功渲染的
+// innerHTML装作仍然新鲜（不静默复用陈旧成功数据）。本面板不包含任何发起研究/交易的按钮或事件。
+async function refreshD8() {
+  try {
+    const res = await fetch('/api/v1/research/d8/status', { cache: 'no-store' });
+    const body = await res.json();
+    if (!body.ok) throw new Error((body.error && body.error.message) || 'D8状态请求失败');
+    document.getElementById('d8Body').innerHTML = renderD8Panel(body.data);
+  } catch (err) {
+    document.getElementById('d8Body').innerHTML = '<div class="muted">D8面板读取失败：' + escapeHtmlD8(err.message) + '</div>';
+  }
+}
+refreshD8();
+setInterval(refreshD8, 15000);
 </script>
 </body>
 </html>

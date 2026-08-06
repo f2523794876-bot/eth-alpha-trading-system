@@ -1,0 +1,56 @@
+{
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-artifact-sidecar-1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifactMode": {
+      "enum": [
+        "FORMAL",
+        "DRY_RUN"
+      ]
+    },
+    "canonicalization": {
+      "const": "RFC8785"
+    },
+    "encoding": {
+      "const": "UTF-8"
+    },
+    "evaluationVersion": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "fullMainArtifactSha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "mainArtifactSchemaVersion": {
+      "const": "v1.4d-formal-research-artifact/2"
+    },
+    "mainFileName": {
+      "const": "research-artifact.json"
+    },
+    "schemaVersion": {
+      "const": "v1.4d-artifact-sidecar/1"
+    },
+    "trailingNewline": {
+      "const": false
+    },
+    "validationRunId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "mainFileName",
+    "canonicalization",
+    "encoding",
+    "trailingNewline",
+    "fullMainArtifactSha256",
+    "mainArtifactSchemaVersion",
+    "artifactMode",
+    "validationRunId",
+    "evaluationVersion"
+  ],
+  "type": "object"
+}

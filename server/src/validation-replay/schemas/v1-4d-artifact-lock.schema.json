@@ -1,0 +1,61 @@
+{
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-artifact-lock-2.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "acquiredAt": {
+      "format": "date-time",
+      "pattern": "Z$",
+      "type": "string"
+    },
+    "hostIdentitySha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "leaseExpiresAt": {
+      "format": "date-time",
+      "pattern": "Z$",
+      "type": "string"
+    },
+    "lockId": {
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "ownerToken": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ownerUid": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "pid": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "processStartIdentity": {
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": "v1.4d-artifact-lock/2"
+    },
+    "targetIdentitySha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "lockId",
+    "ownerToken",
+    "targetIdentitySha256",
+    "hostIdentitySha256",
+    "pid",
+    "processStartIdentity",
+    "ownerUid",
+    "acquiredAt",
+    "leaseExpiresAt"
+  ],
+  "type": "object"
+}

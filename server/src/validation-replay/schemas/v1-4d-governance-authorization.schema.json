@@ -1,0 +1,46 @@
+{
+  "$id": "https://eth-alpha.invalid/schema/v1.4d-governance-authorization-1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "authorizationScope": {
+      "const": "FORMAL_RESEARCH_EXECUTION"
+    },
+    "authorizedAt": {
+      "format": "date-time",
+      "pattern": "Z$",
+      "type": "string"
+    },
+    "authorizedByRole": {
+      "const": "CHAIRMAN"
+    },
+    "decision": {
+      "const": "APPROVE"
+    },
+    "hashAlgorithm": {
+      "const": "SHA-256"
+    },
+    "schemaVersion": {
+      "const": "v1.4d-governance-authorization/1"
+    },
+    "thresholdsSha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "validationRunId": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "hashAlgorithm",
+    "validationRunId",
+    "thresholdsSha256",
+    "authorizationScope",
+    "decision",
+    "authorizedByRole",
+    "authorizedAt"
+  ],
+  "type": "object"
+}

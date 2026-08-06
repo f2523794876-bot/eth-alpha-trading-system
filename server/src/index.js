@@ -12,7 +12,7 @@ import { startStagesWithRollback, stopStagesInOrder, createIdempotentCloser } fr
 export async function bootstrap(config=loadConfig()){
   const pool=await createPgPool(config);const repository=new PostgresRepository(pool);
   const client=new PublicHttpClient(config);const adapter=new BinancePublicAdapter({client,spotBaseUrl:config.spotBaseUrl,futuresBaseUrl:config.futuresBaseUrl});
-  const collector=new CollectorService({adapter,repository,config});const api=createApiServer({collector,repository,host:config.host,port:config.port});
+  const collector=new CollectorService({adapter,repository,config});const api=createApiServer({collector,repository,host:config.host,port:config.port,d8ArtifactRoot:config.d8ArtifactRoot,d8RunStatusRoot:config.d8RunStatusRoot});
   // V1.4C P0-1修复：ForecastGenerator/OutcomeEvaluator是与CollectorService完全独立的第三、第四调度器——各自独立的
   // 类实例、timers、lease、abortController、running状态，互不共享调度状态；只共享同一个Postgres连接池与无状态的
   // measureServerTime()工具函数（不构成"调度状态共享"，同一份服务器时间校验逻辑本就该只有一处实现，见V1_4C_SCOPE_SPEC.md §7.5）。

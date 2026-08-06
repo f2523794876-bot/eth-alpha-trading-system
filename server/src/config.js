@@ -1,3 +1,8 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const SERVER_ROOT = fileURLToPath(new URL('../', import.meta.url));
+
 const integer = (name, fallback, min = 0) => {
   const value = Number(process.env[name] ?? fallback);
   if (!Number.isInteger(value) || value < min) throw new Error(`Invalid ${name}`);
@@ -31,6 +36,12 @@ export function loadConfig() {
     outcomePollMs: integer('OUTCOME_POLL_MS', 300_000, 1_000),
     healthRetentionDays: integer('HEALTH_RETENTION_DAYS', 90, 1),
     freshnessGraceMultiplier: positiveNumber('FRESHNESS_GRACE_MULTIPLIER',3),
-    logLevel: process.env.LOG_LEVEL || 'info'
+    logLevel: process.env.LOG_LEVEL || 'info',
+    // D8只读展示（GET /api/v1/research/d8/status）读取D7已发布产物的根目录，与
+    // 编排/发布运行状态遥测的根目录——本轮新增，两者物理隔离，见d8-status-reader.js/
+    // research-run-status.js头部说明。未显式配置时默认指向仓库内var/子目录（首次启动前
+    // 该目录尚不存在也不影响服务启动——reader对"root不存在"降级为NOT_RUN，不抛出）。
+    d8ArtifactRoot: process.env.D7_ARTIFACT_ROOT || path.join(SERVER_ROOT, 'var', 'research-artifacts'),
+    d8RunStatusRoot: process.env.D7_RUN_STATUS_ROOT || path.join(SERVER_ROOT, 'var', 'research-run-status')
   });
 }
