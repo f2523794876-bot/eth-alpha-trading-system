@@ -106,6 +106,36 @@ test('PostgresRepository.latestProvisionalBar：已促升（promoted_market_bar_
   });
 });
 
+// P1-2补齐（独立复审要求项10）：验证"Repository只负责返回候选行，新鲜度判断完全在View Model层"这一
+// 架构约束——即使provisional_market_bars里存在一条从未被促升、但早已过期的历史遗留快照，
+// PostgresRepository.latestProvisionalBar()仍然原样把它当作"最新候选"返回（不在Repository层悄悄过滤），
+// 真正的过期判定必须、也确实由buildMarketState()（真实生产函数，与API/页面共用同一份代码）完成并安全降级。
+test('PostgresRepository.latestProvisionalBar+buildMarketState：历史遗留未促升的过期快照被Repository原样返回，但View Model正确将其判定为过期并安全回退', { skip }, async () => {
+  await withTxClient(async client => {
+    const rawPayloadId = await insertRawPayload(client, { fetchedAt: Date.UTC(2099, 0, 6) });
+    const openTime = Date.UTC(2099, 0, 6, 0, 0, 0), closeTime = openTime + 900000 - 1;
+    const fetchedAt = openTime + 30000; // 该行自身"看起来"是正常快照，只是相对后面构造的"当前时间"已经过期
+    await client.query(
+      `INSERT INTO provisional_market_bars(source_id,endpoint_id,instrument,market_type,interval_name,open_time,close_time,open,high,low,close,volume,quote_volume,fetched_at,raw_payload_id,content_hash,expires_at)
+       VALUES('binance-spot-rest','binance-spot-klines','ETHUSDT','spot','15m',to_timestamp($1/1000.0),to_timestamp($2/1000.0),'3000','3000','3000','3000','1','1',to_timestamp($3/1000.0),$4,$5,to_timestamp($3/1000.0)+interval '1 day')`,
+      [openTime, closeTime, fetchedAt, rawPayloadId, 'j'.repeat(64)]
+    );
+    const repo = new PostgresRepository(client);
+    const candidate = await repo.latestProvisionalBar({ instrument: 'ETHUSDT', marketType: 'spot', interval: '15m' });
+    assert.ok(candidate, 'Repository层必须原样返回该候选行，不得自行按年龄过滤');
+    assert.equal(candidate.openTime, openTime);
+
+    const { buildMarketState } = await import('../../src/dashboard/realtime-view.js');
+    // "当前时间"设定为该快照生成之后很久（远超新鲜度阈值），且已完成K线基准存在，验证View Model
+    // 正确把这条Repository原样吐出的陈旧候选行判定为不可用于LIVE展示，安全回退。
+    const farFutureNow = fetchedAt + 6 * 3600 * 1000;
+    const referenceBar = { openTime: openTime - 900000, closeTime: openTime - 1, close: 2900 };
+    const state = buildMarketState({ instrument: 'ETHUSDT', currentBar: candidate, referenceBar, now: farFutureNow, dataHealthy: true });
+    assert.notEqual(state.status, 'LIVE', 'View Model必须识别出Repository返回的候选行已过期，不得展示为LIVE');
+    assert.equal(state.price, 2900, '必须安全回退到最近完成K线价格');
+  });
+});
+
 test('PostgresRepository.latestForecastSnapshot：真实schema下按generated_at取instrument+horizon最新一条并完整映射三向概率/目标区间/触发失效条件', { skip }, async () => {
   await withTxClient(async client => {
     const runId = randomUUID();
