@@ -95,6 +95,34 @@ export class PostgresRepository {
   async saveHealth(snapshot,lease){return this.transaction(async client=>{await client.query(`INSERT INTO data_health_snapshots(source_id,endpoint_id,dataset_key,health_state,latest_attempt_at,latest_success_at,latest_data_at,data_age_ms,expected_frequency_ms,missing_count,duplicate_count,anomaly_count,consecutive_failures,last_http_status,rate_limited,clock_offset_ms,pending_backfill_count,recovery_started_at,last_recovered_at,circuit_state,last_error_code,reasons,evaluated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22::jsonb,$23)`,[snapshot.sourceId||'collector',snapshot.endpointId||null,snapshot.datasetKey||'collector:overall',snapshot.state,snapshot.latestAttemptAt?new Date(snapshot.latestAttemptAt):null,snapshot.latestSuccessAt?new Date(snapshot.latestSuccessAt):null,(snapshot.latestDataAt||snapshot.latestDataObservationAt)?new Date(snapshot.latestDataAt||snapshot.latestDataObservationAt):null,snapshot.dataAgeMs??null,snapshot.expectedFrequencyMs??null,snapshot.missingCount||0,snapshot.duplicateCount||0,snapshot.anomalyCount||0,snapshot.consecutiveFailures||0,snapshot.lastHttpStatus||null,!!snapshot.rateLimited,snapshot.clockOffsetMs??null,snapshot.pendingBackfillCount||0,snapshot.recoveryStartedAt?new Date(snapshot.recoveryStartedAt):null,snapshot.lastRecoveredAt?new Date(snapshot.lastRecoveredAt):null,snapshot.circuitState||null,snapshot.lastErrorCode||null,canonicalJsonStringify(snapshot.reasons||[]),new Date(snapshot.evaluatedAt)]);},lease);}
   async audit(event,lease){return this.transaction(async client=>{await client.query(`INSERT INTO source_audit_events(audit_event_id,event_type,source_id,endpoint_id,request_id,severity,detail,occurred_at) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,to_timestamp($8/1000.0))`,[event.auditEventId||randomUUID(),event.eventType,event.sourceId||null,event.endpointId||null,event.requestId||null,event.severity||'INFO',canonicalJsonStringify(event.detail||{}),event.occurredAt||Date.now()]);},lease);}
   async listBars({instrument,marketType='spot',interval,from,to,limit}){return(await this.pool.query(`SELECT * FROM market_bars WHERE instrument=$1 AND market_type=$2 AND interval_name=$3 AND open_time>=to_timestamp($4/1000.0) AND open_time<=to_timestamp($5/1000.0) ORDER BY open_time LIMIT $6`,[instrument,marketType,interval,from,to,limit])).rows;}
+  // 实时看板：最近limit根已收盘formal K线（按close_time倒序），用作"上一根已完成K线收盘价"比较基准——
+  // 只读market_bars，不读provisional_market_bars，不新增写入，不影响正式数据。
+  async latestBars({instrument,marketType='spot',interval,limit=2}){
+    const rows=(await this.pool.query(`SELECT open_time,close_time,open,high,low,close,quality_state FROM market_bars WHERE instrument=$1 AND market_type=$2 AND interval_name=$3 ORDER BY close_time DESC LIMIT $4`,[instrument,marketType,interval,limit])).rows;
+    return rows.map(row=>({openTime:ms(row.open_time),closeTime:ms(row.close_time),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),qualityState:row.quality_state}));
+  }
+  // 实时看板："当前价格"——尚未收盘、仍在进行中的K线最新快照（promoted_market_bar_id IS NULL表示
+  // 该open_time尚未被正式K线收盘覆盖）。只读provisional_market_bars，不写入，不产生新的正式预测样本。
+  async latestProvisionalBar({instrument,marketType='spot',interval}){
+    const row=(await this.pool.query(`SELECT open_time,close_time,open,high,low,close,fetched_at FROM provisional_market_bars WHERE instrument=$1 AND market_type=$2 AND interval_name=$3 AND promoted_market_bar_id IS NULL ORDER BY open_time DESC,fetched_at DESC LIMIT 1`,[instrument,marketType,interval])).rows[0];
+    if(!row)return null;
+    return {openTime:ms(row.open_time),closeTime:ms(row.close_time),open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),fetchedAt:ms(row.fetched_at)};
+  }
+  // 实时看板：instrument+horizon当前权威预测快照（按generated_at取最新一条）。只读forecast_snapshots，
+  // 不触发ForecastGenerator，不写入任何行——复用ForecastGenerator已经产生的正式24h/72h快照，
+  // 不为"看起来实时"另建第二套预测通道。
+  async latestForecastSnapshot({instrument,horizon}){
+    const row=(await this.pool.query(`SELECT * FROM forecast_snapshots WHERE instrument=$1 AND horizon=$2 ORDER BY generated_at DESC LIMIT 1`,[instrument,horizon])).rows[0];
+    if(!row)return null;
+    return {
+      predictionId:row.prediction_id,instrument:row.instrument,horizon:row.horizon,
+      generatedAt:ms(row.generated_at),dataCutoffTime:ms(row.data_cutoff_time),targetStartTime:ms(row.target_start_time),targetEndTime:ms(row.target_end_time),
+      referencePrice:Number(row.reference_price),expectedDirection:row.expected_direction,
+      scenarioWeights:{baseline:row.scenario_weight_baseline,upside:row.scenario_weight_upside,downside:row.scenario_weight_downside},
+      probabilityStatus:row.probability_status,expectedPriceZones:row.expected_price_zones,
+      triggerConditions:row.trigger_conditions,invalidationConditions:row.invalidation_conditions
+    };
+  }
   async listSimple(table,{instrument,from,to,limit}){const allowed={funding_rates:'observation_time',open_interest:'observation_time'};const time=allowed[table];if(!time)throw new Error('INVALID_TABLE');return(await this.pool.query(`SELECT * FROM ${table} WHERE instrument=$1 AND ${time}>=to_timestamp($2/1000.0) AND ${time}<=to_timestamp($3/1000.0) ORDER BY ${time} DESC LIMIT $4`,[instrument,from,to,limit])).rows;}
   async listGaps(limit=100){return(await this.pool.query('SELECT * FROM data_gaps ORDER BY detected_at DESC LIMIT $1',[limit])).rows;}
   async listSources(){return(await this.pool.query('SELECT * FROM source_registry ORDER BY source_id')).rows;}

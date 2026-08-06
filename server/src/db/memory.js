@@ -1,7 +1,7 @@
 import { canonicalJsonHash, canonicalJsonStringify } from '../domain/hash.js';
 
 export class MemoryRepository {
-  constructor({requireLease=false,now=Date.now}={}){this.requireLease=requireLease;this.now=now;this.raw=[];this.bars=[];this.provisional=[];this.facts={funding_rates:[],open_interest:[],long_short_ratios:[],taker_flow:[]};this.revisions=[];this.gaps=[];this.backfills=[];this.health=[];this.audits=[];this.runs=[];this.attempts=[];this.featureRecords=[];this.featureQuality=[];this.featureRuns=[];this.leases=new Map();this.connected=true;this.migrationsReady=true;}
+  constructor({requireLease=false,now=Date.now}={}){this.requireLease=requireLease;this.now=now;this.raw=[];this.bars=[];this.provisional=[];this.facts={funding_rates:[],open_interest:[],long_short_ratios:[],taker_flow:[]};this.revisions=[];this.gaps=[];this.backfills=[];this.health=[];this.audits=[];this.runs=[];this.attempts=[];this.featureRecords=[];this.featureQuality=[];this.featureRuns=[];this.forecasts=[];this.leases=new Map();this.connected=true;this.migrationsReady=true;}
   leaseOk(lease){if(!this.requireLease)return true;const current=this.leases.get(lease?.leaseName);if(!current||current.holderId!==lease.holderId||current.fencingToken!==lease.fencingToken||current.expiresAt<=this.now())throw Object.assign(new Error('Stale fencing token'),{code:'FENCING_TOKEN_REJECTED'});return true;}
   async ping(){if(!this.connected)throw Object.assign(new Error('db unavailable'),{code:'DATABASE_UNAVAILABLE'});return{ok:true,roundTripMs:0};}
   async migrationStatus(){return{ok:this.migrationsReady,versions:this.migrationsReady?['001','002','003']:[]};}
@@ -41,4 +41,9 @@ export class MemoryRepository {
   async listFeatureRuns(limit=100){return this.featureRuns.slice(-limit);}
   async cleanupHealthSnapshots({retentionDays=90,dryRun=false}={}){const cutoff=this.now()-retentionDays*86400000,old=this.health.filter(x=>(x.evaluatedAt||0)<cutoff);if(!dryRun)this.health=this.health.filter(x=>(x.evaluatedAt||0)>=cutoff);return{deleted:old.length};}
   async listBars(q){return this.bars.filter(x=>x.instrument===q.instrument&&x.marketType===q.marketType&&x.interval===q.interval&&x.openTime>=q.from&&x.openTime<=q.to).slice(0,q.limit);}async listSimple(table,q){return this.facts[table].filter(x=>x.instrument===q.instrument&&x.observedAt>=q.from&&x.observedAt<=q.to).slice(0,q.limit);}async listGaps(limit=100){return this.gaps.slice(-limit);}async listSources(){return [];}async latestHealth(){return this.health;}async close(){this.connected=false;}
+  // 实时看板测试专用只读方法：与PostgresRepository同名方法返回同一套camelCase视图形状（epoch毫秒+纯数字），
+  // 使上层view-model构建逻辑与后端存储实现（Postgres/内存）解耦，测试无需连接真实数据库即可覆盖真实分页/映射逻辑。
+  async latestBars({instrument,marketType='spot',interval,limit=2}){return this.bars.filter(x=>x.instrument===instrument&&x.marketType===marketType&&x.interval===interval).sort((a,b)=>b.closeTime-a.closeTime).slice(0,limit).map(x=>({openTime:x.openTime,closeTime:x.closeTime,open:Number(x.open),high:Number(x.high),low:Number(x.low),close:Number(x.close),qualityState:x.qualityState||'NORMAL'}));}
+  async latestProvisionalBar({instrument,marketType='spot',interval}){const rows=this.provisional.filter(x=>x.instrument===instrument&&x.marketType===marketType&&x.interval===interval).sort((a,b)=>(b.openTime-a.openTime)||(b.fetchedAt-a.fetchedAt));const row=rows[0];if(!row)return null;return {openTime:row.openTime,closeTime:row.closeTime,open:Number(row.open),high:Number(row.high),low:Number(row.low),close:Number(row.close),fetchedAt:row.fetchedAt};}
+  async latestForecastSnapshot({instrument,horizon}){const rows=this.forecasts.filter(x=>x.instrument===instrument&&x.horizon===horizon).sort((a,b)=>b.generatedAt-a.generatedAt);return rows[0]?structuredClone(rows[0]):null;}
 }
