@@ -143,8 +143,8 @@ export async function backfillInterval({
     const nextCursor = lastCompletedOpenTime + INTERVAL_MS[interval];
     if (!(nextCursor > cursor)) {
       throw Object.assign(
-        new Error(`Backfill pagination cursor failed to advance (cursor=${cursor}, lastCompletedOpenTime=${lastCompletedOpenTime}, nextCursor=${nextCursor}) — refusing to loop indefinitely`),
-        { code: 'BACKFILL_CURSOR_NOT_ADVANCING', cursor, lastCompletedOpenTime, nextCursor }
+        new Error(`Backfill pagination cursor failed to advance for ${symbol} ${interval} (cursor=${cursor}, lastCompletedOpenTime=${lastCompletedOpenTime}, nextCursor=${nextCursor}) — refusing to loop indefinitely`),
+        { code: 'BACKFILL_CURSOR_NOT_ADVANCING', cursor, lastCompletedOpenTime, nextCursor, symbol, interval }
       );
     }
     cursor = nextCursor;
