@@ -1,7 +1,10 @@
 import http from 'node:http';
 import { HEALTH_STATES, INTERVALS, MARKET_TYPES, MAX_QUERY_RANGE_MS, MAX_QUERY_ROWS, SYMBOLS } from '../domain/constants.js';
+import { buildRealtimeDashboard } from '../dashboard/build-realtime-dashboard.js';
+import { REALTIME_DASHBOARD_PAGE_HTML } from '../dashboard/realtime-page.js';
 
 const json=(res,status,body)=>{const payload=JSON.stringify(body);res.writeHead(status,{'content-type':'application/json; charset=utf-8','content-length':Buffer.byteLength(payload),'cache-control':'no-store'});res.end(payload);};
+const html=(res,status,body)=>{res.writeHead(status,{'content-type':'text/html; charset=utf-8','content-length':Buffer.byteLength(body),'cache-control':'no-store'});res.end(body);};
 const error=(res,status,code,message)=>json(res,status,{ok:false,error:{code,message}});
 const oneOf=(value,allowed,name)=>{if(!allowed.includes(value))throw Object.assign(new Error(`${name}不在白名单内`),{status:400,code:`INVALID_${name.toUpperCase()}`});return value;};
 const integer=(value,fallback,min,max,name)=>{const n=value===null?fallback:Number(value);if(!Number.isSafeInteger(n)||n<min||n>max)throw Object.assign(new Error(`${name}超出范围`),{status:400,code:`INVALID_${name.toUpperCase()}`});return n;};
@@ -12,6 +15,7 @@ export function createApiServer({collector,repository,host='127.0.0.1',port=8787
     try{
       if(req.method!=='GET')return error(res,405,'METHOD_NOT_ALLOWED','仅支持只读GET请求');
       const url=new URL(req.url,'http://localhost');const p=url.pathname;
+      if(p==='/'||p==='/dashboard')return html(res,200,REALTIME_DASHBOARD_PAGE_HTML);
       if(p==='/health/live')return json(res,200,{ok:true,status:'LIVE',time:new Date().toISOString()});
       if(p==='/health/ready'){const readiness=await collector.readiness();return json(res,readiness.ok?200:503,readiness.ok?{ok:true,status:readiness.status,checks:readiness.checks}:{ok:false,error:{code:'NOT_READY',message:'采集服务尚未就绪'},status:readiness.status,checks:readiness.checks});}
       if(p==='/api/v1/collector/status')return json(res,200,{ok:true,data:collector.status()});
@@ -25,6 +29,10 @@ export function createApiServer({collector,repository,host='127.0.0.1',port=8787
       if(p==='/api/v1/features/lineage'||p==='/api/v1/features/quality'){const featureId=url.searchParams.get('featureId');if(!featureId)throw Object.assign(new Error('featureId不能为空'),{status:400,code:'FEATURE_ID_REQUIRED'});return json(res,200,{ok:true,data:p.endsWith('lineage')?await repository.getFeatureLineage(featureId):await repository.listFeatureQuality(featureId)});}
       if(p==='/api/v1/features/runs')return json(res,200,{ok:true,data:await repository.listFeatureRuns(integer(url.searchParams.get('limit'),100,1,MAX_QUERY_ROWS,'limit'))});
       if(p==='/api/v1/features/issues')return json(res,200,{ok:true,data:await repository.listFeatureIssues({symbol:oneOf(url.searchParams.get('symbol')||'ETHUSDT',SYMBOLS,'symbol'),limit:integer(url.searchParams.get('limit'),100,1,MAX_QUERY_ROWS,'limit')})});
+      // 实时看板：实时市场状态+24H/72H UP/DOWN/RANGE方向预测+独立交易许可，三层严格分离（见
+      // server/src/dashboard/*.js顶部说明）。本路由只读repository.latestBars/latestProvisionalBar/
+      // latestForecastSnapshot与collector.readiness()，不触发采集或预测生成，不写入任何行。
+      if(p==='/api/v1/dashboard/realtime'){const instrument=oneOf(url.searchParams.get('instrument')||'ETHUSDT',SYMBOLS,'instrument');return json(res,200,{ok:true,data:await buildRealtimeDashboard({repository,collector,instrument})});}
       return error(res,404,'NOT_FOUND','接口不存在');
     }catch(e){return error(res,e.status||500,e.code||'INTERNAL_ERROR',e.status?e.message:'服务暂时不可用');}
   });
