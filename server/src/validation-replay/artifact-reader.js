@@ -10,6 +10,7 @@ import { canonicalJson, canonicalSha256 } from '../formal-research/canonical-jso
 import { SchemaValidationError } from '../formal-research/schema-registry.js';
 import { lstatIfExists, readFileNoFollowSymlink } from './artifact-fs-primitives.js';
 import { artifactSchemaRegistry as registry, ARTIFACT_SCHEMA_ID, SIDECAR_SCHEMA_ID } from './artifact-schema-registry.js';
+import { assertResearchRunIdentity } from './research-run-status.js';
 
 export { ARTIFACT_SCHEMA_ID, SIDECAR_SCHEMA_ID };
 
@@ -76,6 +77,17 @@ export function readArtifactPair(targetDir) {
   ];
   for (const [, a, b] of identityChecks) {
     if (a !== b) return rejected('ARTIFACT_IDENTITY_MISMATCH');
+  }
+
+  let runIdentity;
+  try { runIdentity = assertResearchRunIdentity(mainObj.core?.runIdentity); }
+  catch { return rejected('ARTIFACT_IDENTITY_MISMATCH'); }
+  if (runIdentity.validationRunId !== mainObj.core.validationRunId || runIdentity.artifactMode !== mainObj.artifactMode ||
+      runIdentity.evaluationVersion !== mainObj.core.evaluationVersion || runIdentity.gitObjectFormat !== mainObj.core.gitObjectFormat ||
+      runIdentity.sourceCommit !== mainObj.core.sourceCommit || runIdentity.datasetVersion !== mainObj.core.auditTrail?.datasetVersion ||
+      runIdentity.researchFrom !== mainObj.core.researchFrom || runIdentity.researchTo !== mainObj.core.researchTo ||
+      runIdentity.fixedAsOf !== mainObj.core.fixedAsOf || runIdentity.thresholdsSha256 !== canonicalSha256(mainObj.core.thresholds)) {
+    return rejected('ARTIFACT_IDENTITY_MISMATCH');
   }
 
   return accepted(Object.freeze(mainObj), Object.freeze(sidecarObj));

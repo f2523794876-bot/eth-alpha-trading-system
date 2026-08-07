@@ -12,6 +12,7 @@ import { MemoryRepository } from '../src/db/memory.js';
 import { publishArtifact } from '../src/validation-replay/artifact-publisher.js';
 import { evaluateGoNoGo } from '../src/formal-research/go-no-go-evaluator.js';
 import { canonicalJson } from '../src/formal-research/canonical-json.js';
+import { createResearchRunIdentity } from '../src/validation-replay/research-run-status.js';
 
 const CONTRACT_TEXT = readFileSync(new URL('../../V1_4D_FORMAL_RESEARCH_EXECUTION_CONTRACT_V8_FINAL_R3.md', import.meta.url), 'utf8');
 function frozenVector(id) {
@@ -22,6 +23,15 @@ function frozenVector(id) {
 const GO_INPUT = frozenVector('GO').input;
 const GO_DECISION = evaluateGoNoGo(GO_INPUT);
 function sha256Hex(text) { return createHash('sha256').update(text, 'utf8').digest('hex'); }
+function runIdentity(validationRunId, evaluationVersion) {
+  return createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode: 'FORMAL', config: {
+    gitObjectFormat: 'SHA1', sourceIdentity: 'MODULE_TEST', sourceVersion: 'v1.4d-test-config/1', sourceCommit: 'a'.repeat(40), datasetVersion: GO_INPUT.auditTrail.datasetVersion,
+    featureEngineVersion: 'feature-1', algorithmVersion: 'algorithm-1', ruleVersion: 'rule-1',
+    evaluationVersion, weightVersion: 'weight-1', horizons: ['24h', '72h'],
+    researchFrom: '2026-01-01T00:00:00.000Z', researchTo: '2026-01-08T00:00:00.000Z',
+    fixedAsOf: '2026-01-08T00:00:00.000Z', thresholds: GO_INPUT.thresholds
+  } });
+}
 
 function readyCollector() {
   return { health: () => ({ state: 'HEALTHY' }), status: () => ({ running: true }), readiness: async () => ({ ok: true, status: 'HEALTHY', checks: {} }) };
@@ -62,6 +72,7 @@ test('GO：真实发布一份FORMAL artifact后，GET返回完整白名单投影
   const thresholdsSha256 = sha256Hex(canonicalJson(GO_INPUT.thresholds));
   const core = {
     validationRunId, evaluationVersion: 'v1.4d-eval-d8-api-test', gitObjectFormat: 'SHA1', sourceCommit: 'a'.repeat(40),
+    runIdentity: runIdentity(validationRunId, 'v1.4d-eval-d8-api-test'),
     d8InputSha256: 'b'.repeat(64), researchFrom: '2026-01-01T00:00:00.000Z', researchTo: '2026-01-08T00:00:00.000Z',
     fixedAsOf: '2026-01-08T00:00:00.000Z', thresholds: GO_INPUT.thresholds, scorecard: GO_INPUT.scorecard,
     auditTrail: { ...GO_INPUT.auditTrail, authenticityGateStatus: 'PASSED', manifestCoverage: 1, featureCoverage: 1, validationRunStatus: 'SUCCEEDED' },

@@ -21,6 +21,7 @@ import {
   renameAllowCreate, renameNoReplace, lstatIfExists, readFileNoFollowSymlink, processStartIdentity
 } from './artifact-fs-primitives.js';
 import { readArtifactPair, MAIN_FILE_NAME, SIDECAR_FILE_NAME } from './artifact-reader.js';
+import { assertResearchRunIdentity } from './research-run-status.js';
 import {
   artifactSchemaRegistry as registry, ARTIFACT_SCHEMA_ID, SIDECAR_SCHEMA_ID, LOCK_SCHEMA_ID, PUBLISH_RESULT_SCHEMA_ID
 } from './artifact-schema-registry.js';
@@ -33,6 +34,19 @@ const MAX_LOCK_BYTES = 4096;
 
 function fail(reasonCode, message, extra) {
   return Object.assign(new Error(message || reasonCode), { code: reasonCode, ...(extra || {}) });
+}
+
+function assertCoreRunIdentity(core, { artifactMode, validationRunId, evaluationVersion }) {
+  const identity = assertResearchRunIdentity(core?.runIdentity);
+  if (identity.artifactMode !== artifactMode || identity.validationRunId !== validationRunId ||
+      identity.evaluationVersion !== evaluationVersion || core.validationRunId !== identity.validationRunId ||
+      core.evaluationVersion !== identity.evaluationVersion || core.gitObjectFormat !== identity.gitObjectFormat ||
+      core.sourceCommit !== identity.sourceCommit || core.researchFrom !== identity.researchFrom ||
+      core.researchTo !== identity.researchTo || core.fixedAsOf !== identity.fixedAsOf ||
+      core.auditTrail?.datasetVersion !== identity.datasetVersion || canonicalSha256(core.thresholds) !== identity.thresholdsSha256) {
+    throw fail('ARTIFACT_IDENTITY_MISMATCH', 'artifact core does not match the complete run identity');
+  }
+  return identity;
 }
 
 function publishResult({ operationStatus, reasonCode = 'NONE', postPublishStatus = 'NOT_APPLICABLE', postPublishCode = 'NONE', runtimeEvents }) {
@@ -190,11 +204,13 @@ export function publishArtifact(options) {
   };
   let mainBytesText;
   try {
+    assertCoreRunIdentity(core, { artifactMode, validationRunId, evaluationVersion });
     mainBytesText = canonicalJson(artifactObj);
     registry.validate(ARTIFACT_SCHEMA_ID, artifactObj);
   } catch (error) {
     events.push('ARTIFACT_PUBLISH_FAILED');
-    return publishResult({ operationStatus: 'FAILED', reasonCode: error instanceof SchemaValidationError ? 'ARTIFACT_SCHEMA_INVALID' : 'ARTIFACT_CANONICALIZATION_FAILED', runtimeEvents: events });
+    const identityInvalid = error?.code === 'ARTIFACT_IDENTITY_MISMATCH' || /^RUN_STATUS_IDENTITY_/.test(error?.code || '');
+    return publishResult({ operationStatus: 'FAILED', reasonCode: error instanceof SchemaValidationError || identityInvalid ? 'ARTIFACT_SCHEMA_INVALID' : 'ARTIFACT_CANONICALIZATION_FAILED', runtimeEvents: events });
   }
   const fullMainArtifactSha256 = canonicalSha256(artifactObj);
   const sidecarObj = {

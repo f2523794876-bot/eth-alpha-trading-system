@@ -173,6 +173,7 @@ function formalConfig(validationRunId, artifactRoot) {
     lockTimeoutMs: 30_000, staleLockRecovery: 'ENABLED', maxArtifactBytes: 64 * 1024 * 1024, databaseIdentity: 'test',
     researchFrom: runFrom, researchTo: runTo, fixedAsOf: runTo, symbols: ['ETHUSDT', 'BTCUSDT'],
     intervals: ['15m', '1h', '4h'], horizons: ['24h', '72h'], datasetVersion,
+    featureEngineVersion: featureAlgorithmVersion,
     algorithmVersion: replayAlgorithmVersion, ruleVersion: 'rule-v1', weightVersion: 'weight-v1', evaluationVersion,
     costs: { feeBps: 5, slippageBps: 3 }, thresholds };
 }

@@ -56,6 +56,7 @@ function input(overrides = {}) {
     intervals: ['15m', '1h', '4h'],
     horizons: ['24h', '72h'],
     datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`,
+    featureEngineVersion: 'v1.4b-feature-engine-1',
     algorithmVersion: 'algorithm-1',
     ruleVersion: 'rule-1',
     weightVersion: 'weight-1',
@@ -122,6 +123,7 @@ test('T1完整运行身份的任一真实字段变化都改变canonical config h
   const original = freezeFormalRunConfig(input());
   for (const [field, value] of [
     ['datasetVersion', `v1.4d-sha256-${'b'.repeat(64)}`],
+    ['featureEngineVersion', 'feature-engine-2'],
     ['algorithmVersion', 'algorithm-2'], ['ruleVersion', 'rule-2'],
     ['weightVersion', 'weight-2'], ['evaluationVersion', 'evaluation-2'],
     ['researchTo', '2025-06-30T23:59:59.999Z'], ['fixedAsOf', '2025-07-05T00:00:00.000Z']

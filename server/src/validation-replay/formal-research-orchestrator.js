@@ -22,7 +22,8 @@ import {
 import { assertGuardedResearchPgPool } from '../db/research-database-guard.js';
 import { freezeFormalRunConfig } from './formal-run-config.js';
 import {
-  createResearchRunIdentity, readRunStatus, writeRunStatus, initialRunStatus, withBatchPlan, withBatchCompleted, withBlocked, withCompleted, withFailed
+  createResearchRunIdentity, assertResearchRunIdentity, readRunStatus, writeRunStatus, initialRunStatus,
+  withBatchPlan, withBatchCompleted, withBlocked, withCompleted, withFailed, writeRejectedResearchAttempt
 } from './research-run-status.js';
 import {
   ensureDirectorySafe, writeTempFileDurable, renameNoReplace, fsyncDirectory,
@@ -37,6 +38,20 @@ function sha256(value) { return createHash('sha256').update(canonicalJson(value)
 function runConfig(options, source, extra = {}) {
   return {
     source,
+    sourceIdentity: source,
+    sourceVersion: 'v1.4d-memory-run-config/1',
+    gitObjectFormat: options.gitObjectFormat,
+    sourceCommit: options.sourceCommit,
+    datasetVersion: options.datasetVersion,
+    featureEngineVersion: options.featureEngineVersion,
+    algorithmVersion: options.algorithmVersion,
+    ruleVersion: options.ruleVersion,
+    evaluationVersion: options.evaluationVersion,
+    weightVersion: options.weightVersion,
+    horizons: options.horizons,
+    researchFrom: options.researchFrom,
+    researchTo: options.researchTo,
+    fixedAsOf: options.fixedAsOf,
     scorecardOptions: options.scorecardOptions ?? null,
     validationRunFinishedAt: options.validationRunFinishedAt ?? null,
     thresholds: options.thresholds ?? null,
@@ -55,7 +70,11 @@ function artifactTargetDir(root, artifactMode, validationRunId, evaluationVersio
 
 function verifyCompletedArtifact(artifactRoot, status) {
   const pair = readArtifactPair(artifactTargetDir(artifactRoot, status.artifactMode, status.validationRunId, status.evaluationVersion));
+  let artifactIdentity;
+  try { artifactIdentity = assertResearchRunIdentity(pair.artifact?.core?.runIdentity); }
+  catch { throw fail('ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID', 'published artifact lacks a valid complete run identity'); }
   if (pair.readerStatus !== 'ACCEPTED' || pair.sidecar.fullMainArtifactSha256 !== status.publishedArtifactSha256 ||
+      canonicalJson(artifactIdentity) !== canonicalJson(assertResearchRunIdentity(status)) ||
       pair.artifact.core.validationRunId !== status.validationRunId || pair.artifact.core.evaluationVersion !== status.evaluationVersion ||
       pair.artifact.artifactMode !== status.artifactMode ||
       (status.sourceCommit !== null && pair.artifact.core.sourceCommit !== status.sourceCommit) ||
@@ -186,7 +205,8 @@ export function runFormalResearchOrchestrator(options) {
   }
 
   try {
-    core = buildArtifactCore({ decision, governanceRef, statistics, scorecardResult, validationRunId, evaluationVersion, d8Input });
+    core = { ...buildArtifactCore({ decision, governanceRef, statistics, scorecardResult, validationRunId, evaluationVersion, d8Input }),
+      runIdentity: assertResearchRunIdentity(runIdentity) };
   } catch (error) {
     const code = safeCode(error, 'ORCHESTRATOR_ARTIFACT_CORE_FAILED');
     status = persistFailure(statusRoot, status, 'FAILED', code);
@@ -226,10 +246,7 @@ function checkpointPath(statusRoot, runIdentity, batchIndex) {
 }
 
 function checkpointIdentity(runIdentity) {
-  const { validationRunId, artifactMode, configSha256, sourceCommit, datasetVersion, algorithmVersion, ruleVersion,
-    evaluationVersion, weightVersion, horizons, researchFrom, researchTo, fixedAsOf, runIdentitySha256 } = runIdentity;
-  return { validationRunId, artifactMode, configSha256, sourceCommit, datasetVersion, algorithmVersion, ruleVersion,
-    evaluationVersion, weightVersion, horizons, researchFrom, researchTo, fixedAsOf, runIdentitySha256 };
+  return assertResearchRunIdentity(runIdentity);
 }
 
 function readDatabasePageCheckpoint(statusRoot, runIdentity, checkpoint) {
@@ -274,32 +291,20 @@ function writeDatabasePageCheckpoint(statusRoot, runIdentity, batch) {
 // RUNNING status write; repository, mapping, artifact-core and publication
 // failures therefore always leave an auditable terminal state.
 export async function runFormalResearchFromDatabase(options) {
-  const frozen = freezeFormalRunConfig(options.formalRunConfig);
+  let frozen;
+  try { frozen = freezeFormalRunConfig(options.formalRunConfig); }
+  catch (error) {
+    const code = safeCode(error, 'RUN_CONFIG_INVALID');
+    let rejected;
+    try { rejected = writeRejectedResearchAttempt(options.statusRoot, code); }
+    catch { throw fail('ORCHESTRATOR_STATUS_PERSIST_FAILED', 'unable to persist rejected startup audit'); }
+    return { runStatus: rejected, published: false, error: { code, message: code } };
+  }
   const config = frozen.config;
   const { pool, batchSize = 1000, statusRoot } = options;
   const { validationRunId, evaluationVersion, artifactMode } = config;
-  if (options.validationRunId !== undefined && options.validationRunId !== validationRunId ||
-      options.evaluationVersion !== undefined && options.evaluationVersion !== evaluationVersion ||
-      options.artifactMode !== undefined && options.artifactMode !== artifactMode ||
-      options.artifactRoot !== undefined && options.artifactRoot !== config.artifactRoot) {
-    throw fail('ORCHESTRATOR_RUN_CONFIG_MISMATCH', 'runtime options conflict with the frozen formal run config');
-  }
-  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 10_000) throw fail('ORCHESTRATOR_INVALID_INPUT', 'batchSize must be 1..10000');
-
   const runIdentity = createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode, config });
   let status = readRunStatus(statusRoot, runIdentity);
-  if (status?.runState === 'COMPLETED') {
-    try { verifyCompletedArtifact(config.artifactRoot, status); }
-    catch (error) {
-      const code = safeCode(error, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID');
-      return { runStatus: status, published: false, error: { code, message: code } };
-    }
-    return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
-  }
-  if (status?.runState === 'FAILED' || status?.runState === 'BLOCKED') {
-    const code = status.blockedReasonCode;
-    return { runStatus: status, published: false, resumed: true, error: { code, message: code } };
-  }
   if (!status) {
     status = initialRunStatus({ runIdentity, totalBatches: 1 });
     try { status = writeRunStatus(statusRoot, status); }
@@ -308,6 +313,23 @@ export async function runFormalResearchFromDatabase(options) {
 
   let context, count;
   try {
+    if (options.validationRunId !== undefined && options.validationRunId !== validationRunId ||
+        options.evaluationVersion !== undefined && options.evaluationVersion !== evaluationVersion ||
+        options.artifactMode !== undefined && options.artifactMode !== artifactMode ||
+        options.artifactRoot !== undefined && options.artifactRoot !== config.artifactRoot) {
+      throw fail('ORCHESTRATOR_RUN_CONFIG_MISMATCH', 'runtime options conflict with the frozen formal run config');
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 10_000) {
+      throw fail('ORCHESTRATOR_INVALID_INPUT', 'batchSize must be 1..10000');
+    }
+    if (status.runState === 'COMPLETED') {
+      verifyCompletedArtifact(config.artifactRoot, status);
+      return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
+    }
+    if (status.runState === 'FAILED' || status.runState === 'BLOCKED') {
+      const code = status.blockedReasonCode;
+      return { runStatus: status, published: false, resumed: true, error: { code, message: code } };
+    }
     assertGuardedResearchPgPool(pool);
     context = await loadFormalResearchContext(pool, { validationRunId });
     if (context.datasetVersion !== config.datasetVersion || context.algorithmVersion !== config.algorithmVersion ||
@@ -315,10 +337,11 @@ export async function runFormalResearchFromDatabase(options) {
         context.to !== Date.parse(config.researchTo)) {
       throw fail('ORCHESTRATOR_RUN_CONFIG_DATABASE_MISMATCH', 'database validation identity conflicts with frozen config');
     }
-    context = { ...context, weightVersion: config.weightVersion };
+    context = { ...context, weightVersion: config.weightVersion, featureEngineVersion: config.featureEngineVersion };
     count = await countFormalResearchRows(pool, { validationRunId, evaluationVersion });
   } catch (error) {
     const code = safeCode(error, 'ORCHESTRATOR_REPOSITORY_FAILED');
+    if (status.runState === 'COMPLETED') return { runStatus: status, published: false, error: { code, message: code } };
     try { status = persistFailure(statusRoot, status, 'FAILED', code); }
     catch { throw fail('ORCHESTRATOR_STATUS_PERSIST_FAILED', 'unable to persist repository failure status'); }
     return { runStatus: status, published: false, error: { code, message: code } };

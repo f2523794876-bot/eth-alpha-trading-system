@@ -42,6 +42,7 @@
       "maxItems": 2
     },
     "datasetVersion": { "type": "string", "pattern": "^v1\\.4d-sha256-[0-9a-f]{64}$" },
+    "featureEngineVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
     "algorithmVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
     "ruleVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
     "weightVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
@@ -63,7 +64,7 @@
     "schemaVersion", "validationRunId", "artifactMode", "artifactRoot", "lockTimeoutMs",
     "staleLockRecovery", "maxArtifactBytes", "databaseIdentity",
     "researchFrom", "researchTo", "fixedAsOf", "symbols", "intervals", "horizons",
-    "datasetVersion", "algorithmVersion", "ruleVersion", "weightVersion", "evaluationVersion",
+    "datasetVersion", "featureEngineVersion", "algorithmVersion", "ruleVersion", "weightVersion", "evaluationVersion",
     "gitObjectFormat", "sourceCommit", "costs", "thresholds"
   ],
   "allOf": [

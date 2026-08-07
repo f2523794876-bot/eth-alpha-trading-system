@@ -11,6 +11,7 @@ import { publishArtifact } from './artifact-publisher.js';
 import { readArtifactPair } from './artifact-reader.js';
 import { canonicalJson } from '../formal-research/canonical-json.js';
 import { evaluateGoNoGo } from '../formal-research/go-no-go-evaluator.js';
+import { createResearchRunIdentity } from './research-run-status.js';
 
 const CONTRACT_TEXT = readFileSync(new URL('../../../V1_4D_FORMAL_RESEARCH_EXECUTION_CONTRACT_V8_FINAL_R3.md', import.meta.url), 'utf8');
 function frozenVector(id) {
@@ -26,9 +27,17 @@ function evalIdentity(evaluationVersion) { return sha256Hex(evaluationVersion); 
 
 function makeRoot() { return mkdtempSync(path.join(os.tmpdir(), 'd7-artifact-root-')); }
 
-function baseCore({ validationRunId, evaluationVersion, researchTo = '2026-01-08T00:00:00.000Z', governanceAuthorizationRef = null, auditOverrides = {} }) {
+function baseCore({ validationRunId, evaluationVersion, artifactMode = 'DRY_RUN', researchTo = '2026-01-08T00:00:00.000Z', governanceAuthorizationRef = null, auditOverrides = {} }) {
+  const runIdentity = createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode, config: {
+    gitObjectFormat: 'SHA1', sourceIdentity: 'MODULE_TEST', sourceVersion: 'v1.4d-test-config/1', sourceCommit: 'a'.repeat(40), datasetVersion: GO_INPUT.auditTrail.datasetVersion,
+    featureEngineVersion: 'feature-1', algorithmVersion: 'algorithm-1', ruleVersion: 'rule-1',
+    evaluationVersion, weightVersion: 'weight-1', horizons: ['24h', '72h'],
+    researchFrom: '2026-01-01T00:00:00.000Z', researchTo, fixedAsOf: '2026-01-08T00:00:00.000Z',
+    thresholds: GO_INPUT.thresholds
+  } });
   return {
     validationRunId, evaluationVersion, gitObjectFormat: 'SHA1', sourceCommit: 'a'.repeat(40),
+    runIdentity,
     d8InputSha256: 'b'.repeat(64), researchFrom: '2026-01-01T00:00:00.000Z', researchTo, fixedAsOf: '2026-01-08T00:00:00.000Z',
     thresholds: GO_INPUT.thresholds, scorecard: GO_INPUT.scorecard,
     auditTrail: { ...GO_INPUT.auditTrail, authenticityGateStatus: 'PASSED', manifestCoverage: 1, featureCoverage: 1, validationRunStatus: 'SUCCEEDED', ...auditOverrides },
@@ -48,6 +57,19 @@ function targetDirFor(root, mode, validationRunId, evaluationVersion) {
 }
 function publishOpts(overrides = {}) {
   return { manifestContentHash: 'c'.repeat(64), validationRunFinishedAt: '2026-01-08T00:05:00.000Z', ...overrides };
+}
+
+function rewritePairWithMutatedIdentity(targetDir, mutate) {
+  const mainPath = path.join(targetDir, 'research-artifact.json');
+  const sidecarPath = path.join(targetDir, 'research-artifact.sha256.json');
+  const main = JSON.parse(readFileSync(mainPath, 'utf8'));
+  const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8'));
+  mutate(main.core.runIdentity);
+  const bytes = canonicalJson(main);
+  sidecar.fullMainArtifactSha256 = sha256Hex(bytes);
+  rmSync(mainPath); rmSync(sidecarPath);
+  writeFileSync(mainPath, bytes);
+  writeFileSync(sidecarPath, canonicalJson(sidecar));
 }
 
 test('D7成功路径：DRY_RUN发布产生合法PUBLISHED，事件序列包含唯一commit point', () => {
@@ -74,7 +96,7 @@ test('D7成功路径：FORMAL模式要求governanceAuthorizationRef非null，且
   try {
     const validationRunId = randomUUID();
     const evaluationVersion = 'v1.4d-eval-t2';
-    const core = baseCore({ validationRunId, evaluationVersion, governanceAuthorizationRef: governanceRef(validationRunId) });
+    const core = baseCore({ validationRunId, evaluationVersion, artifactMode: 'FORMAL', governanceAuthorizationRef: governanceRef(validationRunId) });
     const result = publishArtifact({ root, artifactMode: 'FORMAL', validationRunId, evaluationVersion, core, ...publishOpts() });
     assert.equal(result.operationStatus, 'PUBLISHED');
     assert.equal(result.postPublishStatus, 'COMPLETE');
@@ -86,7 +108,7 @@ test('D7红线：FORMAL模式下governanceAuthorizationRef为null必须Schema拒
   try {
     const validationRunId = randomUUID();
     const evaluationVersion = 'v1.4d-eval-t3';
-    const core = baseCore({ validationRunId, evaluationVersion, governanceAuthorizationRef: null });
+    const core = baseCore({ validationRunId, evaluationVersion, artifactMode: 'FORMAL', governanceAuthorizationRef: null });
     const result = publishArtifact({ root, artifactMode: 'FORMAL', validationRunId, evaluationVersion, core, ...publishOpts() });
     assert.equal(result.operationStatus, 'FAILED');
     assert.equal(result.reasonCode, 'ARTIFACT_SCHEMA_INVALID');
@@ -155,7 +177,8 @@ test('D7确定性：两次独立构造相同core（不同JS对象、不同键插
       governanceAuthorizationRef: coreA.governanceAuthorizationRef, decision: coreA.decision, auditTrail: coreA.auditTrail,
       scorecard: coreA.scorecard, thresholds: coreA.thresholds, fixedAsOf: coreA.fixedAsOf, researchTo: coreA.researchTo,
       researchFrom: coreA.researchFrom, d8InputSha256: coreA.d8InputSha256, sourceCommit: coreA.sourceCommit,
-      gitObjectFormat: coreA.gitObjectFormat, evaluationVersion: coreA.evaluationVersion, validationRunId: coreA.validationRunId
+      gitObjectFormat: coreA.gitObjectFormat, runIdentity: coreA.runIdentity,
+      evaluationVersion: coreA.evaluationVersion, validationRunId: coreA.validationRunId
     }));
     const r1 = publishArtifact({ root: root1, artifactMode: 'DRY_RUN', validationRunId, evaluationVersion, core: coreA, ...publishOpts() });
     const r2 = publishArtifact({ root: root2, artifactMode: 'DRY_RUN', validationRunId, evaluationVersion, core: coreB, ...publishOpts() });
@@ -246,6 +269,45 @@ test('D7读取者红线：主文件被symlink替换 → 拒绝跟随，REJECTED'
     symlinkSync(decoyPath, mainPath);
     const read = readArtifactPair(targetDir);
     assert.equal(read.readerStatus, 'REJECTED');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('P0完整身份：legacy artifact缺runIdentity必须fail-closed', () => {
+  const root = makeRoot();
+  try {
+    const validationRunId = randomUUID(), evaluationVersion = 'v1.4d-eval-legacy-reject';
+    const core = baseCore({ validationRunId, evaluationVersion });
+    assert.equal(publishArtifact({ root, artifactMode: 'DRY_RUN', validationRunId, evaluationVersion, core, ...publishOpts() }).operationStatus, 'PUBLISHED');
+    const targetDir = targetDirFor(root, 'dry-run', validationRunId, evaluationVersion);
+    rewritePairWithMutatedIdentity(targetDir, identity => { for (const key of Object.keys(identity)) delete identity[key]; });
+    const read = readArtifactPair(targetDir);
+    assert.equal(read.readerStatus, 'REJECTED');
+    assert.equal(read.readerReasonCode, 'ARTIFACT_SCHEMA_INVALID');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+const identityTamperCases = {
+  validationRunId: () => randomUUID(), artifactMode: () => 'FORMAL', configSha256: () => 'f'.repeat(64),
+  thresholdsSha256: () => 'f'.repeat(64), gitObjectFormat: () => 'SHA256', sourceIdentity: () => 'TAMPERED_SOURCE',
+  sourceVersion: () => 'tampered-source-version', sourceCommit: () => 'b'.repeat(40),
+  datasetVersion: () => `v1.4d-sha256-${'f'.repeat(64)}`, featureEngineVersion: () => 'feature-tampered',
+  algorithmVersion: () => 'algorithm-tampered', ruleVersion: () => 'rule-tampered',
+  evaluationVersion: () => 'evaluation-tampered', weightVersion: () => 'weight-tampered',
+  horizons: () => ['72h', '24h'], researchFrom: () => '2026-01-02T00:00:00.000Z',
+  researchTo: () => '2026-01-09T00:00:00.000Z', fixedAsOf: () => '2026-01-09T00:00:00.000Z',
+  runIdentitySha256: () => 'f'.repeat(64)
+};
+for (const [field, replacement] of Object.entries(identityTamperCases)) test(`P0完整身份逐字段篡改拒绝：${field}`, () => {
+  const root = makeRoot();
+  try {
+    const validationRunId = randomUUID(), evaluationVersion = `v1.4d-eval-tamper-${field}`;
+    const core = baseCore({ validationRunId, evaluationVersion });
+    assert.equal(publishArtifact({ root, artifactMode: 'DRY_RUN', validationRunId, evaluationVersion, core, ...publishOpts() }).operationStatus, 'PUBLISHED');
+    const targetDir = targetDirFor(root, 'dry-run', validationRunId, evaluationVersion);
+    rewritePairWithMutatedIdentity(targetDir, identity => { identity[field] = replacement(); });
+    const read = readArtifactPair(targetDir);
+    assert.equal(read.readerStatus, 'REJECTED');
+    assert.ok(['ARTIFACT_SCHEMA_INVALID', 'ARTIFACT_IDENTITY_MISMATCH'].includes(read.readerReasonCode), read.readerReasonCode);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

@@ -1,12 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, symlinkSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, symlinkSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { createGuardedResearchPgPool } from '../db/research-database-guard.js';
 import { runFormalResearchFromDatabase } from './formal-research-orchestrator.js';
-import { findMostRecentRunStatus } from './research-run-status.js';
+import { findMostRecentRejectedResearchAttempt, findMostRecentRunStatus } from './research-run-status.js';
+import { readD8DisplayStatus } from './d8-status-reader.js';
 
 function thresholds() {
   const both = value => ({ '24h': value, '72h': value });
@@ -19,7 +20,8 @@ function config(validationRunId, artifactRoot) {
     lockTimeoutMs: 1000, staleLockRecovery: 'ENABLED', maxArtifactBytes: 10_000_000, databaseIdentity: 'test',
     researchFrom: '2025-01-01T00:00:00.000Z', researchTo: '2025-07-01T00:00:00.000Z', fixedAsOf: '2025-07-04T00:00:00.000Z',
     symbols: ['ETHUSDT', 'BTCUSDT'], intervals: ['15m', '1h', '4h'], horizons: ['24h', '72h'],
-    datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`, algorithmVersion: 'v1.4c-server-po-rule-1', ruleVersion: 'rule-1',
+    datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`, featureEngineVersion: 'v1.4b-feature-engine-1',
+    algorithmVersion: 'v1.4c-server-po-rule-1', ruleVersion: 'rule-1',
     weightVersion: 'weight-1', evaluationVersion: 'evaluation-1', costs: { feeBps: 5, slippageBps: 3 }, thresholds: thresholds() };
 }
 async function guardedFailingPool(message = 'postgresql://user:password@production.invalid/db') {
@@ -101,9 +103,68 @@ test('启动状态持久化失败使用稳定分类，且不会进入repository�
   }
 });
 
+test('batchSize=0在首次数据库操作前留下可读取FAILED审计', async () => {
+  const artifactRoot = mkdtempSync(path.join(os.tmpdir(), 'startup-artifact-'));
+  const statusRoot = mkdtempSync(path.join(os.tmpdir(), 'startup-status-'));
+  let queries = 0;
+  try {
+    const result = await runFormalResearchFromDatabase({ pool: { query: async () => { queries += 1; } }, batchSize: 0,
+      statusRoot, formalRunConfig: config(randomUUID(), artifactRoot) });
+    assert.equal(queries, 0);
+    assert.equal(result.runStatus.runState, 'FAILED');
+    assert.equal(result.error.code, 'ORCHESTRATOR_INVALID_INPUT');
+    assert.equal(findMostRecentRunStatus(statusRoot, 'DRY_RUN').blockedReasonCode, 'ORCHESTRATOR_INVALID_INPUT');
+  } finally { rmSync(artifactRoot, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});
+
+test('runtime配置冲突在首次数据库操作前留下可读取FAILED审计', async () => {
+  const artifactRoot = mkdtempSync(path.join(os.tmpdir(), 'startup-artifact-'));
+  const statusRoot = mkdtempSync(path.join(os.tmpdir(), 'startup-status-'));
+  let queries = 0;
+  try {
+    const formalRunConfig = config(randomUUID(), artifactRoot);
+    const result = await runFormalResearchFromDatabase({ pool: { query: async () => { queries += 1; } },
+      evaluationVersion: 'conflicting-version', statusRoot, formalRunConfig });
+    assert.equal(queries, 0);
+    assert.equal(result.runStatus.runState, 'FAILED');
+    assert.equal(result.error.code, 'ORCHESTRATOR_RUN_CONFIG_MISMATCH');
+    assert.equal(findMostRecentRunStatus(statusRoot, 'DRY_RUN').blockedReasonCode, 'ORCHESTRATOR_RUN_CONFIG_MISMATCH');
+  } finally { rmSync(artifactRoot, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});
+
+test('无法安全形成完整身份的非法config进入隔离rejected-attempt审计，不伪造正式身份', async () => {
+  const artifactRoot = mkdtempSync(path.join(os.tmpdir(), 'startup-artifact-'));
+  const statusRoot = mkdtempSync(path.join(os.tmpdir(), 'startup-status-'));
+  let queries = 0;
+  try {
+    const result = await runFormalResearchFromDatabase({ pool: { query: async () => { queries += 1; } }, statusRoot, formalRunConfig: {} });
+    assert.equal(queries, 0);
+    assert.equal(result.runStatus.runState, 'FAILED');
+    assert.equal(result.runStatus.identityConstructed, false);
+    assert.equal('runIdentitySha256' in result.runStatus, false);
+    const audit = findMostRecentRejectedResearchAttempt(statusRoot);
+    assert.equal(audit.reasonCode, 'RUN_CONFIG_INVALID');
+    assert.equal(readD8DisplayStatus({ artifactRoot, statusRoot }).readerReasonCode, 'RUN_CONFIG_INVALID');
+  } finally { rmSync(artifactRoot, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});
+
 test('契约边界：正式database orchestrator保持模块调用，不新增HTTP/CLI或package启动入口', () => {
   const packageJson = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
   assert.equal(Object.values(packageJson.scripts).some(command => /formal-research-orchestrator|runFormalResearchFromDatabase/.test(command)), false);
-  const cliSource = readFileSync(new URL('./cli-entry.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(cliSource, /runFormalResearchFromDatabase|formal-research-orchestrator/);
+  const srcRoot = path.resolve(new URL('../', import.meta.url).pathname);
+  const files = [];
+  const walk = dir => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const target = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(target);
+      else if (entry.isFile() && entry.name.endsWith('.js') && !entry.name.endsWith('.test.js')) files.push(target);
+    }
+  };
+  walk(srcRoot);
+  const callers = files.filter(file => /runFormalResearchFromDatabase/.test(readFileSync(file, 'utf8')));
+  assert.deepEqual(callers, [path.join(srcRoot, 'validation-replay', 'formal-research-orchestrator.js')]);
+  for (const file of files.filter(file => /(?:cli|server|service|bootstrap|entry|index)/i.test(path.basename(file)))) {
+    assert.doesNotMatch(readFileSync(file, 'utf8'), /runFormalResearchFromDatabase|formal-research-orchestrator/,
+      `正式入口边界泄漏: ${path.relative(srcRoot, file)}`);
+  }
 });

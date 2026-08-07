@@ -15,6 +15,41 @@ export const LOCK_SCHEMA_ID = 'https://eth-alpha.invalid/schema/v1.4d-artifact-l
 export const PUBLISH_RESULT_SCHEMA_ID = 'https://eth-alpha.invalid/schema/v1.4d-artifact-publish-result-4.json';
 export const GOVERNANCE_SCHEMA_ID = 'https://eth-alpha.invalid/schema/v1.4d-governance-authorization-1.json';
 export const READER_RESULT_SCHEMA_ID = 'https://eth-alpha.invalid/schema/v1.4d-artifact-reader-result-1.json';
+export const RUN_IDENTITY_SCHEMA_ID = 'https://eth-alpha.invalid/schema/v1.4d-research-run-identity-1.json';
+
+// §2.5 implementation binding.  The raw artifact schema below remains the
+// byte-faithful frozen-contract copy used by fidelity verification.  Reader and
+// writer compile this strict extension so legacy artifacts without the full
+// identity fail closed while no frozen Markdown or frozen schema fixture is
+// rewritten.
+const runIdentitySchema = {
+  $schema: 'https://json-schema.org/draft/2020-12/schema', $id: RUN_IDENTITY_SCHEMA_ID,
+  type: 'object', additionalProperties: false,
+  properties: {
+    validationRunId: { type: 'string', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' },
+    artifactMode: { enum: ['FORMAL', 'DRY_RUN'] },
+    configSha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+    thresholdsSha256: { type: 'string', pattern: '^[0-9a-f]{64}$' },
+    gitObjectFormat: { enum: ['SHA1', 'SHA256'] },
+    sourceIdentity: { type: 'string', minLength: 1, maxLength: 128 },
+    sourceVersion: { type: 'string', minLength: 1, maxLength: 128 },
+    sourceCommit: { type: 'string', pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' },
+    datasetVersion: { type: 'string', pattern: '^v1\\.4d-sha256-[0-9a-f]{64}$' },
+    featureEngineVersion: { type: 'string', minLength: 1, maxLength: 128 },
+    algorithmVersion: { type: 'string', minLength: 1, maxLength: 128 },
+    ruleVersion: { type: 'string', minLength: 1, maxLength: 128 },
+    evaluationVersion: { type: 'string', minLength: 1, maxLength: 128 },
+    weightVersion: { type: 'string', minLength: 1, maxLength: 128 },
+    horizons: { type: 'array', prefixItems: [{ const: '24h' }, { const: '72h' }], items: false, minItems: 2, maxItems: 2 },
+    researchFrom: { type: 'string', format: 'date-time', pattern: 'Z$' },
+    researchTo: { type: 'string', format: 'date-time', pattern: 'Z$' },
+    fixedAsOf: { type: 'string', format: 'date-time', pattern: 'Z$' },
+    runIdentitySha256: { type: 'string', pattern: '^[0-9a-f]{64}$' }
+  },
+  required: ['validationRunId', 'artifactMode', 'configSha256', 'thresholdsSha256', 'gitObjectFormat', 'sourceIdentity', 'sourceVersion', 'sourceCommit',
+    'datasetVersion', 'featureEngineVersion', 'algorithmVersion', 'ruleVersion', 'evaluationVersion', 'weightVersion',
+    'horizons', 'researchFrom', 'researchTo', 'fixedAsOf', 'runIdentitySha256']
+};
 
 const artifactSchema = loadJsonSchema(ARTIFACT_SCHEMA_URL);
 const sidecarSchema = loadJsonSchema(SIDECAR_SCHEMA_URL);
@@ -60,12 +95,19 @@ function patchAllConditionalBranches(schema) {
   return clone;
 }
 
-const compilableArtifactSchema = patchAllConditionalBranches(artifactSchema);
+function extendArtifactWithCompleteRunIdentity(schema) {
+  const clone = structuredClone(schema);
+  clone.$defs.artifactCore.properties.runIdentity = { $ref: RUN_IDENTITY_SCHEMA_ID };
+  clone.$defs.artifactCore.required.push('runIdentity');
+  return clone;
+}
+
+const compilableArtifactSchema = patchAllConditionalBranches(extendArtifactWithCompleteRunIdentity(artifactSchema));
 const compilablePublishResultSchema = patchAllConditionalBranches(publishResultSchema);
 const compilableReaderResultSchema = patchAllConditionalBranches(readerResultSchema);
 
 export const artifactSchemaRegistry = new Draft202012SchemaRegistry({
-  schemas: [compilableArtifactSchema, sidecarSchema, lockSchema, compilablePublishResultSchema, governanceSchema, compilableReaderResultSchema]
+  schemas: [runIdentitySchema, compilableArtifactSchema, sidecarSchema, lockSchema, compilablePublishResultSchema, governanceSchema, compilableReaderResultSchema]
 });
 
 // 未经strictTypes补丁的原始byte-faithful版本，供fidelity测试与冻结契约canonical字节比对。

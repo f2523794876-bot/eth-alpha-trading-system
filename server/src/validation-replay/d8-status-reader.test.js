@@ -25,9 +25,17 @@ const GO_DECISION = evaluateGoNoGo(GO_INPUT);
 
 function sha256Hex(text) { return createHash('sha256').update(text, 'utf8').digest('hex'); }
 function makeRoot() { return mkdtempSync(path.join(os.tmpdir(), 'd8-status-reader-')); }
+function runIdentity(validationRunId, evaluationVersion, artifactMode) {
+  return createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode, config: {
+    gitObjectFormat: 'SHA1', sourceIdentity: 'MODULE_TEST', sourceVersion: 'v1.4d-test-config/1', sourceCommit: 'a'.repeat(40), datasetVersion: GO_INPUT.auditTrail.datasetVersion,
+    featureEngineVersion: 'feature-1', algorithmVersion: 'algorithm-1', ruleVersion: 'rule-1',
+    evaluationVersion, weightVersion: 'weight-1', horizons: ['24h', '72h'],
+    researchFrom: '2026-01-01T00:00:00.000Z', researchTo: '2026-01-08T00:00:00.000Z',
+    fixedAsOf: '2026-01-08T00:00:00.000Z', thresholds: GO_INPUT.thresholds
+  } });
+}
 function initial(validationRunId, totalBatches, now) {
-  return initialRunStatus({ runIdentity: createResearchRunIdentity({ validationRunId, evaluationVersion: 'display-status-test',
-    artifactMode: 'FORMAL', config: { test: 'd8-status-reader' } }), totalBatches, ...(now ? { now } : {}) });
+  return initialRunStatus({ runIdentity: runIdentity(validationRunId, 'display-status-test', 'FORMAL'), totalBatches, ...(now ? { now } : {}) });
 }
 
 function governanceRef(validationRunId) {
@@ -41,6 +49,7 @@ function governanceRef(validationRunId) {
 function publishGo(root, validationRunId, evaluationVersion = 'v1.4d-eval-d8-display') {
   const core = {
     validationRunId, evaluationVersion, gitObjectFormat: 'SHA1', sourceCommit: 'a'.repeat(40),
+    runIdentity: runIdentity(validationRunId, evaluationVersion, 'FORMAL'),
     d8InputSha256: 'b'.repeat(64), researchFrom: '2026-01-01T00:00:00.000Z', researchTo: '2026-01-08T00:00:00.000Z',
     fixedAsOf: '2026-01-08T00:00:00.000Z', thresholds: GO_INPUT.thresholds, scorecard: GO_INPUT.scorecard,
     auditTrail: { ...GO_INPUT.auditTrail, authenticityGateStatus: 'PASSED', manifestCoverage: 1, featureCoverage: 1, validationRunStatus: 'SUCCEEDED' },
@@ -183,6 +192,7 @@ test('DRY_RUN隔离：DRY_RUN artifact即使存在于artifactRoot下，也绝不
     void thresholdsSha256;
     const core = {
       validationRunId, evaluationVersion: 'v1.4d-eval-dry-run-isolation', gitObjectFormat: 'SHA1', sourceCommit: 'a'.repeat(40),
+      runIdentity: runIdentity(validationRunId, 'v1.4d-eval-dry-run-isolation', 'DRY_RUN'),
       d8InputSha256: 'b'.repeat(64), researchFrom: '2026-01-01T00:00:00.000Z', researchTo: '2026-01-08T00:00:00.000Z',
       fixedAsOf: '2026-01-08T00:00:00.000Z', thresholds: GO_INPUT.thresholds, scorecard: GO_INPUT.scorecard,
       auditTrail: { ...GO_INPUT.auditTrail, authenticityGateStatus: 'PASSED', manifestCoverage: 1, featureCoverage: 1, validationRunStatus: 'SUCCEEDED' },
@@ -220,4 +230,52 @@ test('结构性红线自检：d8-status-reader.js源码不引用historical_valid
   assert.ok(!/historical_validation/i.test(source), 'D8展示只读层不得直接引用historical_validation表');
   assert.ok(!/evaluateGoNoGo/.test(source), 'D8展示只读层不得调用evaluateGoNoGo()——决策只能来自D7已发布产物');
   assert.ok(!/INSERT INTO|UPDATE |DELETE FROM/i.test(source), 'D8展示只读层不得包含任何写入SQL');
+});
+
+function candidatePath(statusRoot, identity) {
+  const dir = path.join(statusRoot, 'run-status', 'formal', identity.validationRunId);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return path.join(dir, `${identity.runIdentitySha256}.status.json`);
+}
+
+for (const [label, mutate] of [
+  ['截断JSON', () => '{"schemaVersion":'],
+  ['非法schema', status => canonicalJson({ ...status, schemaVersion: 'legacy/0' })],
+  ['未知state', status => canonicalJson({ ...status, runState: 'UNKNOWN' })],
+  ['identity hash不匹配', status => canonicalJson({ ...status, runIdentitySha256: 'f'.repeat(64) })]
+]) test(`损坏状态fail-closed：${label}不得降级为NOT_RUN`, () => {
+  const root = makeRoot(), statusRoot = makeRoot();
+  try {
+    const identity = runIdentity(randomUUID(), 'display-status-test', 'FORMAL');
+    const status = initialRunStatus({ runIdentity: identity, totalBatches: 1 });
+    writeFileSync(candidatePath(statusRoot, identity), mutate(status));
+    const result = readD8DisplayStatus({ artifactRoot: root, statusRoot });
+    assert.equal(result.state, 'FAILED');
+    assert.equal(result.readerReasonCode, 'RUN_STATUS_CORRUPT_CANDIDATE');
+    assert.ok(!JSON.stringify(result).includes('schemaVersion'), '不得泄漏损坏候选原文');
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});
+
+test('确定排序：有效状态与任一损坏候选并存仍fail-closed', () => {
+  const root = makeRoot(), statusRoot = makeRoot();
+  try {
+    writeRunStatus(statusRoot, initial(randomUUID(), 1, '2026-01-08T00:00:00.000Z'));
+    const corruptIdentity = runIdentity(randomUUID(), 'display-status-test', 'FORMAL');
+    writeFileSync(candidatePath(statusRoot, corruptIdentity), '{partial');
+    const result = readD8DisplayStatus({ artifactRoot: root, statusRoot });
+    assert.equal(result.state, 'FAILED');
+    assert.equal(result.readerReasonCode, 'RUN_STATUS_CORRUPT_CANDIDATE');
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});
+
+test('临时文件残留不是状态候选；确无status文件时才返回NOT_RUN', () => {
+  const root = makeRoot(), statusRoot = makeRoot();
+  try {
+    const identity = runIdentity(randomUUID(), 'display-status-test', 'FORMAL');
+    const dir = path.dirname(candidatePath(statusRoot, identity));
+    rmSync(candidatePath(statusRoot, identity), { force: true });
+    writeFileSync(path.join(dir, '.interrupted.status.json.tmp.123.token'), '{partial');
+    const result = readD8DisplayStatus({ artifactRoot: root, statusRoot });
+    assert.equal(result.state, 'NOT_RUN');
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });

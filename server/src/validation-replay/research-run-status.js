@@ -21,15 +21,17 @@ import path from 'node:path';
 import { canonicalJson, canonicalSha256 } from '../formal-research/canonical-json.js';
 import {
   writeTempFileDurable, renameAllowCreate, fsyncDirectory, ensureDirectorySafe,
-  readFileNoFollowSymlink, lstatIfExists, newLockId
+  readFileNoFollowSymlink, lstatIfExists, newLockId, newOwnerToken, processStartIdentity, renameNoReplace
 } from './artifact-fs-primitives.js';
 
-const SCHEMA_VERSION = 'v1.4d-research-run-status/4';
+const SCHEMA_VERSION = 'v1.4d-research-run-status/5';
 const VALID_STATES = new Set(['RUNNING', 'BLOCKED', 'COMPLETED', 'FAILED']);
 const MAX_STATUS_BYTES = 1_000_000;
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const COMPLETE_IDENTITY_FIELDS = ['sourceCommit', 'datasetVersion', 'algorithmVersion', 'ruleVersion', 'evaluationVersion',
-  'weightVersion', 'horizons', 'researchFrom', 'researchTo', 'fixedAsOf', 'configSha256', 'runIdentitySha256'];
+const IDENTITY_CORE_FIELDS = ['validationRunId', 'artifactMode', 'configSha256', 'thresholdsSha256', 'gitObjectFormat',
+  'sourceIdentity', 'sourceVersion', 'sourceCommit', 'datasetVersion', 'featureEngineVersion', 'algorithmVersion', 'ruleVersion', 'evaluationVersion',
+  'weightVersion', 'horizons', 'researchFrom', 'researchTo', 'fixedAsOf'];
+const COMPLETE_IDENTITY_FIELDS = [...IDENTITY_CORE_FIELDS, 'runIdentitySha256'];
 
 function fail(code, message) {
   return Object.assign(new Error(message || code), { code });
@@ -54,19 +56,24 @@ export function createResearchRunIdentity({ validationRunId, evaluationVersion, 
   }
   const configSha256 = sha256(config);
   const core = {
-    validationRunId, artifactMode, configSha256,
-    sourceCommit: config.sourceCommit ?? null,
-    datasetVersion: config.datasetVersion ?? null,
-    algorithmVersion: config.algorithmVersion ?? null,
-    ruleVersion: config.ruleVersion ?? null,
+    validationRunId, artifactMode, configSha256, thresholdsSha256: sha256(config.thresholds),
+    gitObjectFormat: config.gitObjectFormat,
+    sourceIdentity: config.sourceIdentity ?? config.databaseIdentity ?? config.source,
+    sourceVersion: config.sourceVersion ?? config.schemaVersion,
+    sourceCommit: config.sourceCommit,
+    datasetVersion: config.datasetVersion,
+    featureEngineVersion: config.featureEngineVersion,
+    algorithmVersion: config.algorithmVersion,
+    ruleVersion: config.ruleVersion,
     evaluationVersion: config.evaluationVersion ?? evaluationVersion,
-    weightVersion: config.weightVersion ?? null,
-    horizons: config.horizons ?? null,
-    researchFrom: config.researchFrom ?? null,
-    researchTo: config.researchTo ?? null,
-    fixedAsOf: config.fixedAsOf ?? null
+    weightVersion: config.weightVersion,
+    horizons: config.horizons,
+    researchFrom: config.researchFrom,
+    researchTo: config.researchTo,
+    fixedAsOf: config.fixedAsOf
   };
   if (core.evaluationVersion !== evaluationVersion) throw fail('RUN_STATUS_IDENTITY_MISMATCH', 'evaluationVersion conflicts with frozen config');
+  assertIdentityCore(core);
   return Object.freeze({ ...core, runIdentitySha256: sha256(core) });
 }
 
@@ -121,32 +128,45 @@ function assertStatus(status) {
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
-function assertIdentity(runIdentity) {
+export function assertResearchRunIdentity(runIdentity) {
   if (!runIdentity || COMPLETE_IDENTITY_FIELDS.some(field => !Object.hasOwn(runIdentity, field))) {
     throw fail('RUN_STATUS_IDENTITY_INVALID', 'complete hashed run identity is required');
   }
-  if (!RUN_ID_PATTERN.test(runIdentity.validationRunId || '') ||
-      typeof runIdentity.evaluationVersion !== 'string' || !runIdentity.evaluationVersion.trim() ||
-      !['FORMAL', 'DRY_RUN'].includes(runIdentity.artifactMode) || !SHA256_PATTERN.test(runIdentity.configSha256 || '') ||
-      !SHA256_PATTERN.test(runIdentity.runIdentitySha256 || '')) throw fail('RUN_STATUS_IDENTITY_INVALID', 'complete hashed run identity is required');
+  assertIdentityCore(runIdentity);
+  if (!SHA256_PATTERN.test(runIdentity.runIdentitySha256 || '')) throw fail('RUN_STATUS_IDENTITY_INVALID', 'complete hashed run identity is required');
   const expectedHash = sha256(identityCore(runIdentity));
   if (runIdentity.runIdentitySha256 !== expectedHash) throw fail('RUN_STATUS_IDENTITY_MISMATCH', 'run identity hash mismatch');
   return Object.freeze({ ...identityCore(runIdentity), runIdentitySha256: runIdentity.runIdentitySha256 });
 }
 
-function identityCore(value) {
-  return {
-    validationRunId: value.validationRunId, artifactMode: value.artifactMode, configSha256: value.configSha256,
-    sourceCommit: value.sourceCommit ?? null, datasetVersion: value.datasetVersion ?? null,
-    algorithmVersion: value.algorithmVersion ?? null, ruleVersion: value.ruleVersion ?? null,
-    evaluationVersion: value.evaluationVersion, weightVersion: value.weightVersion ?? null,
-    horizons: value.horizons ?? null, researchFrom: value.researchFrom ?? null,
-    researchTo: value.researchTo ?? null, fixedAsOf: value.fixedAsOf ?? null
+function assertIdentityCore(value) {
+  const versions = ['sourceIdentity', 'sourceVersion', 'featureEngineVersion', 'algorithmVersion', 'ruleVersion', 'evaluationVersion', 'weightVersion'];
+  const canonicalUtc = field => {
+    try { return typeof value[field] === 'string' && new Date(value[field]).toISOString() === value[field]; }
+    catch { return false; }
   };
+  const sourcePattern = value.gitObjectFormat === 'SHA1' ? /^[0-9a-f]{40}$/ : value.gitObjectFormat === 'SHA256' ? /^[0-9a-f]{64}$/ : null;
+  if (!RUN_ID_PATTERN.test(value.validationRunId || '') || !['FORMAL', 'DRY_RUN'].includes(value.artifactMode) ||
+      !SHA256_PATTERN.test(value.configSha256 || '') || !SHA256_PATTERN.test(value.thresholdsSha256 || '') ||
+      !sourcePattern?.test(value.sourceCommit || '') || !/^v1\.4d-sha256-[0-9a-f]{64}$/.test(value.datasetVersion || '') ||
+      versions.some(field => typeof value[field] !== 'string' || !value[field].trim()) ||
+      !Array.isArray(value.horizons) || value.horizons.length === 0 || value.horizons.some(horizon => !['24h', '72h'].includes(horizon)) ||
+      !canonicalUtc('researchFrom') || !canonicalUtc('researchTo') || !canonicalUtc('fixedAsOf')) {
+    throw fail('RUN_STATUS_IDENTITY_INVALID', 'complete canonical run identity fields are required');
+  }
+  return value;
+}
+
+function identityCore(value) {
+  return Object.fromEntries(IDENTITY_CORE_FIELDS.map(field => [field, value[field]]));
+}
+
+export function researchRunIdentityCore(value) {
+  return identityCore(assertResearchRunIdentity(value));
 }
 
 export function readRunStatus(root, runIdentity) {
-  const identity = assertIdentity(runIdentity);
+  const identity = assertResearchRunIdentity(runIdentity);
   const target = statusPath(root, identity);
   const st = lstatIfExists(target);
   if (!st) {
@@ -183,21 +203,68 @@ export function findMostRecentRunStatus(root, artifactMode) {
   let runDirs;
   try { runDirs = fs.readdirSync(dir, { withFileTypes: true }).filter(entry => entry.isDirectory()); } catch { return null; }
   let best = null;
-  for (const runDir of runDirs) {
+  for (const runDir of runDirs.sort((a, b) => a.name.localeCompare(b.name))) {
     let files = [];
-    try { files = fs.readdirSync(path.join(dir, runDir.name)).filter(name => name.endsWith('.status.json')); } catch { continue; }
+    try { files = fs.readdirSync(path.join(dir, runDir.name)).filter(name => name.endsWith('.status.json')).sort(); }
+    catch { throw fail('RUN_STATUS_CORRUPT_CANDIDATE', 'run status directory cannot be read safely'); }
     for (const file of files) {
       let status;
       try {
         const { bytes } = readFileNoFollowSymlink(path.join(dir, runDir.name, file), MAX_STATUS_BYTES);
         status = assertStatus(JSON.parse(bytes.toString('utf8')));
-      } catch {
-        continue;
+        if (status.validationRunId !== runDir.name || file !== `${status.runIdentitySha256}.status.json` ||
+            status.artifactMode !== artifactMode) throw fail('RUN_STATUS_CORRUPT_CANDIDATE', 'run status path identity mismatch');
+      } catch (error) {
+        if (error?.code === 'RUN_STATUS_CORRUPT_CANDIDATE') throw error;
+        throw fail('RUN_STATUS_CORRUPT_CANDIDATE', 'run status candidate failed validation');
       }
       if (!best || new Date(status.updatedAt).getTime() > new Date(best.updatedAt).getTime()) best = status;
     }
   }
   return best;
+}
+
+// A malformed config cannot truthfully own a formal run identity.  Record it
+// in a physically separate namespace with no caller content, database detail,
+// or invented identity fields.  This is the fail-closed §2.5 boundary for
+// attempts rejected before complete canonical identity construction.
+export function writeRejectedResearchAttempt(root, reasonCode, { now = new Date().toISOString() } = {}) {
+  if (!/^[A-Z0-9_]+$/.test(reasonCode || '') || new Date(now).toISOString() !== now) {
+    throw fail('RUN_STATUS_REJECTED_ATTEMPT_INVALID', 'rejected attempt audit fields are invalid');
+  }
+  const dir = path.join(root, 'run-status', 'rejected-attempts');
+  ensureDirectorySafe(dir, root);
+  const attemptId = newLockId();
+  const payload = {
+    schemaVersion: 'v1.4d-rejected-research-attempt/1', attemptId, runState: 'FAILED',
+    identityConstructed: false, reasonCode, createdAt: now
+  };
+  const target = path.join(dir, `${Date.parse(now)}.${attemptId}.rejected.json`);
+  const temp = path.join(dir, `.${attemptId}.tmp`);
+  writeTempFileDurable(temp, Buffer.from(canonicalJson(payload), 'utf8'));
+  try { renameNoReplace(temp, target); }
+  catch (error) { try { fs.unlinkSync(temp); } catch { /* best effort */ } throw error; }
+  fsyncDirectory(dir);
+  return Object.freeze(payload);
+}
+
+export function findMostRecentRejectedResearchAttempt(root) {
+  const dir = path.join(root, 'run-status', 'rejected-attempts');
+  let files;
+  try { files = fs.readdirSync(dir).filter(name => name.endsWith('.rejected.json')).sort(); } catch { return null; }
+  let latest = null;
+  for (const file of files) {
+    try {
+      const payload = JSON.parse(readFileNoFollowSymlink(path.join(dir, file), 4096).bytes.toString('utf8'));
+      if (payload?.schemaVersion !== 'v1.4d-rejected-research-attempt/1' || !/^[0-9a-f]{32}$/.test(payload.attemptId || '') ||
+          payload.runState !== 'FAILED' || payload.identityConstructed !== false || !/^[A-Z0-9_]+$/.test(payload.reasonCode || '') ||
+          new Date(payload.createdAt).toISOString() !== payload.createdAt || file !== `${Date.parse(payload.createdAt)}.${payload.attemptId}.rejected.json`) {
+        throw new Error('invalid');
+      }
+      if (!latest || payload.createdAt > latest.createdAt) latest = payload;
+    } catch { throw fail('RUN_STATUS_CORRUPT_CANDIDATE', 'rejected attempt audit failed validation'); }
+  }
+  return latest;
 }
 
 function readExactStatus(root, identity) {
@@ -215,41 +282,119 @@ function processAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
 }
 
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function readStatusLockOwner(lockPath) {
+  const stat = fs.lstatSync(lockPath);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) throw fail('RUN_STATUS_LOCK_INVALID', 'status lock is not a safe directory');
+  const ownerFiles = fs.readdirSync(lockPath).filter(name => /^owner\.[0-9a-f]{64}\.json$/.test(name));
+  if (ownerFiles.length !== 1) throw fail('RUN_STATUS_LOCK_INVALID', 'status lock owner evidence is incomplete');
+  const ownerPath = path.join(lockPath, ownerFiles[0]);
+  let owner;
+  try { owner = JSON.parse(readFileNoFollowSymlink(ownerPath, 4096).bytes.toString('utf8')); }
+  catch { throw fail('RUN_STATUS_LOCK_INVALID', 'status lock owner evidence is invalid'); }
+  if (!owner || owner.ownerToken !== ownerFiles[0].slice(6, -5) || !/^[0-9a-f]{64}$/.test(owner.ownerToken) ||
+      !Number.isInteger(owner.pid) || owner.pid < 1 || typeof owner.processStartIdentity !== 'string' ||
+      typeof owner.createdAt !== 'string' || !Number.isFinite(new Date(owner.createdAt).getTime())) {
+    throw fail('RUN_STATUS_LOCK_INVALID', 'status lock owner evidence is invalid');
+  }
+  return { stat, owner, ownerPath };
+}
+
+function quarantineStaleStatusLock(lockPath, dir) {
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const quarantineDir = `${lockPath}.stale.${newLockId()}`;
+    try { fs.mkdirSync(quarantineDir, { mode: 0o700 }); }
+    catch (error) { if (error.code === 'EEXIST') continue; throw error; }
+    const quarantinedLock = path.join(quarantineDir, 'lock');
+    try {
+      // The destination is inside a directory created by this contender with
+      // O_EXCL mkdir semantics, so it is proven absent and cannot overwrite a
+      // competing quarantine target.  rename itself remains the atomic claim.
+      fs.renameSync(lockPath, quarantinedLock);
+      fsyncDirectory(dir);
+      fs.rmSync(quarantineDir, { recursive: true });
+      fsyncDirectory(dir);
+      return true;
+    } catch (error) {
+      try { fs.rmdirSync(quarantineDir); } catch { /* winner may have populated it */ }
+      if (error.code === 'ENOENT') return false;
+      throw error;
+    }
+  }
+  throw fail('RUN_STATUS_LOCK_QUARANTINE_COLLISION', 'status lock quarantine retries exhausted');
+}
+
 function acquireStatusLock(dir, identity, { lockTimeoutMs = 5_000, staleLockMs = 30_000 } = {}) {
   const lockPath = path.join(dir, `.${identity.runIdentitySha256}.status.lock`);
   const deadline = Date.now() + lockTimeoutMs;
   while (true) {
     try {
       fs.mkdirSync(lockPath, { mode: 0o700 });
-      const ownerPath = path.join(lockPath, 'owner.json');
-      writeTempFileDurable(ownerPath, Buffer.from(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), 'utf8'));
-      fsyncDirectory(lockPath);
-      return { lockPath, ownerPath };
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
-      let owner = null, age = 0;
-      try {
-        const stat = fs.lstatSync(lockPath);
-        if (!stat.isDirectory() || stat.isSymbolicLink()) throw fail('RUN_STATUS_LOCK_INVALID', 'status lock is not a safe directory');
-        age = Date.now() - stat.mtimeMs;
-        owner = JSON.parse(readFileNoFollowSymlink(path.join(lockPath, 'owner.json'), 4096).bytes.toString('utf8'));
-      } catch (readError) {
-        if (readError?.code === 'RUN_STATUS_LOCK_INVALID') throw readError;
+      let evidence;
+      try { evidence = readStatusLockOwner(lockPath); }
+      catch (readError) {
+        if (readError?.code === 'ENOENT') continue; // another contender atomically quarantined it
+        if (readError?.code !== 'RUN_STATUS_LOCK_INVALID') throw readError;
+        if (Date.now() >= deadline) throw readError;
+        sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
+        continue;
       }
-      if (age >= staleLockMs || (owner && !processAlive(owner.pid))) {
-        const stalePath = `${lockPath}.stale.${Date.now()}.${newLockId()}`;
-        try { fs.renameSync(lockPath, stalePath); fsyncDirectory(dir); fs.rmSync(stalePath, { recursive: true }); continue; }
-        catch (recoveryError) { if (recoveryError.code === 'ENOENT') continue; }
+      const { stat, owner } = evidence;
+      const age = Date.now() - stat.mtimeMs;
+      const ownerAlive = processAlive(owner.pid) && processStartIdentity(owner.pid) === owner.processStartIdentity;
+      if (age >= staleLockMs && !ownerAlive) {
+        quarantineStaleStatusLock(lockPath, dir);
+        continue;
       }
       if (Date.now() >= deadline) throw fail('RUN_STATUS_LOCK_TIMEOUT', 'timed out acquiring run status lock');
+      sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
+      continue;
+    }
+    const ownerToken = newOwnerToken();
+    const ownerPath = path.join(lockPath, `owner.${ownerToken}.json`);
+    try {
+      const owner = { ownerToken, pid: process.pid, processStartIdentity: processStartIdentity(), createdAt: new Date().toISOString() };
+      writeTempFileDurable(ownerPath, Buffer.from(canonicalJson(owner), 'utf8'));
+      fsyncDirectory(lockPath);
+      fsyncDirectory(dir);
+      return { lockPath, ownerPath, ownerToken, dir };
+    } catch (error) {
+      try { fs.unlinkSync(ownerPath); } catch { /* best effort */ }
+      try { fs.rmdirSync(lockPath); } catch { /* best effort */ }
+      throw error;
     }
   }
 }
 
 function releaseStatusLock(dir, lock) {
-  try { fs.unlinkSync(lock.ownerPath); } catch { /* owner may have been externally removed */ }
-  try { fs.rmdirSync(lock.lockPath); } catch { /* caller error must remain primary */ }
-  fsyncDirectory(dir);
+  let owner;
+  try { owner = JSON.parse(readFileNoFollowSymlink(lock.ownerPath, 4096).bytes.toString('utf8')); }
+  catch { return false; }
+  if (owner.ownerToken !== lock.ownerToken) return false;
+  try {
+    fs.unlinkSync(lock.ownerPath);
+    fs.rmdirSync(lock.lockPath);
+    fsyncDirectory(dir);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function acquireResearchRunStatusLock(root, runIdentity, options = {}) {
+  const identity = assertResearchRunIdentity(runIdentity);
+  const dir = runStatusDir(root, identity.artifactMode, identity.validationRunId);
+  ensureDirectorySafe(dir, root);
+  return acquireStatusLock(dir, identity, options);
+}
+
+export function releaseResearchRunStatusLock(lock) {
+  return releaseStatusLock(lock.dir, lock);
 }
 
 function assertMonotonicTransition(current, next) {
@@ -276,7 +421,7 @@ export function writeRunStatus(root, status, lockOptions = {}) {
   assertStatus(status);
   const dir = runStatusDir(root, status.artifactMode, status.validationRunId);
   ensureDirectorySafe(dir, root);
-  const identity = assertIdentity(status);
+  const identity = assertResearchRunIdentity(status);
   const lock = acquireStatusLock(dir, identity, lockOptions);
   let tempPath = null;
   try {
@@ -303,7 +448,7 @@ export function writeRunStatus(root, status, lockOptions = {}) {
 }
 
 export function initialRunStatus({ runIdentity, totalBatches, now = new Date().toISOString() }) {
-  const identity = assertIdentity(runIdentity);
+  const identity = assertResearchRunIdentity(runIdentity);
   return assertStatus({
     schemaVersion: SCHEMA_VERSION, ...identity, revision: 0, runState: 'RUNNING',
     totalBatches, completedBatchIndices: [], batchCheckpoints: [], blockedReasonCode: null,

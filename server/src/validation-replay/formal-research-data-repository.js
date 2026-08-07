@@ -296,6 +296,7 @@ function mapRow(row, context) {
         row.outcomeSourceOrigin !== 'HISTORICAL_REPLAY' || row.datasetVersion !== context.datasetVersion ||
         replayAlgorithmVersion !== context.algorithmVersion || replayRuleVersion !== context.ruleVersion ||
         (context.weightVersion !== undefined && replayWeightVersion !== context.weightVersion) ||
+        (context.featureEngineVersion !== undefined && featureEngineVersion !== context.featureEngineVersion) ||
         row.researchAvailabilityRuleVersion !== context.researchAvailabilityRuleVersion) {
       throw fail('FORMAL_RESEARCH_DATABASE_IDENTITY_CHAIN_INVALID', 'row identity/status chain conflicts with the validation run');
     }

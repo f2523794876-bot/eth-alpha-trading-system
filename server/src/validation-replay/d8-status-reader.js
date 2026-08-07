@@ -11,7 +11,7 @@
 //      candidateTrajectories等内部字段、不返回validationRunFinishedAt之外的任何文件系统细节。
 import { findLatestFormalArtifactDir } from './d8-artifact-discovery.js';
 import { readArtifactPair } from './artifact-reader.js';
-import { findMostRecentRunStatus } from './research-run-status.js';
+import { findMostRecentRejectedResearchAttempt, findMostRecentRunStatus } from './research-run-status.js';
 
 const DISPLAY_ONLY_DISCLOSURE =
   'DISPLAY_ONLY：本字段/本次读取结果仅用于只读展示，不是、也不影响任何交易执行许可判断；' +
@@ -61,8 +61,26 @@ function projectAcceptedResult(artifact, runStatus) {
 export function readD8DisplayStatus({ artifactRoot, statusRoot }) {
   // run-status的发现独立于"是否已经有已发布artifact"——第一次运行、尚未产出任何已发布结果时
   // 也必须能被观察到RUNNING，不能依赖"先有已发布artifact才能定位validationRunId"这个错误假设。
-  let runStatus = null;
-  try { runStatus = findMostRecentRunStatus(statusRoot, 'FORMAL'); } catch { runStatus = null; }
+  let runStatus = null, rejectedAttempt = null;
+  try {
+    runStatus = findMostRecentRunStatus(statusRoot, 'FORMAL');
+    rejectedAttempt = findMostRecentRejectedResearchAttempt(statusRoot);
+  }
+  catch (error) {
+    const code = error?.code === 'RUN_STATUS_CORRUPT_CANDIDATE' ? error.code : 'RUN_STATUS_READ_FAILED';
+    return {
+      state: 'FAILED', message: '正式研究状态记录损坏或无法安全读取，拒绝降级为未运行。',
+      readerReasonCode: code, actionPermission: 'DISPLAY_ONLY', disclosure: DISPLAY_ONLY_DISCLOSURE
+    };
+  }
+
+  if (rejectedAttempt && (!runStatus || rejectedAttempt.createdAt > runStatus.updatedAt)) {
+    return {
+      state: 'FAILED', message: '正式研究尝试在完整运行身份形成前被拒绝，未执行数据库查询。',
+      readerReasonCode: rejectedAttempt.reasonCode,
+      actionPermission: 'DISPLAY_ONLY', disclosure: DISPLAY_ONLY_DISCLOSURE
+    };
+  }
 
   if (runStatus && runStatus.runState === 'RUNNING') {
     return {
