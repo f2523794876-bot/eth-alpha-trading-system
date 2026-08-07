@@ -11,7 +11,8 @@
 //      candidateTrajectories等内部字段、不返回validationRunFinishedAt之外的任何文件系统细节。
 import { findLatestFormalArtifactDir } from './d8-artifact-discovery.js';
 import { readArtifactPair } from './artifact-reader.js';
-import { findMostRecentRejectedResearchAttempt, findMostRecentRunStatus } from './research-run-status.js';
+import { assertResearchRunIdentity, findMostRecentRejectedResearchAttempt, findMostRecentRunStatus } from './research-run-status.js';
+import { canonicalJson } from '../formal-research/canonical-json.js';
 
 const DISPLAY_ONLY_DISCLOSURE =
   'DISPLAY_ONLY：本字段/本次读取结果仅用于只读展示，不是、也不影响任何交易执行许可判断；' +
@@ -42,7 +43,11 @@ function projectAcceptedResult(artifact, runStatus) {
   const decision = artifact.core.decision;
   return {
     state: decision.overall.status, // GO | CONDITIONAL_GO | NO_GO | DATA_GATE_FAILED | BASELINE_NOT_EVALUABLE
-    runId: decision.validationRunId,
+    // Sourced from the verified core.validationRunId (checked against
+    // runStatus's own identity below when a run-status claim exists), not
+    // from decision.validationRunId's unverified pass-through, so callers
+    // can audit which run this response actually belongs to.
+    runId: artifact.core.validationRunId,
     algorithmVersion: decision.evaluationVersion,
     datasetVersion: artifact.core.auditTrail?.datasetVersion ?? null,
     generatedAt: decision.evaluatedAt,
@@ -117,5 +122,36 @@ export function readD8DisplayStatus({ artifactRoot, statusRoot }) {
       readerReasonCode: result.readerReasonCode, actionPermission: 'DISPLAY_ONLY', disclosure: DISPLAY_ONLY_DISCLOSURE
     };
   }
+
+  // P0-01: findMostRecentRunStatus (by updatedAt) and findLatestFormalArtifactDir
+  // (by sidecar rename mtime) are two independent selection mechanisms over two
+  // independent clocks and can legitimately disagree about which validationRunId
+  // is "latest" (e.g. two separate FORMAL runs completing in an interleaved
+  // order -- see finding P0-01). runStatus reaching this line is only ever
+  // COMPLETED (RUNNING/BLOCKED/FAILED already returned above). When a COMPLETED
+  // run-status claim exists, the artifact we are about to display must be
+  // provably that same run's artifact -- full canonical identity, not just a
+  // matching validationRunId, directory name, or single narrow hash -- or we
+  // must fail closed instead of silently displaying a mismatched pair. When no
+  // run-status claim exists at all (e.g. legitimately pruned/retired after the
+  // artifact's own retention window, or predates run-status tracking), there is
+  // nothing to cross-check against and the artifact is shown as before.
+  if (runStatus) {
+    let identityMatch = false;
+    try {
+      const artifactIdentity = assertResearchRunIdentity(result.artifact.core?.runIdentity);
+      const statusIdentity = assertResearchRunIdentity(runStatus);
+      identityMatch = canonicalJson(artifactIdentity) === canonicalJson(statusIdentity);
+    } catch { identityMatch = false; }
+    if (!identityMatch) {
+      return {
+        state: 'FAILED',
+        message: '最新研究状态与最新已发布artifact所属运行身份不一致，拒绝展示可能被混淆的结果。',
+        readerReasonCode: 'D8_DISPLAY_STATUS_ARTIFACT_MISMATCH',
+        actionPermission: 'DISPLAY_ONLY', disclosure: DISPLAY_ONLY_DISCLOSURE
+      };
+    }
+  }
+
   return projectAcceptedResult(result.artifact, runStatus);
 }

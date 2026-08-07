@@ -21,7 +21,8 @@ import path from 'node:path';
 import { canonicalJson, canonicalSha256 } from '../formal-research/canonical-json.js';
 import {
   writeTempFileDurable, renameAllowCreate, fsyncDirectory, ensureDirectorySafe,
-  readFileNoFollowSymlink, lstatIfExists, newLockId, newOwnerToken, processStartIdentity, renameNoReplace
+  readFileNoFollowSymlink, lstatIfExists, newLockId, newOwnerToken, processStartIdentity, renameNoReplace,
+  hostIdentitySha256
 } from './artifact-fs-primitives.js';
 
 const SCHEMA_VERSION = 'v1.4d-research-run-status/5';
@@ -286,43 +287,161 @@ function sleepSync(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
-function readStatusLockOwner(lockPath) {
-  const stat = fs.lstatSync(lockPath);
-  if (!stat.isDirectory() || stat.isSymbolicLink()) throw fail('RUN_STATUS_LOCK_INVALID', 'status lock is not a safe directory');
-  const ownerFiles = fs.readdirSync(lockPath).filter(name => /^owner\.[0-9a-f]{64}\.json$/.test(name));
-  if (ownerFiles.length !== 1) throw fail('RUN_STATUS_LOCK_INVALID', 'status lock owner evidence is incomplete');
-  const ownerPath = path.join(lockPath, ownerFiles[0]);
-  let owner;
-  try { owner = JSON.parse(readFileNoFollowSymlink(ownerPath, 4096).bytes.toString('utf8')); }
-  catch { throw fail('RUN_STATUS_LOCK_INVALID', 'status lock owner evidence is invalid'); }
-  if (!owner || owner.ownerToken !== ownerFiles[0].slice(6, -5) || !/^[0-9a-f]{64}$/.test(owner.ownerToken) ||
-      !Number.isInteger(owner.pid) || owner.pid < 1 || typeof owner.processStartIdentity !== 'string' ||
-      typeof owner.createdAt !== 'string' || !Number.isFinite(new Date(owner.createdAt).getTime())) {
-    throw fail('RUN_STATUS_LOCK_INVALID', 'status lock owner evidence is invalid');
-  }
-  return { stat, owner, ownerPath };
+// P1-02 (round 2): the lock is published via an atomic hardlink-claim, not
+// "mkdir a directory, then separately write a file inside it". A brand-new,
+// uniquely-named temp file bound to a fresh ownerToken is written and fsynced
+// to completion *first*; only then is it atomically linked onto `lockPath`
+// (via renameNoReplace = linkSync+unlink, the same no-replace primitive the
+// D7 artifact lock's own sidecar commit point uses). Because link() only
+// ever attaches a *complete, already-durable* inode to the lockPath name,
+// there is no filesystem state in which `lockPath` exists but is
+// incomplete/mid-write -- it is always either fully absent or fully valid.
+// This removes the observable "lock visible, owner evidence not yet formed"
+// window that P0-02 exploited; it does not merely shrink it.
+//
+// P1-01: owner evidence must be bound to the host that wrote it, not just to
+// a PID number. PID numbers have zero cross-host meaning, so any activeness
+// judgement for a lock declared on a *different* host than the observer is
+// fail-closed by construction (see isSameHostOwner/evaluateLockDisposition
+// below): it is never auto-reclaimed no matter how old it looks locally.
+function ownerContentFor(ownerToken) {
+  return {
+    ownerToken, pid: process.pid, processStartIdentity: processStartIdentity(),
+    hostIdentitySha256: hostIdentitySha256(), createdAt: new Date().toISOString()
+  };
 }
 
-function quarantineStaleStatusLock(lockPath, dir) {
+function isValidOwnerShape(owner) {
+  return !!owner && typeof owner === 'object' &&
+    /^[0-9a-f]{64}$/.test(owner.ownerToken || '') &&
+    Number.isInteger(owner.pid) && owner.pid >= 1 &&
+    typeof owner.processStartIdentity === 'string' &&
+    /^[0-9a-f]{64}$/.test(owner.hostIdentitySha256 || '') &&
+    typeof owner.createdAt === 'string' && Number.isFinite(new Date(owner.createdAt).getTime());
+}
+
+// Reads the *published* lock (a regular file at lockPath -- never a
+// directory: a directory at this path can only be a pre-fix legacy lock or
+// an unknown/corrupted object, both handled by the isFile() check below).
+function readPublishedLockOwner(lockPath) {
+  const stat = fs.lstatSync(lockPath); // throws ENOENT if absent -- caller distinguishes
+  if (stat.isSymbolicLink()) throw fail('RUN_STATUS_LOCK_INVALID', 'lock path is a symlink');
+  if (!stat.isFile()) {
+    // Covers the pre-fix directory-based lock format and any other unknown
+    // object type. §四.9: legacy/unknown formats must fail closed and are
+    // never auto-migrated, auto-quarantined, or auto-interpreted here.
+    throw fail('RUN_STATUS_LOCK_INVALID', 'lock path is not a regular file (legacy or unknown format)');
+  }
+  let owner;
+  try { owner = JSON.parse(readFileNoFollowSymlink(lockPath, 4096).bytes.toString('utf8')); }
+  catch { throw fail('RUN_STATUS_LOCK_INVALID', 'lock content is not valid JSON'); }
+  if (!isValidOwnerShape(owner)) throw fail('RUN_STATUS_LOCK_INVALID', 'lock content failed schema validation');
+  return { stat, owner };
+}
+
+// A process-start identity string of the form `pid-only-<pid>` means the
+// platform (documented in artifact-fs-primitives.js: anything without /proc,
+// e.g. macOS) could not provide a real start-time disambiguator and silently
+// degraded to a bare PID. Matching such a value proves nothing about PID
+// reuse. This function makes that degradation an explicit, checked condition
+// here rather than letting a coincidental string match imply a verified
+// identity.
+function hasReliableStartIdentity(value) {
+  return typeof value === 'string' && !/^pid-only-/.test(value);
+}
+
+function isSameHostOwner(owner) {
+  return owner.hostIdentitySha256 === hostIdentitySha256();
+}
+
+// Single source of truth for "what is this lock right now", used both to
+// decide whether to attempt quarantine and, immediately before the rename
+// itself, to re-confirm nothing has changed (TOCTOU requirement). Returns
+// one of:
+//   'gone'               - lock path no longer exists (raced away)
+//   'active'              - same-host owner verified alive, or platform
+//                            cannot reliably disambiguate PID reuse
+//                            (fail closed: never auto-reclaim)
+//   'active-cross-host'   - owner declared on a different host; cannot be
+//                            disproven from here (fail closed)
+//   'stale-with-owner'    - same-host owner, reliable start identity,
+//                            confirmed not alive, past staleLockMs
+// Any other outcome (lock content unreadable/corrupt/schema-invalid/legacy
+// format/symlink) is *not* modeled as a disposition at all -- it throws.
+// Under the atomic-publish protocol a published lockPath is always either
+// fully absent or fully valid, so reaching an unreadable-but-present state
+// means genuine corruption, tampering, or a pre-fix legacy leftover, none of
+// which self-resolve by waiting. §四.6: never auto-quarantine on mtime alone
+// for this case; return a stable, diagnosable, non-retryable error instead
+// and require manual/governance intervention.
+function evaluateLockDisposition(lockPath, staleLockMs) {
+  let evidence;
+  try { evidence = readPublishedLockOwner(lockPath); }
+  catch (error) {
+    if (error.code === 'ENOENT') return { status: 'gone' };
+    throw error;
+  }
+  const { stat, owner } = evidence;
+  const age = Date.now() - stat.mtimeMs;
+  if (!isSameHostOwner(owner)) return { status: 'active-cross-host', owner };
+
+  // A PID the OS confirms is not running at all is conclusively dead --
+  // start-identity ambiguity (PID reuse) only matters for disambiguating a
+  // *currently alive* PID from an unrelated process that happens to reuse
+  // it. Checking processAlive() first avoids the trap where
+  // processStartIdentity() itself degrades to the unreliable `pid-only-`
+  // form for an already-exited PID (its /proc entry is gone), which would
+  // otherwise be misread as "cannot determine" instead of "definitely dead".
+  if (!processAlive(owner.pid)) {
+    return { status: age >= staleLockMs ? 'stale-with-owner' : 'active', owner };
+  }
+  const localStartIdentity = processStartIdentity(owner.pid);
+  const reliableStartIdentity = hasReliableStartIdentity(owner.processStartIdentity) && hasReliableStartIdentity(localStartIdentity);
+  if (!reliableStartIdentity) {
+    // Same host, PID currently alive, but this platform cannot reliably
+    // distinguish the original owner from an unrelated process that later
+    // reused the same PID. Explicit fail-closed: never treat as stale on
+    // this evidence alone.
+    return { status: 'active', owner };
+  }
+  // PID alive under a *different* start identity than recorded: the original
+  // owner is gone and this PID number was reused by an unrelated process.
+  const sameProcess = localStartIdentity === owner.processStartIdentity;
+  if (age >= staleLockMs && !sameProcess) return { status: 'stale-with-owner', owner };
+  return { status: 'active', owner };
+}
+
+// Moves a confirmed-stale *published* lock file out of the way using plain
+// POSIX rename(), not link+unlink: for this direction (one known existing
+// source, racing reclaimers) rename() is the correct exclusive primitive --
+// the first rename to execute atomically detaches the source, so a second
+// reclaimer's rename on the same (now-gone) source cleanly fails ENOENT.
+// (link+unlink would be wrong here: multiple processes could each
+// successfully link the same still-existing source to their own distinct
+// destination name before either unlinks it, defeating exclusivity -- that
+// primitive is only exclusive on its shared *destination*, which publish
+// uses lockPath for, not quarantine.)
+function quarantinePublishedLock(lockPath, dir, staleLockMs) {
   for (let attempt = 0; attempt < 16; attempt += 1) {
-    const quarantineDir = `${lockPath}.stale.${newLockId()}`;
-    try { fs.mkdirSync(quarantineDir, { mode: 0o700 }); }
-    catch (error) { if (error.code === 'EEXIST') continue; throw error; }
-    const quarantinedLock = path.join(quarantineDir, 'lock');
+    // TOCTOU guard: re-evaluate immediately before touching the lock. If a
+    // legitimate owner has since (re)appeared and is no longer stale by the
+    // same rule, abort without renaming anything.
+    let recheck;
+    try { recheck = evaluateLockDisposition(lockPath, staleLockMs); }
+    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    if (recheck.status !== 'stale-with-owner') return false;
+    const quarantinePath = `${lockPath}.stale.${newLockId()}`;
     try {
-      // The destination is inside a directory created by this contender with
-      // O_EXCL mkdir semantics, so it is proven absent and cannot overwrite a
-      // competing quarantine target.  rename itself remains the atomic claim.
-      fs.renameSync(lockPath, quarantinedLock);
-      fsyncDirectory(dir);
-      fs.rmSync(quarantineDir, { recursive: true });
-      fsyncDirectory(dir);
-      return true;
+      fs.renameSync(lockPath, quarantinePath);
     } catch (error) {
-      try { fs.rmdirSync(quarantineDir); } catch { /* winner may have populated it */ }
-      if (error.code === 'ENOENT') return false;
+      if (error.code === 'ENOENT') return false; // another reclaimer already won
+      if (error.code === 'EEXIST') continue; // quarantine name collision (negligible with 128-bit ids); retry with a new one
       throw error;
     }
+    fsyncDirectory(dir);
+    try { fs.unlinkSync(quarantinePath); } catch { /* best effort; leftover quarantine file blocks nothing */ }
+    fsyncDirectory(dir);
+    return true;
   }
   throw fail('RUN_STATUS_LOCK_QUARANTINE_COLLISION', 'status lock quarantine retries exhausted');
 }
@@ -331,54 +450,59 @@ function acquireStatusLock(dir, identity, { lockTimeoutMs = 5_000, staleLockMs =
   const lockPath = path.join(dir, `.${identity.runIdentitySha256}.status.lock`);
   const deadline = Date.now() + lockTimeoutMs;
   while (true) {
-    try {
-      fs.mkdirSync(lockPath, { mode: 0o700 });
-    } catch (error) {
-      if (error.code !== 'EEXIST') throw error;
-      let evidence;
-      try { evidence = readStatusLockOwner(lockPath); }
-      catch (readError) {
-        if (readError?.code === 'ENOENT') continue; // another contender atomically quarantined it
-        if (readError?.code !== 'RUN_STATUS_LOCK_INVALID') throw readError;
-        if (Date.now() >= deadline) throw readError;
-        sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
-        continue;
-      }
-      const { stat, owner } = evidence;
-      const age = Date.now() - stat.mtimeMs;
-      const ownerAlive = processAlive(owner.pid) && processStartIdentity(owner.pid) === owner.processStartIdentity;
-      if (age >= staleLockMs && !ownerAlive) {
-        quarantineStaleStatusLock(lockPath, dir);
-        continue;
-      }
-      if (Date.now() >= deadline) throw fail('RUN_STATUS_LOCK_TIMEOUT', 'timed out acquiring run status lock');
-      sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
-      continue;
-    }
     const ownerToken = newOwnerToken();
-    const ownerPath = path.join(lockPath, `owner.${ownerToken}.json`);
+    const tempPath = path.join(dir, `.${identity.runIdentitySha256}.status.lock.tmp.${ownerToken}`);
+    const owner = ownerContentFor(ownerToken);
+    const bytes = Buffer.from(canonicalJson(owner), 'utf8');
+    writeTempFileDurable(tempPath, bytes); // O_CREAT|O_EXCL|O_NOFOLLOW + write + fsync, see artifact-fs-primitives.js
+    // Re-read and re-validate the prepared evidence before it can ever become
+    // visible at lockPath -- defense against a corrupted write reaching a
+    // position where any other process could observe it as "the" lock.
+    let readBack;
+    try { readBack = JSON.parse(fs.readFileSync(tempPath, 'utf8')); } catch { readBack = null; }
+    if (!isValidOwnerShape(readBack) || canonicalJson(readBack) !== canonicalJson(owner)) {
+      try { fs.unlinkSync(tempPath); } catch { /* best effort cleanup of our own temp file only */ }
+      throw fail('RUN_STATUS_LOCK_PUBLISH_FAILED', 'prepared owner evidence failed self-verification before publish');
+    }
+
     try {
-      const owner = { ownerToken, pid: process.pid, processStartIdentity: processStartIdentity(), createdAt: new Date().toISOString() };
-      writeTempFileDurable(ownerPath, Buffer.from(canonicalJson(owner), 'utf8'));
-      fsyncDirectory(lockPath);
+      renameNoReplace(tempPath, lockPath); // atomic hardlink-claim: the ONE step that makes the lock visible, already fully formed
       fsyncDirectory(dir);
-      return { lockPath, ownerPath, ownerToken, dir };
+      return { lockPath, ownerToken, dir };
     } catch (error) {
-      try { fs.unlinkSync(ownerPath); } catch { /* best effort */ }
-      try { fs.rmdirSync(lockPath); } catch { /* best effort */ }
+      try { fs.unlinkSync(tempPath); } catch { /* best effort cleanup of our own temp file only */ }
+      if (!(error.code === 'ARTIFACT_RENAME_FAILED' && error.cause === 'EEXIST')) throw error; // unexpected failure: fail closed, do not fall back to a weaker protocol
+      // lockPath already exists -- fall through to evaluate it below.
+    }
+
+    let disposition;
+    try { disposition = evaluateLockDisposition(lockPath, staleLockMs); }
+    catch (error) {
+      if (error.code === 'ENOENT') continue; // raced away between our EEXIST and now
+      // Unreadable/corrupt/legacy-format published lock: never auto-recovered
+      // by mtime alone (§四.6). Propagate immediately as a stable,
+      // diagnosable, non-timeout error rather than retry-looping toward one.
       throw error;
     }
+    if (disposition.status === 'gone') continue; // another contender already reclaimed and cleared it
+    if (disposition.status === 'stale-with-owner') {
+      quarantinePublishedLock(lockPath, dir, staleLockMs);
+      continue; // whether we won the race or lost it, re-evaluate from scratch
+    }
+    // 'active' | 'active-cross-host': cannot prove this lock is safe to
+    // reclaim right now -- wait for it, never steal it.
+    if (Date.now() >= deadline) throw fail('RUN_STATUS_LOCK_TIMEOUT', 'timed out acquiring run status lock');
+    sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
   }
 }
 
 function releaseStatusLock(dir, lock) {
   let owner;
-  try { owner = JSON.parse(readFileNoFollowSymlink(lock.ownerPath, 4096).bytes.toString('utf8')); }
+  try { owner = JSON.parse(readFileNoFollowSymlink(lock.lockPath, 4096).bytes.toString('utf8')); }
   catch { return false; }
   if (owner.ownerToken !== lock.ownerToken) return false;
   try {
-    fs.unlinkSync(lock.ownerPath);
-    fs.rmdirSync(lock.lockPath);
+    fs.unlinkSync(lock.lockPath);
     fsyncDirectory(dir);
     return true;
   } catch {
