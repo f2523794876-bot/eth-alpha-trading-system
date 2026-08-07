@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync, mkdirSync, utimesSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, mkdirSync, utimesSync } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   acquireResearchRunStatusLock, createResearchRunIdentity, initialRunStatus, readRunStatus,
-  releaseResearchRunStatusLock, writeRunStatus, withBatchCompleted, withFailed
+  releaseResearchRunStatusLock, releaseResearchRunStatusLockForTest, quarantinePublishedLockForTest,
+  writeRunStatus, withBatchCompleted, withFailed
 } from './research-run-status.js';
 import { canonicalJson } from '../formal-research/canonical-json.js';
 import { hostIdentitySha256, processStartIdentity } from './artifact-fs-primitives.js';
@@ -374,20 +375,48 @@ test('lockPath是符号链接：不得跟随，必须fail closed', () => {
 
 // ===== CEO六.10 / 六.11: 同host正常死亡owner恢复 / 同host PID复用恢复 =====
 // 六.10见上方真实子进程"崩溃持锁者超过阈值后可安全恢复"(已对新形态重新验证通过)。
-test('同host PID复用(start identity不符)的陈旧正式锁可被正确回收', () => {
-  const rootPath = root();
-  try {
-    const runIdentity = identity();
-    const { lockPath } = lockPathFor(rootPath, runIdentity);
-    publishRawLock(lockPath, validOwnerJson({
-      ownerToken: 'e'.repeat(64), pid: process.pid /* 真实存活 -- 就是我们自己 */,
-      processStartIdentity: 'linux-starttime-0000000000' /* 刻意错误：与我们真实start identity不符 */
-    }));
-    age(lockPath, 60_000);
-    const written = writeRunStatus(rootPath, initialRunStatus({ runIdentity, totalBatches: 1 }), { lockTimeoutMs: 1_000, staleLockMs: 10 });
-    assert.equal(written.runState, 'RUNNING');
-  } finally { rmSync(rootPath, { recursive: true, force: true }); }
-});
+//
+// 六.11要求：不得错误声称"所有平台均能回收PID复用锁"。先探测本机processStartIdentity()
+// 是否真的提供了可靠的(非pid-only-)启动身份；只有在这个前提成立时，"PID复用陈旧锁可被
+// 回收"才是本模块设计要保证的行为。不成立(如macOS无/proc)时，跳过"可回收"这一断言，
+// 改为断言相反方向的安全性质——即fail closed(绝不错误接管)，而不是对两种平台都断言同一个
+// "总能回收"的结论。
+{
+  const hasReliableLocalStartIdentity = !/^pid-only-/.test(processStartIdentity(process.pid));
+  test('同host PID复用(start identity不符)的陈旧正式锁可被正确回收',
+    hasReliableLocalStartIdentity ? undefined : { skip: '本平台processStartIdentity()退化为pid-only-，无法提供可靠启动身份，见下方fail-closed对照测试' },
+    () => {
+      const rootPath = root();
+      try {
+        const runIdentity = identity();
+        const { lockPath } = lockPathFor(rootPath, runIdentity);
+        publishRawLock(lockPath, validOwnerJson({
+          ownerToken: 'e'.repeat(64), pid: process.pid /* 真实存活 -- 就是我们自己 */,
+          processStartIdentity: 'linux-starttime-0000000000' /* 刻意错误：与我们真实start identity不符 */
+        }));
+        age(lockPath, 60_000);
+        const written = writeRunStatus(rootPath, initialRunStatus({ runIdentity, totalBatches: 1 }), { lockTimeoutMs: 1_000, staleLockMs: 10 });
+        assert.equal(written.runState, 'RUNNING');
+      } finally { rmSync(rootPath, { recursive: true, force: true }); }
+    });
+
+  test('平台无可靠启动身份时，PID复用场景必须fail closed而不是静默接管',
+    hasReliableLocalStartIdentity ? { skip: '本平台(Linux /proc可用)提供可靠启动身份，见上方"可被正确回收"测试覆盖该分支' } : undefined,
+    () => {
+      const rootPath = root();
+      try {
+        const runIdentity = identity();
+        const { lockPath } = lockPathFor(rootPath, runIdentity);
+        publishRawLock(lockPath, validOwnerJson({
+          ownerToken: 'e2'.padEnd(64, '0'), pid: process.pid,
+          processStartIdentity: 'pid-only-999999999' /* 陈旧记录本身也是不可靠格式 */
+        }));
+        age(lockPath, 60_000);
+        assert.throws(() => writeRunStatus(rootPath, initialRunStatus({ runIdentity, totalBatches: 1 }), { lockTimeoutMs: 150, staleLockMs: 10 }),
+          error => error.code === 'RUN_STATUS_LOCK_TIMEOUT');
+      } finally { rmSync(rootPath, { recursive: true, force: true }); }
+    });
+}
 
 // ===== CEO六.12: 不同host相同PID不得自动接管 =====
 test('不同hostIdentity声明的正式锁，即使本机判断该PID不存在也绝不自动接管(跨主机fail closed)', () => {
@@ -434,5 +463,69 @@ test('连续20轮获取与释放后，目标目录不residual任何锁或临时�
     const dir = path.join(rootPath, 'run-status', 'dry-run', runIdentity.validationRunId);
     const leftovers = readdirSync(dir).filter(name => name.includes('.lock') || name.includes('.tmp.'));
     assert.deepEqual(leftovers, [], `连续多轮获取/释放后不得残留锁或临时文件，实际残留: ${JSON.stringify(leftovers)}`);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------
+// P0-03 / P0-04 修复：quarantine与release的TOCTOU（董事长/CEO独立复审授权的
+// 范围受控修复，父提交032bae4）。
+//
+// 两个测试都使用同进程同步hook在生产实现内部的精确临界点(验证完成之后、
+// 破坏性操作之前)注入"锁已被替换为新owner"这一竞态，而不是依赖wall-clock
+// 延迟或进程调度——JS单线程语义保证hook触发的时刻是确定的，不是概率性的。
+// 替换本身通过真实的acquireResearchRunStatusLock()完成，是生产实现而非
+// 手工重演的相似原语。
+// ---------------------------------------------------------------------------
+
+test('P0-03修复：quarantine在rename前发现目标已被替换为新owner时，绝不能移动/删除新锁(确定性同步点)', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const { dir, lockPath } = lockPathFor(rootPath, runIdentity);
+    // 构造一把真实的、已确认死亡、已超过staleLockMs的旧锁A。
+    publishRawLock(lockPath, validOwnerJson({ ownerToken: 'a'.repeat(64), pid: 99999999 }));
+    age(lockPath, 60_000);
+
+    let newOwnerLock = null;
+    const hooks = {
+      afterVerifiedBeforeRename: () => {
+        // 场景四步：1.已验证A为stale(已发生，见上) 2.在rename前A被移走
+        // 3.新owner B在同一lockPath成功发布——用真实生产函数完成。
+        unlinkSync(lockPath);
+        newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+      }
+    };
+
+    const quarantined = quarantinePublishedLockForTest(lockPath, dir, 10, hooks);
+    assert.equal(quarantined, false, '4.原恢复者不得把B的锁rename到quarantine——必须放弃，不得声称成功');
+    assert.equal(existsSync(lockPath), true, 'B的正式锁必须仍然存在于原路径');
+    const stillB = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(stillB.ownerToken, newOwnerLock.ownerToken, 'lockPath内容必须仍是B，未被移进/删除于quarantine');
+    assert.equal(releaseResearchRunStatusLock(newOwnerLock), true);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('P0-04修复：release在token验证后、unlink前发现锁已被替换为新owner时，绝不能删除新锁(确定性同步点，非概率stress)', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const oldLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+
+    let newOwnerLock = null;
+    const hooks = {
+      afterVerifiedBeforeUnlink: () => {
+        // 场景四步：1.旧owner已验证自己ownerToken(已发生，见上) 2.在unlink前
+        // 旧锁被移走 3.新owner在同一lockPath发布——用真实生产函数完成。
+        unlinkSync(oldLock.lockPath);
+        newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+      }
+    };
+
+    const released = releaseResearchRunStatusLockForTest(oldLock, hooks);
+    assert.equal(released, false, '4.旧owner不得把新owner的锁unlink——必须放弃，不得声称release成功');
+    assert.equal(existsSync(oldLock.lockPath), true, '新owner的正式锁必须仍然存在');
+    const stillNew = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
+    assert.equal(stillNew.ownerToken, newOwnerLock.ownerToken, 'lockPath内容必须仍是新owner，未被旧owner误删');
+    assert.equal(releaseResearchRunStatusLock(newOwnerLock), true);
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
