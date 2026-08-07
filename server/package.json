@@ -3,7 +3,9 @@
   "version": "1.4.0-b.1",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node src/index.js",
     "migrate": "node src/db/migrate.js up",
@@ -37,7 +39,16 @@
     "test:postgres:r3-batch3": "node --test tests/postgres/v1-4d-formal-research-data-repository.integration.test.js",
     "test:postgres:r3-batch4": "node --test tests/postgres/v1-4d-formal-research-data-repository.integration.test.js",
     "test:verification-bundle": "node --test src/validation-replay/research-scorecard.test.js scripts/v1-4d-scorecard-cli.test.mjs",
-    "check": "node --check src/index.js && node --test tests/*.test.js tests/forecast/*.test.js"
+    "check": "node --check src/index.js && node --test tests/*.test.js tests/forecast/*.test.js",
+    "build:renameat2": "node scripts/build-renameat2-addon.mjs",
+    "postinstall": "node scripts/build-renameat2-addon.mjs"
   },
-  "dependencies": { "ajv": "8.20.0", "canonicalize": "3.0.0", "pg": "^8.16.3" }
+  "dependencies": {
+    "ajv": "8.20.0",
+    "canonicalize": "3.0.0",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "node-gyp": "^13.0.1"
+  }
 }

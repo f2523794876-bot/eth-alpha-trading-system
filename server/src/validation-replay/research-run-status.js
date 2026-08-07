@@ -24,6 +24,7 @@ import {
   readFileNoFollowSymlink, lstatIfExists, newLockId, newOwnerToken, processStartIdentity, renameNoReplace,
   hostIdentitySha256
 } from './artifact-fs-primitives.js';
+import * as renameat2 from '../../native/renameat2/index.js';
 
 const SCHEMA_VERSION = 'v1.4d-research-run-status/5';
 const VALID_STATES = new Set(['RUNNING', 'BLOCKED', 'COMPLETED', 'FAILED']);
@@ -311,13 +312,28 @@ function ownerContentFor(ownerToken) {
   };
 }
 
+// A "tombstone" is what a clean release() leaves behind: a schema-valid,
+// self-describing marker that unambiguously means "vacated on purpose",
+// distinct from a crashed/dead owner (which requires the age+liveness
+// heuristics in classifyOwnerDisposition to become reclaimable). Written by
+// the SAME safe verified-exchange primitive as everything else -- there is
+// no separate "just unlink it" path anymore (see P0-04 fix rationale below).
+function tombstoneContentFor(precedingOwnerToken) {
+  return {
+    ownerToken: newOwnerToken(), pid: process.pid, processStartIdentity: processStartIdentity(),
+    hostIdentitySha256: hostIdentitySha256(), createdAt: new Date().toISOString(),
+    released: true, precedingOwnerToken
+  };
+}
+
 function isValidOwnerShape(owner) {
   return !!owner && typeof owner === 'object' &&
     /^[0-9a-f]{64}$/.test(owner.ownerToken || '') &&
     Number.isInteger(owner.pid) && owner.pid >= 1 &&
     typeof owner.processStartIdentity === 'string' &&
     /^[0-9a-f]{64}$/.test(owner.hostIdentitySha256 || '') &&
-    typeof owner.createdAt === 'string' && Number.isFinite(new Date(owner.createdAt).getTime());
+    typeof owner.createdAt === 'string' && Number.isFinite(new Date(owner.createdAt).getTime()) &&
+    (owner.released === undefined || (owner.released === true && typeof owner.precedingOwnerToken === 'string'));
 }
 
 // Reads the *published* lock (a regular file at lockPath -- never a
@@ -409,6 +425,11 @@ function isSameHostOwner(owner) {
 // re-verify identity by inode immediately before acting (see below); this
 // function only ever informs a decision, never anchors one.
 function classifyOwnerDisposition(owner, stat, staleLockMs) {
+  // A clean release leaves an explicit, unambiguous "vacated" marker --
+  // unlike a crashed/dead owner, there is no liveness question to resolve
+  // (no staleLockMs wait, no host/PID heuristics needed), so it is always
+  // immediately reclaimable regardless of which host released it.
+  if (owner.released === true) return { status: 'stale-with-owner', owner };
   const age = Date.now() - stat.mtimeMs;
   if (!isSameHostOwner(owner)) return { status: 'active-cross-host', owner };
 
@@ -452,91 +473,144 @@ function evaluateLockDisposition(lockPath, staleLockMs) {
   return classifyOwnerDisposition(evidence.owner, evidence.stat, staleLockMs);
 }
 
-// P0-03: moves a confirmed-stale *published* lock file out of the way using
-// plain POSIX rename(), not link+unlink: for this direction (one known
-// existing source, racing reclaimers) rename() is the correct exclusive
-// primitive -- the first rename to execute atomically detaches the source,
-// so a second reclaimer's rename on the same (now-gone) source cleanly
-// fails ENOENT. (link+unlink would be wrong here: multiple processes could
-// each successfully link the same still-existing source to their own
-// distinct destination name before either unlinks it, defeating
-// exclusivity -- that primitive is only exclusive on its shared
-// *destination*, which publish uses lockPath for, not quarantine.)
+// P0-03/P0-04 (round 2, CEO-authorized "方案B"): displacing an existing lock
+// object -- whether to quarantine a confirmed-dead owner, to install our own
+// fresh claim over one, or to release our own lock into a tombstone -- is
+// now always done through Linux renameat2(RENAME_EXCHANGE) (see
+// native/renameat2/), never through "lstat to check an inode, then rename()
+// by path" as before. This is a deliberate response to independent review
+// finding those two operations are never the same atomic step: the OS can
+// always interleave a directory-entry change for lockPath between our last
+// lstat and the rename() syscall actually running, so a "recheck immediately
+// before acting" discipline is not itself an atomicity guarantee, no matter
+// how narrow the window is made.
 //
-// Verification is anchored to a single open file descriptor for the entire
-// operation, not to the path: "recheck immediately before rename" is *not*
-// treated as an atomicity guarantee by itself (a bare path-based recheck can
-// still be stale by the time rename() actually executes) -- what makes this
-// safe is that (a) the pre-rename check compares the *current* directory
-// entry's inode against the inode we opened and verified, refusing to touch
-// anything if they differ, and (b) after the rename we independently confirm
-// the object that ended up in quarantine is still that same inode, restoring
-// it and failing closed rather than deleting it if not. `hooks` is a
-// test-only synchronous injection point (see research-run-status-concurrency
-// test file); production callers never pass it.
-function quarantinePublishedLock(lockPath, dir, staleLockMs, hooks = {}) {
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    let fd;
-    try { fd = fs.openSync(lockPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
-    catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+// renameat2(RENAME_EXCHANGE) gives us the two properties that a check-then-
+// act sequence cannot: (1) lockPath is *never* observably absent -- the
+// exchange swaps two already-existing directory entries in one atomic
+// kernel operation, so there is no window for anything else to claim
+// lockPath via the normal link()-no-replace publish path (which requires
+// the target to be absent) while a displacement is in flight; and (2) the
+// object we displace lands at our own private, CSPRNG-named path that no
+// other process has ever heard of or can reference -- so reading it back
+// through that path, *after* the exchange has already committed, is not
+// subject to any further race: nothing else can have touched a name only we
+// know. If what we find there is not what we expected to displace (a
+// confirmed-dead owner, a clean-release tombstone, or -- for release -- our
+// own still-current lock), we undo with a second exchange. That second
+// exchange is unconditionally safe, not "best effort": because lockPath was
+// never absent for even an instant across the whole sequence, nothing else
+// could have taken it in the interim, so swapping back is guaranteed to
+// restore exactly what was there, never overwriting or losing a third
+// party's lock. We never fall back to path-based rename/unlink for this --
+// if the native addon is unavailable, these operations fail closed with
+// RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE instead.
+function exchangeCandidatePathFor(lockPath) {
+  return `${lockPath}.exchange.${newOwnerToken()}`;
+}
 
-    let verifiedStat, owner;
-    try {
-      const read = readOwnerFromFd(fd);
-      verifiedStat = read.stat; owner = read.owner;
-    } catch (error) {
-      fs.closeSync(fd);
-      if (error.code === 'RUN_STATUS_LOCK_INVALID') return false; // not a stale-owner shape we can act on; do not touch it
-      throw error;
-    }
-    const disposition = classifyOwnerDisposition(owner, verifiedStat, staleLockMs);
-    if (disposition.status !== 'stale-with-owner') { fs.closeSync(fd); return false; }
-
-    hooks.afterVerifiedBeforeRename?.(); // test-only: inject a swap here to prove the pre-rename check below catches it
-
-    // Pre-rename identity check: the *current* directory entry at lockPath
-    // must still be the exact inode we just opened and verified as stale.
-    let preStat;
-    try { preStat = fs.lstatSync(lockPath); }
-    catch (error) { fs.closeSync(fd); if (error.code === 'ENOENT') return false; throw error; }
-    if (!sameInode(preStat, verifiedStat)) {
-      // Someone else already moved/replaced it (quarantined it themselves,
-      // or -- P0-03's exact scenario -- a new owner published there). We
-      // must not touch whatever is there now, whether or not we can tell
-      // what it is.
-      fs.closeSync(fd);
-      return false;
-    }
-
-    const quarantinePath = `${lockPath}.stale.${newLockId()}`;
-    try {
-      fs.renameSync(lockPath, quarantinePath);
-    } catch (error) {
-      fs.closeSync(fd);
-      if (error.code === 'ENOENT') return false; // another reclaimer already won
-      if (error.code === 'EEXIST') continue; // quarantine name collision (negligible with 128-bit ids); retry with a new one
-      throw error;
-    }
-
-    // Post-rename confirmation: what we actually moved must still be the
-    // same inode. This is the only way to detect the residual (execution-
-    // order-level, not test-injectable) race between the pre-rename check
-    // above and the rename() syscall itself actually running.
-    let postStat;
-    try { postStat = fs.lstatSync(quarantinePath); } catch { postStat = null; }
-    const identityHeld = sameInode(postStat, verifiedStat);
-    fs.closeSync(fd);
-    if (!identityHeld) {
-      try { fs.renameSync(quarantinePath, lockPath); } catch { /* best effort restore; surfaced via the thrown error either way */ }
-      throw fail('RUN_STATUS_LOCK_QUARANTINE_IDENTITY_CHANGED', 'quarantine target identity changed between verification and rename');
-    }
-
-    fsyncDirectory(dir);
-    try { fs.unlinkSync(quarantinePath); } catch { /* best effort; leftover quarantine file blocks nothing */ }
-    fsyncDirectory(dir);
-    return true;
+function prepareCandidate(candidatePath, content) {
+  const bytes = Buffer.from(canonicalJson(content), 'utf8');
+  writeTempFileDurable(candidatePath, bytes); // O_CREAT|O_EXCL|O_NOFOLLOW + write + fsync
+  let readBack;
+  try { readBack = fs.readFileSync(candidatePath); } catch { readBack = null; }
+  if (!readBack || !readBack.equals(bytes)) {
+    try { fs.unlinkSync(candidatePath); } catch { /* best effort cleanup of our own file only */ }
+    throw fail('RUN_STATUS_LOCK_PUBLISH_FAILED', 'prepared lock evidence failed self-verification before use');
   }
-  throw fail('RUN_STATUS_LOCK_QUARANTINE_COLLISION', 'status lock quarantine retries exhausted');
+}
+
+function discardCandidate(candidatePath) {
+  // Always our own private, never-shared path -- safe to remove
+  // unconditionally; nothing else can ever have a reason to reference it.
+  try { fs.unlinkSync(candidatePath); } catch { /* best effort */ }
+}
+
+// The single primitive both quarantine, direct-claim, and release are built
+// from. `candidatePath` must already hold fully-formed, self-verified
+// content (see prepareCandidate). `acceptDisplaced(owner, stat)` decides,
+// from what was *actually* displaced (read back through our own private
+// path, immune to further tampering), whether the exchange should stand.
+// Returns `{ exchanged: true }` on success (lockPath now holds our
+// candidate; candidatePath now holds the displaced object, not yet
+// discarded -- caller inspects/discards it) or `{ exchanged: false }` if
+// undone (candidatePath now holds our own unused candidate again, restored
+// to exactly its pre-exchange state; lockPath is untouched from any outside
+// observer's perspective). `hooks.beforeExchange` is a test-only, same-
+// process synchronous injection point fired at the last possible moment
+// before the actual atomic syscall -- production callers never pass it.
+function exchangeAndVerify(lockPath, dir, candidatePath, acceptDisplaced, hooks = {}) {
+  if (!renameat2.available) {
+    throw fail('RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE',
+      `renameat2(RENAME_EXCHANGE) is required to safely displace an existing lock and is not available: ${renameat2.getUnavailableReason()}`);
+  }
+  hooks.beforeExchange?.();
+  try {
+    renameat2.renameExchangeSync(candidatePath, lockPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') return { exchanged: false, reason: 'gone' };
+    throw error;
+  }
+
+  // candidatePath now holds whatever was previously at lockPath. Nothing
+  // else can have touched candidatePath, ever -- its name is derived from a
+  // CSPRNG token nobody else has seen -- so this read is definitive, not
+  // advisory.
+  let displacedStat, displacedOwner;
+  try {
+    const fd = fs.openSync(candidatePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try { ({ stat: displacedStat, owner: displacedOwner } = readOwnerFromFd(fd)); }
+    finally { fs.closeSync(fd); }
+  } catch (error) {
+    undoExchange(candidatePath, lockPath, dir);
+    throw fail('RUN_STATUS_LOCK_QUARANTINE_IDENTITY_CHANGED', `displaced lock object failed verification: ${error.message}`);
+  }
+
+  if (!acceptDisplaced(displacedOwner, displacedStat)) {
+    undoExchange(candidatePath, lockPath, dir);
+    return { exchanged: false, reason: 'identity-mismatch', displacedOwner };
+  }
+
+  fsyncDirectory(dir);
+  return { exchanged: true, displacedOwner, displacedStat };
+}
+
+// The undo is unconditionally safe, not best-effort: lockPath was never
+// absent between the original exchange and this one, so nothing else could
+// have claimed it -- this swap is guaranteed to restore exactly what was
+// there before, never overwriting or removing a third party's lock. If the
+// undo itself fails (e.g. the addon becomes unavailable mid-sequence, which
+// should not happen but is not assumed away), that is surfaced loudly
+// rather than silently leaving the displaced object stranded and unlogged.
+function undoExchange(candidatePath, lockPath, dir) {
+  try {
+    renameat2.renameExchangeSync(candidatePath, lockPath);
+    fsyncDirectory(dir);
+  } catch (error) {
+    throw fail('RUN_STATUS_LOCK_EXCHANGE_UNDO_FAILED',
+      `failed to restore displaced lock object after a failed verification (it remains intact, un-deleted, at ${candidatePath}): ${error.message}`);
+  }
+}
+
+// P0-03: displaces a confirmed-stale published lock with a clean tombstone
+// (does not claim ownership for the caller -- see acquireStatusLock below
+// for the more efficient direct-claim variant used on the normal acquire
+// path). Exposed directly (via quarantinePublishedLockForTest) so this
+// exact operation is independently testable.
+function quarantinePublishedLock(lockPath, dir, staleLockMs, hooks = {}) {
+  let disposition;
+  try { disposition = evaluateLockDisposition(lockPath, staleLockMs); }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+  if (disposition.status !== 'stale-with-owner') return false; // advisory only; exchangeAndVerify's post-check is the real gate
+
+  const candidatePath = exchangeCandidatePathFor(lockPath);
+  prepareCandidate(candidatePath, tombstoneContentFor(null));
+
+  const result = exchangeAndVerify(lockPath, dir, candidatePath,
+    (owner, stat) => classifyOwnerDisposition(owner, stat, staleLockMs).status === 'stale-with-owner',
+    hooks);
+  discardCandidate(candidatePath);
+  return result.exchanged;
 }
 
 function acquireStatusLock(dir, identity, { lockTimeoutMs = 5_000, staleLockMs = 30_000 } = {}) {
@@ -544,107 +618,86 @@ function acquireStatusLock(dir, identity, { lockTimeoutMs = 5_000, staleLockMs =
   const deadline = Date.now() + lockTimeoutMs;
   while (true) {
     const ownerToken = newOwnerToken();
-    const tempPath = path.join(dir, `.${identity.runIdentitySha256}.status.lock.tmp.${ownerToken}`);
-    const owner = ownerContentFor(ownerToken);
-    const bytes = Buffer.from(canonicalJson(owner), 'utf8');
-    writeTempFileDurable(tempPath, bytes); // O_CREAT|O_EXCL|O_NOFOLLOW + write + fsync, see artifact-fs-primitives.js
-    // Re-read and re-validate the prepared evidence before it can ever become
-    // visible at lockPath -- defense against a corrupted write reaching a
-    // position where any other process could observe it as "the" lock.
-    let readBack;
-    try { readBack = JSON.parse(fs.readFileSync(tempPath, 'utf8')); } catch { readBack = null; }
-    if (!isValidOwnerShape(readBack) || canonicalJson(readBack) !== canonicalJson(owner)) {
-      try { fs.unlinkSync(tempPath); } catch { /* best effort cleanup of our own temp file only */ }
-      throw fail('RUN_STATUS_LOCK_PUBLISH_FAILED', 'prepared owner evidence failed self-verification before publish');
-    }
+    const claimPath = path.join(dir, `.${identity.runIdentitySha256}.status.lock.tmp.${ownerToken}`);
+    prepareCandidate(claimPath, ownerContentFor(ownerToken));
 
+    // Bootstrap: only ever succeeds the very first time this identity's
+    // lockPath is claimed (link()-no-replace requires the target to be
+    // absent). Every subsequent claim -- including immediately after a
+    // clean release, which leaves a tombstone rather than removing
+    // lockPath -- goes through the exchange path below instead.
     try {
-      renameNoReplace(tempPath, lockPath); // atomic hardlink-claim: the ONE step that makes the lock visible, already fully formed
+      renameNoReplace(claimPath, lockPath);
       fsyncDirectory(dir);
       return { lockPath, ownerToken, dir };
     } catch (error) {
-      try { fs.unlinkSync(tempPath); } catch { /* best effort cleanup of our own temp file only */ }
-      if (!(error.code === 'ARTIFACT_RENAME_FAILED' && error.cause === 'EEXIST')) throw error; // unexpected failure: fail closed, do not fall back to a weaker protocol
-      // lockPath already exists -- fall through to evaluate it below.
+      if (!(error.code === 'ARTIFACT_RENAME_FAILED' && error.cause === 'EEXIST')) {
+        discardCandidate(claimPath);
+        throw error; // unexpected failure: fail closed, do not fall back to a weaker protocol
+      }
+      // lockPath already exists (live lock, dead lock, or tombstone) -- fall
+      // through and reuse this already-prepared, already-verified claim for
+      // an exchange-based attempt below.
     }
 
     let disposition;
     try { disposition = evaluateLockDisposition(lockPath, staleLockMs); }
     catch (error) {
+      discardCandidate(claimPath);
       if (error.code === 'ENOENT') continue; // raced away between our EEXIST and now
       // Unreadable/corrupt/legacy-format published lock: never auto-recovered
       // by mtime alone (§四.6). Propagate immediately as a stable,
       // diagnosable, non-timeout error rather than retry-looping toward one.
       throw error;
     }
-    if (disposition.status === 'gone') continue; // another contender already reclaimed and cleared it
-    if (disposition.status === 'stale-with-owner') {
-      quarantinePublishedLock(lockPath, dir, staleLockMs);
-      continue; // whether we won the race or lost it, re-evaluate from scratch
+    if (disposition.status === 'gone') { discardCandidate(claimPath); continue; }
+    if (disposition.status !== 'stale-with-owner') {
+      // 'active' | 'active-cross-host': cannot prove this lock is safe to
+      // reclaim right now -- wait for it, never steal it.
+      discardCandidate(claimPath);
+      if (Date.now() >= deadline) throw fail('RUN_STATUS_LOCK_TIMEOUT', 'timed out acquiring run status lock');
+      sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
+      continue;
     }
-    // 'active' | 'active-cross-host': cannot prove this lock is safe to
-    // reclaim right now -- wait for it, never steal it.
-    if (Date.now() >= deadline) throw fail('RUN_STATUS_LOCK_TIMEOUT', 'timed out acquiring run status lock');
-    sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
+
+    const result = exchangeAndVerify(lockPath, dir, claimPath,
+      (owner, stat) => classifyOwnerDisposition(owner, stat, staleLockMs).status === 'stale-with-owner');
+    if (!result.exchanged) {
+      discardCandidate(claimPath);
+      if (Date.now() >= deadline) throw fail('RUN_STATUS_LOCK_TIMEOUT', 'timed out acquiring run status lock');
+      sleepSync(Math.min(10, Math.max(1, deadline - Date.now())));
+      continue;
+    }
+    // Success: lockPath now holds OUR claim (installed atomically by the
+    // exchange, already fully formed before the exchange ever ran);
+    // claimPath now holds the confirmed-stale object we displaced.
+    discardCandidate(claimPath);
+    return { lockPath, ownerToken, dir };
   }
 }
 
-// P0-04: same inode-pinned pattern as quarantinePublishedLock, applied to
-// release. A bare "read token by path, then unlink by path" has the same
-// TOCTOU shape as the pre-fix quarantine did: the entry at lock.lockPath
-// could be replaced by a new legitimate owner between the token check and
-// the unlink, and a path-based unlink would delete whatever is *currently*
-// there -- possibly the new owner's lock, not ours. Fixed the same way:
-// verify via an open fd (pinned to our lock's inode), recheck the path
-// still resolves to that inode immediately before acting, and -- since
-// unlink has no undo -- perform the destructive step as a rename to a
-// per-owner tombstone first (so it can still be verified and, if wrong,
-// restored) rather than an irreversible unlink directly on lockPath.
-// `hooks` is a test-only synchronous injection point; production callers
-// never pass it.
+// P0-04: release no longer unlinks lockPath at all -- it exchanges our lock
+// for a tombstone, verifying (through the exchange's own private-path
+// readback) that what we displaced really was our own current lock before
+// treating the release as successful, and undoing (safely, unconditionally,
+// per exchangeAndVerify's contract) if it was not.
 function releaseStatusLock(dir, lock, hooks = {}) {
-  let fd;
-  try { fd = fs.openSync(lock.lockPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
-  catch { return false; } // gone, or a symlink (ELOOP) -- nothing of ours to release
-
-  let verifiedStat, owner;
-  try {
-    const read = readOwnerFromFd(fd);
-    verifiedStat = read.stat; owner = read.owner;
-  } catch { fs.closeSync(fd); return false; }
-  if (owner.ownerToken !== lock.ownerToken) { fs.closeSync(fd); return false; }
-
-  hooks.afterVerifiedBeforeUnlink?.(); // test-only: inject a swap here to prove the pre-unlink check below catches it
-
-  let preStat;
-  try { preStat = fs.lstatSync(lock.lockPath); }
-  catch { fs.closeSync(fd); return false; }
-  if (!sameInode(preStat, verifiedStat)) { fs.closeSync(fd); return false; } // already replaced -- not ours to touch
-
-  const tombstonePath = `${lock.lockPath}.release.${lock.ownerToken}`;
-  try {
-    fs.renameSync(lock.lockPath, tombstonePath);
-  } catch {
-    fs.closeSync(fd);
-    return false; // raced away between our check and the rename -- not ours to release
+  if (!renameat2.available) {
+    // Deliberately do not fall back to a path-based unlink here -- that is
+    // exactly the TOCTOU this fix closes. Fail closed with a stable,
+    // diagnosable error instead; the lock remains held (from every other
+    // observer's perspective) until a human resolves the missing addon.
+    throw fail('RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE',
+      `renameat2(RENAME_EXCHANGE) is required to safely release a lock and is not available: ${renameat2.getUnavailableReason()}`);
   }
+  const candidatePath = exchangeCandidatePathFor(lock.lockPath);
+  prepareCandidate(candidatePath, tombstoneContentFor(lock.ownerToken));
 
-  let postStat;
-  try { postStat = fs.lstatSync(tombstonePath); } catch { postStat = null; }
-  const identityHeld = sameInode(postStat, verifiedStat);
-  fs.closeSync(fd);
-  if (!identityHeld) {
-    try { fs.renameSync(tombstonePath, lock.lockPath); } catch { /* best effort restore */ }
-    return false; // do not delete something we cannot prove is our own lock
-  }
-
-  try {
-    fs.unlinkSync(tombstonePath);
-    fsyncDirectory(dir);
-    return true;
-  } catch {
-    return false;
-  }
+  const result = exchangeAndVerify(lock.lockPath, dir, candidatePath,
+    owner => owner.ownerToken === lock.ownerToken,
+    hooks);
+  discardCandidate(candidatePath);
+  return result.exchanged;
 }
 
 export function acquireResearchRunStatusLock(root, runIdentity, options = {}) {
@@ -661,9 +714,9 @@ export function releaseResearchRunStatusLock(lock) {
 // Test-only seams (see research-run-status-concurrency.test.js): identical
 // to the exported functions above, but allow passing a synchronous `hooks`
 // object to deterministically inject an adversarial filesystem change at the
-// exact post-verification, pre-destructive-operation instant, without
-// relying on wall-clock timing or process scheduling. No production call
-// path constructs or passes `hooks`.
+// last possible moment before the actual atomic renameat2(RENAME_EXCHANGE)
+// syscall, without relying on wall-clock timing or process scheduling. No
+// production call path constructs or passes `hooks`.
 export function quarantinePublishedLockForTest(lockPath, dir, staleLockMs, hooks) {
   return quarantinePublishedLock(lockPath, dir, staleLockMs, hooks);
 }

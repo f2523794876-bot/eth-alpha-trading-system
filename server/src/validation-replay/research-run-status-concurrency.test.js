@@ -329,7 +329,15 @@ test('两个独立Node子进程同时对同一(全新)身份执行原子发布�
     assert.equal(payloads.filter(value => value.ok && value.state).length, 1, '只能有一方真正写入');
     assert.equal(payloads.filter(value => value.rejected).length, 1, '另一方必须被拒绝，不得覆盖');
     const { lockPath } = lockPathFor(rootPath, runIdentity);
-    assert.equal(existsSync(lockPath), false, '竞争结束后锁必须已释放，不留残留');
+    // release不再unlink lockPath——干净release在原路径留下一个tombstone(见P0-04修复)，
+    // 而不是让路径变为不存在。"不留残留"在新协议下的正确含义是：lockPath内容是一个
+    // 合法的released tombstone，目录里没有任何其他杂散的.tmp./.exchange.文件。
+    assert.equal(existsSync(lockPath), true, '竞争结束后锁应保留为tombstone(新协议不再unlink lockPath)');
+    const finalContent = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(finalContent.released, true, '正常竞争后应以tombstone收尾，不是遗留的活跃/损坏内容');
+    const dir = path.dirname(lockPath);
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `不得残留任何临时/exchange候选文件: ${JSON.stringify(stray)}`);
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
@@ -445,7 +453,13 @@ test('正常单进程：获取锁、写状态、release全流程无残留', () =
     const { lockPath } = lockPathFor(rootPath, runIdentity);
     const written = writeRunStatus(rootPath, initialRunStatus({ runIdentity, totalBatches: 1 }));
     assert.equal(written.runState, 'RUNNING');
-    assert.equal(existsSync(lockPath), false, '正常写入结束后锁必须已释放');
+    // 新协议下release以tombstone收尾(见P0-04)，lockPath本身不再变为不存在——
+    // "已释放"改为断言内容是released tombstone，且没有任何临时文件残留。
+    assert.equal(existsSync(lockPath), true, '正常写入结束后锁应保留为tombstone(新协议不再unlink lockPath)');
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).released, true);
+    const dir = path.dirname(lockPath);
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `不得残留任何临时/exchange候选文件: ${JSON.stringify(stray)}`);
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
@@ -461,8 +475,12 @@ test('连续20轮获取与释放后，目标目录不residual任何锁或临时�
       status = writeRunStatus(rootPath, status);
     }
     const dir = path.join(rootPath, 'run-status', 'dry-run', runIdentity.validationRunId);
-    const leftovers = readdirSync(dir).filter(name => name.includes('.lock') || name.includes('.tmp.'));
-    assert.deepEqual(leftovers, [], `连续多轮获取/释放后不得残留锁或临时文件，实际残留: ${JSON.stringify(leftovers)}`);
+    // 20轮全部是同一次COMPLETED流程内的withBatchCompleted续写(未曾release中途)，
+    // 所以此处只需确认没有任何临时/exchange候选文件残留——lockPath本身(可能是
+    // 活跃锁，因为writeRunStatus尚未返回)不应被当作"残留"。
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `连续多轮获取/释放后不得残留临时/exchange候选文件，实际残留: ${JSON.stringify(stray)}`);
+    assert.equal(existsSync(path.join(dir, `.${runIdentity.runIdentitySha256}.status.lock`)), true, 'lockPath应以tombstone形式留存(新协议不再unlink)');
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
@@ -477,7 +495,14 @@ test('连续20轮获取与释放后，目标目录不residual任何锁或临时�
 // 手工重演的相似原语。
 // ---------------------------------------------------------------------------
 
-test('P0-03修复：quarantine在rename前发现目标已被替换为新owner时，绝不能移动/删除新锁(确定性同步点)', () => {
+// 本轮(方案B)修复后，hook注入点是exchangeAndVerify内部、renameat2.renameExchangeSync()
+// 实际执行前的最后一刻(beforeExchange)——不再有"lstat检查"这一步骤本身，因为
+// exchange本身就是唯一的检查+行动点；安全性完全来自exchange之后的核验，不依赖
+// hook之前发生了什么。因此hook注入的"替换"无论多晚发生(哪怕就在renameat2系统调用
+// 前一刻)，都必须被下面的post-exchange核验捕获——这正是本轮独立复审要求覆盖的
+// "最后一次路径身份检查之后、实际破坏性系统调用之前"这一点，而不是通过缩短某个
+// pre-check窗口来"碰运气"。
+test('P0-03修复：quarantine在renameat2(RENAME_EXCHANGE)执行前发现目标已被替换为新owner时，绝不能移动/覆盖新锁(确定性同步点)', () => {
   const rootPath = root();
   try {
     const runIdentity = identity();
@@ -488,24 +513,24 @@ test('P0-03修复：quarantine在rename前发现目标已被替换为新owner时
 
     let newOwnerLock = null;
     const hooks = {
-      afterVerifiedBeforeRename: () => {
-        // 场景四步：1.已验证A为stale(已发生，见上) 2.在rename前A被移走
-        // 3.新owner B在同一lockPath成功发布——用真实生产函数完成。
-        unlinkSync(lockPath);
+      beforeExchange: () => {
+        // 场景：1.已验证A为stale(已发生，见上) 2.在我方renameat2调用前，A已被
+        // 其他真实恢复者(经由真实acquireResearchRunStatusLock，内部同样走
+        // exchange协议)合法替换为新owner B。
         newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
       }
     };
 
     const quarantined = quarantinePublishedLockForTest(lockPath, dir, 10, hooks);
-    assert.equal(quarantined, false, '4.原恢复者不得把B的锁rename到quarantine——必须放弃，不得声称成功');
+    assert.equal(quarantined, false, '原恢复者不得把B的锁换入quarantine——必须放弃，不得声称成功');
     assert.equal(existsSync(lockPath), true, 'B的正式锁必须仍然存在于原路径');
     const stillB = JSON.parse(readFileSync(lockPath, 'utf8'));
-    assert.equal(stillB.ownerToken, newOwnerLock.ownerToken, 'lockPath内容必须仍是B，未被移进/删除于quarantine');
+    assert.equal(stillB.ownerToken, newOwnerLock.ownerToken, 'lockPath内容必须仍是B，未被换出/覆盖');
     assert.equal(releaseResearchRunStatusLock(newOwnerLock), true);
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
-test('P0-04修复：release在token验证后、unlink前发现锁已被替换为新owner时，绝不能删除新锁(确定性同步点，非概率stress)', () => {
+test('P0-04修复：release在renameat2(RENAME_EXCHANGE)执行前发现锁已被替换为新owner时，绝不能覆盖/删除新锁(确定性同步点，非概率stress)', () => {
   const rootPath = root();
   try {
     const runIdentity = identity();
@@ -513,19 +538,92 @@ test('P0-04修复：release在token验证后、unlink前发现锁已被替换为
 
     let newOwnerLock = null;
     const hooks = {
-      afterVerifiedBeforeUnlink: () => {
-        // 场景四步：1.旧owner已验证自己ownerToken(已发生，见上) 2.在unlink前
-        // 旧锁被移走 3.新owner在同一lockPath发布——用真实生产函数完成。
+      beforeExchange: () => {
+        // 旧owner仍合法持有中，正常协议下任何人都无法"合法"抢占它(这正是修复
+        // 要保证的)——此处模拟的是外部/异常干预直接删除了lockPath目录项(不经过
+        // 本协议)，随后一个全新进程合法bootstrap到这个(意外)空出的位置，即
+        // "旧owner的release在renameat2执行前发现目标已经不是自己"这一场景。
         unlinkSync(oldLock.lockPath);
         newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
       }
     };
 
     const released = releaseResearchRunStatusLockForTest(oldLock, hooks);
-    assert.equal(released, false, '4.旧owner不得把新owner的锁unlink——必须放弃，不得声称release成功');
+    assert.equal(released, false, '旧owner不得把新owner的锁换出/覆盖——必须放弃，不得声称release成功');
     assert.equal(existsSync(oldLock.lockPath), true, '新owner的正式锁必须仍然存在');
     const stillNew = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
-    assert.equal(stillNew.ownerToken, newOwnerLock.ownerToken, 'lockPath内容必须仍是新owner，未被旧owner误删');
+    assert.equal(stillNew.ownerToken, newOwnerLock.ownerToken, 'lockPath内容必须仍是新owner，未被旧owner误删/覆盖');
     assert.equal(releaseResearchRunStatusLock(newOwnerLock), true);
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('第三owner：hook内先由B替换A、B又合法释放为tombstone、C再合法接管，我方仍不得覆盖/删除C', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const { dir, lockPath } = lockPathFor(rootPath, runIdentity);
+    publishRawLock(lockPath, validOwnerJson({ ownerToken: 'a'.repeat(64), pid: 99999999 }));
+    age(lockPath, 60_000);
+
+    let cLock = null;
+    const hooks = {
+      beforeExchange: () => {
+        // A(stale) -> B(真实acquire，合法替换A) -> B真实release(合法留下
+        // tombstone) -> C(真实acquire，合法接管B留下的tombstone)。三方链路
+        //全部经过真实生产函数，我方对A的quarantine尝试直到此刻才真正执行
+        // 它自己的renameat2调用。
+        const bLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+        assert.equal(releaseResearchRunStatusLock(bLock), true);
+        cLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+      }
+    };
+
+    const quarantined = quarantinePublishedLockForTest(lockPath, dir, 10, hooks);
+    assert.equal(quarantined, false, '经过B、C两次合法交接后，我方针对A的陈旧尝试必须放弃，不得触碰C');
+    assert.equal(existsSync(lockPath), true, 'C的正式锁必须仍然存在');
+    const stillC = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(stillC.ownerToken, cLock.ownerToken, 'lockPath内容必须仍是C，未被覆盖/删除');
+    assert.equal(releaseResearchRunStatusLock(cLock), true);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('renameat2(RENAME_EXCHANGE)不可用时，reclaim与release必须fail closed，绝不静默退回存在竞态的旧实现', async () => {
+  const FIXDIR_SERVER = path.resolve(path.dirname(childPath), '..', '..', '..');
+  const buildDir = path.join(FIXDIR_SERVER, 'native', 'renameat2', 'build');
+  const disabledDir = `${buildDir}.disabled-for-test`;
+  const rootPath = root();
+  const runIdentity = identity();
+  const { lockPath } = lockPathFor(rootPath, runIdentity);
+  publishRawLock(lockPath, validOwnerJson({ ownerToken: 'a'.repeat(64), pid: 99999999 }));
+  age(lockPath, 60_000);
+  // 直接写入run-status数据文件本身(与锁文件是完全不同的两个文件)，绕开锁获取，
+  // 只是为了让子进程的readRunStatus()能读到一个合法current，从而真正走到
+  // writeRunStatus->acquireStatusLock这条我们要测试的路径，而不是在更早的
+  // "current为null"处提前抛出一个无关错误。
+  const seedStatus = initialRunStatus({ runIdentity, totalBatches: 1 });
+  const statusDirPath = path.join(rootPath, 'run-status', 'dry-run', runIdentity.validationRunId);
+  mkdirSync(statusDirPath, { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(statusDirPath, `${runIdentity.runIdentitySha256}.status.json`), canonicalJson(seedStatus));
+  const identityPath = path.join(rootPath, 'identity.json');
+  writeFileSync(identityPath, JSON.stringify(runIdentity));
+
+  const hadBuild = existsSync(buildDir);
+  try {
+    if (hadBuild) renameSync(buildDir, disabledDir);
+    // 真实全新子进程(独立ESM模块缓存，addon.available在其内必然重新计算为false)，
+    // 尝试对一把已确认stale的锁执行reclaim(经由writeRunStatus->acquireStatusLock)。
+    const proc = spawn(process.execPath, [childPath, rootPath, identityPath, 'FAILED', String(Date.now())], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    proc.stdout.on('data', v => { stdout += v; });
+    proc.stderr.on('data', v => { stderr += v; });
+    const { code } = await new Promise(resolve => proc.on('close', c => resolve({ code: c })));
+    assert.notEqual(code, 0, 'addon不可用时reclaim不得静默成功');
+    const errorPayload = JSON.parse(stderr || '{}');
+    assert.equal(errorPayload.code, 'RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE', `必须fail closed为稳定错误码，不得回退旧实现；实际: ${stderr}`);
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).ownerToken, 'a'.repeat(64), 'lockPath内容必须完全未被触碰(既未被接管也未损坏)');
+    assert.equal(stdout.trim(), '', '不得输出任何"成功"结果');
+  } finally {
+    if (hadBuild && existsSync(disabledDir)) renameSync(disabledDir, buildDir);
+    rmSync(rootPath, { recursive: true, force: true });
+  }
 });
