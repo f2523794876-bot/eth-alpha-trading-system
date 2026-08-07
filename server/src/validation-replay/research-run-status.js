@@ -333,7 +333,8 @@ function isValidOwnerShape(owner) {
     typeof owner.processStartIdentity === 'string' &&
     /^[0-9a-f]{64}$/.test(owner.hostIdentitySha256 || '') &&
     typeof owner.createdAt === 'string' && Number.isFinite(new Date(owner.createdAt).getTime()) &&
-    (owner.released === undefined || (owner.released === true && typeof owner.precedingOwnerToken === 'string'));
+    (owner.released === undefined || (owner.released === true &&
+      (owner.precedingOwnerToken === null || typeof owner.precedingOwnerToken === 'string')));
 }
 
 // Reads the *published* lock (a regular file at lockPath -- never a
@@ -473,38 +474,73 @@ function evaluateLockDisposition(lockPath, staleLockMs) {
   return classifyOwnerDisposition(evidence.owner, evidence.stat, staleLockMs);
 }
 
-// P0-03/P0-04 (round 2, CEO-authorized "方案B"): displacing an existing lock
-// object -- whether to quarantine a confirmed-dead owner, to install our own
-// fresh claim over one, or to release our own lock into a tombstone -- is
-// now always done through Linux renameat2(RENAME_EXCHANGE) (see
-// native/renameat2/), never through "lstat to check an inode, then rename()
-// by path" as before. This is a deliberate response to independent review
-// finding those two operations are never the same atomic step: the OS can
-// always interleave a directory-entry change for lockPath between our last
-// lstat and the rename() syscall actually running, so a "recheck immediately
-// before acting" discipline is not itself an atomicity guarantee, no matter
-// how narrow the window is made.
+// P0-03/P0-04 (round 3, CEO-authorized "方案B", refined after independent
+// review found the round-2 single-exchange design insufficient): displacing
+// an existing lock object is now always done in two independently-verified
+// atomic steps, never one.
 //
-// renameat2(RENAME_EXCHANGE) gives us the two properties that a check-then-
-// act sequence cannot: (1) lockPath is *never* observably absent -- the
-// exchange swaps two already-existing directory entries in one atomic
-// kernel operation, so there is no window for anything else to claim
-// lockPath via the normal link()-no-replace publish path (which requires
-// the target to be absent) while a displacement is in flight; and (2) the
-// object we displace lands at our own private, CSPRNG-named path that no
-// other process has ever heard of or can reference -- so reading it back
-// through that path, *after* the exchange has already committed, is not
-// subject to any further race: nothing else can have touched a name only we
-// know. If what we find there is not what we expected to displace (a
-// confirmed-dead owner, a clean-release tombstone, or -- for release -- our
-// own still-current lock), we undo with a second exchange. That second
-// exchange is unconditionally safe, not "best effort": because lockPath was
-// never absent for even an instant across the whole sequence, nothing else
-// could have taken it in the interim, so swapping back is guaranteed to
-// restore exactly what was there, never overwriting or losing a third
-// party's lock. We never fall back to path-based rename/unlink for this --
-// if the native addon is unavailable, these operations fail closed with
-// RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE instead.
+// Round 2's flaw, exactly as independent review identified it: quarantine
+// and release both published an immediately-reclaimable object (a
+// `released:true` tombstone) as the very first exchange's candidate. The
+// instant that exchange committed, lockPath held that tombstone --
+// classifyOwnerDisposition() correctly treats any `released:true` object as
+// unconditionally reclaimable (right for a genuinely completed release, but
+// wrong as a transient intermediate state) -- so a legitimate third owner
+// could win a real RENAME_EXCHANGE against that tombstone before our own
+// post-exchange verification/undo ever ran. Our "undo" (a second exchange
+// assuming lockPath still held what we had just put there) would then rip
+// that third owner's brand-new claim back out. "lockPath was never
+// observably absent" was true and is *not* the relevant safety property --
+// the bug was never about absence, it was about publishing a *reclaimable*
+// object during a window where we had not yet committed to the outcome. We
+// do not rely on that "never absent" framing as a safety argument anywhere
+// below; it is necessary (an exchange primitive gives it for free) but not
+// sufficient.
+//
+// The fix: the *first* exchange's candidate is never reclaimable by a
+// correct competitor. It is a `reservation` -- an object with exactly the
+// same shape as a genuine freshly-claimed lock (ownerContentFor(), the same
+// content acquireStatusLock's own direct-claim uses below), bound to this
+// process's real, live, current identity, with its own distinct ownerToken.
+// classifyOwnerDisposition() has no special case for it and needs none: to
+// every other caller it is indistinguishable from an entirely ordinary
+// active lock, so the existing "active | active-cross-host -> wait, never
+// steal" rule already in acquireStatusLock refuses to touch it, for the same
+// reason it refuses to touch any other live lock. *That* -- "the object
+// sitting at lockPath during the vulnerable window is never one a correct
+// competitor is willing to exchange against" -- is the actual safety
+// argument this fix rests on.
+//
+// Only after the reservation's own displaced-object verification has passed
+// (proving we really did displace what we intended to: a confirmed-stale
+// owner for quarantine, or our own still-current lock for release) does a
+// *second*, separately-verified exchange convert that reservation into the
+// true final tombstone. That second exchange's own post-exchange check
+// proves what it displaced really was our own reservation (identified by its
+// own distinct ownerToken) before treating the conversion as complete --
+// never assumed just because the first exchange succeeded.
+//
+// If the process crashes between the two exchanges, no special recovery
+// logic is needed or written: the abandoned reservation is a completely
+// ordinary owner record and is reclaimed by the exact same age/host/PID/
+// start-identity staleness rules any other dead lock is, via the normal
+// acquireStatusLock path -- it cannot deadlock the run identity.
+//
+// acquireStatusLock's own direct-claim exchange (below) needs no
+// reserve/finalize split at all: its single exchange's candidate *is already*
+// the final active claim, never a reclaimable object, so it was already safe
+// under the same "never reclaimable" argument even in round 2.
+//
+// Both exchanges go through the same exchangeAndVerify primitive:
+// renameat2(RENAME_EXCHANGE) so lockPath is never observably absent, and the
+// displaced object is read back through our own private, CSPRNG-named path
+// that no other process has ever heard of. `hooks` here is always
+// `{ reserve, finalize }`, each independently accepting
+// `{ beforeExchange, afterExchange }` -- test-only, same-process synchronous
+// injection points; production callers never pass them. `afterExchange`
+// fires immediately after the atomic syscall commits, before this function
+// reads back or judges what it displaced -- the precise post-exchange,
+// pre-verification window independent review required be directly testable.
 function exchangeCandidatePathFor(lockPath) {
   return `${lockPath}.exchange.${newOwnerToken()}`;
 }
@@ -526,7 +562,8 @@ function discardCandidate(candidatePath) {
   try { fs.unlinkSync(candidatePath); } catch { /* best effort */ }
 }
 
-// The single primitive both quarantine, direct-claim, and release are built
+// The single primitive every exchange (reserve or finalize, in either
+// quarantine or release, or acquireStatusLock's own direct claim) is built
 // from. `candidatePath` must already hold fully-formed, self-verified
 // content (see prepareCandidate). `acceptDisplaced(owner, stat)` decides,
 // from what was *actually* displaced (read back through our own private
@@ -534,11 +571,17 @@ function discardCandidate(candidatePath) {
 // Returns `{ exchanged: true }` on success (lockPath now holds our
 // candidate; candidatePath now holds the displaced object, not yet
 // discarded -- caller inspects/discards it) or `{ exchanged: false }` if
-// undone (candidatePath now holds our own unused candidate again, restored
-// to exactly its pre-exchange state; lockPath is untouched from any outside
-// observer's perspective). `hooks.beforeExchange` is a test-only, same-
-// process synchronous injection point fired at the last possible moment
-// before the actual atomic syscall -- production callers never pass it.
+// undone (candidatePath restored to exactly its pre-exchange state; lockPath
+// untouched from any outside observer's perspective across the whole
+// sequence). The undo is unconditionally safe -- not best-effort -- whenever
+// the exchanged-in candidate was itself non-reclaimable (a live reservation
+// or a direct active claim): nothing else could have taken lockPath in the
+// interim, so swapping back restores exactly what was there. If this ever
+// fires on the *finalize* step (converting a reservation to its tombstone),
+// reaching it at all means our own just-installed, supposedly-untouchable
+// reservation was somehow displaced -- which the caller (see
+// finalizeReservationAsTombstone) must treat as a failed conversion, not
+// paper over by assuming the undo alone made everything consistent again.
 function exchangeAndVerify(lockPath, dir, candidatePath, acceptDisplaced, hooks = {}) {
   if (!renameat2.available) {
     throw fail('RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE',
@@ -551,6 +594,7 @@ function exchangeAndVerify(lockPath, dir, candidatePath, acceptDisplaced, hooks 
     if (error.code === 'ENOENT') return { exchanged: false, reason: 'gone' };
     throw error;
   }
+  hooks.afterExchange?.();
 
   // candidatePath now holds whatever was previously at lockPath. Nothing
   // else can have touched candidatePath, ever -- its name is derived from a
@@ -575,13 +619,11 @@ function exchangeAndVerify(lockPath, dir, candidatePath, acceptDisplaced, hooks 
   return { exchanged: true, displacedOwner, displacedStat };
 }
 
-// The undo is unconditionally safe, not best-effort: lockPath was never
-// absent between the original exchange and this one, so nothing else could
-// have claimed it -- this swap is guaranteed to restore exactly what was
-// there before, never overwriting or removing a third party's lock. If the
-// undo itself fails (e.g. the addon becomes unavailable mid-sequence, which
-// should not happen but is not assumed away), that is surfaced loudly
-// rather than silently leaving the displaced object stranded and unlogged.
+// See exchangeAndVerify's doc comment for exactly when this is
+// unconditionally safe. If the undo itself fails (e.g. the addon becomes
+// unavailable mid-sequence, which should not happen but is not assumed
+// away), that is surfaced loudly rather than silently leaving the displaced
+// object stranded and unlogged.
 function undoExchange(candidatePath, lockPath, dir) {
   try {
     renameat2.renameExchangeSync(candidatePath, lockPath);
@@ -592,25 +634,54 @@ function undoExchange(candidatePath, lockPath, dir) {
   }
 }
 
+// Phase 1 of quarantine/release: install a reservation (ownerContentFor() --
+// indistinguishable from an ordinary fresh claim, hence non-reclaimable by
+// any correct competitor) and verify, via the exchange's own private-path
+// readback, that what it displaced was really what the caller expected.
+// `acceptDisplaced` is the caller-specific check (confirmed-stale owner for
+// quarantine; our own still-current lock for release). Returns the
+// exchangeAndVerify result plus the reservation's own ownerToken, which
+// finalizeReservationAsTombstone needs to verify its own displaced object.
+function reserveOverLock(lockPath, dir, acceptDisplaced, hooks = {}) {
+  const reservationToken = newOwnerToken();
+  const reservePath = exchangeCandidatePathFor(lockPath);
+  prepareCandidate(reservePath, ownerContentFor(reservationToken));
+  const result = exchangeAndVerify(lockPath, dir, reservePath, acceptDisplaced, hooks);
+  discardCandidate(reservePath);
+  return { ...result, reservationToken };
+}
+
+// Phase 2: convert our own just-installed, currently-live (therefore
+// non-reclaimable by any correct competitor) reservation into the true final
+// tombstone. Independently verifies what this second exchange displaced was
+// really our own reservation, by its distinct ownerToken -- never assumed
+// just because phase 1 succeeded.
+function finalizeReservationAsTombstone(lockPath, dir, reservationToken, precedingOwnerToken, hooks = {}) {
+  const tombstonePath = exchangeCandidatePathFor(lockPath);
+  prepareCandidate(tombstonePath, tombstoneContentFor(precedingOwnerToken));
+  const result = exchangeAndVerify(lockPath, dir, tombstonePath, owner => owner.ownerToken === reservationToken, hooks);
+  discardCandidate(tombstonePath);
+  return result;
+}
+
 // P0-03: displaces a confirmed-stale published lock with a clean tombstone
 // (does not claim ownership for the caller -- see acquireStatusLock below
 // for the more efficient direct-claim variant used on the normal acquire
 // path). Exposed directly (via quarantinePublishedLockForTest) so this
-// exact operation is independently testable.
+// exact operation is independently testable. `hooks` = `{ reserve, finalize }`.
 function quarantinePublishedLock(lockPath, dir, staleLockMs, hooks = {}) {
   let disposition;
   try { disposition = evaluateLockDisposition(lockPath, staleLockMs); }
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
-  if (disposition.status !== 'stale-with-owner') return false; // advisory only; exchangeAndVerify's post-check is the real gate
+  if (disposition.status !== 'stale-with-owner') return false; // advisory only; the reserve exchange's post-check is the real gate
 
-  const candidatePath = exchangeCandidatePathFor(lockPath);
-  prepareCandidate(candidatePath, tombstoneContentFor(null));
-
-  const result = exchangeAndVerify(lockPath, dir, candidatePath,
+  const reserved = reserveOverLock(lockPath, dir,
     (owner, stat) => classifyOwnerDisposition(owner, stat, staleLockMs).status === 'stale-with-owner',
-    hooks);
-  discardCandidate(candidatePath);
-  return result.exchanged;
+    hooks.reserve);
+  if (!reserved.exchanged) return false;
+
+  const finalized = finalizeReservationAsTombstone(lockPath, dir, reserved.reservationToken, null, hooks.finalize);
+  return finalized.exchanged;
 }
 
 function acquireStatusLock(dir, identity, { lockTimeoutMs = 5_000, staleLockMs = 30_000 } = {}) {
@@ -676,11 +747,14 @@ function acquireStatusLock(dir, identity, { lockTimeoutMs = 5_000, staleLockMs =
   }
 }
 
-// P0-04: release no longer unlinks lockPath at all -- it exchanges our lock
-// for a tombstone, verifying (through the exchange's own private-path
-// readback) that what we displaced really was our own current lock before
-// treating the release as successful, and undoing (safely, unconditionally,
-// per exchangeAndVerify's contract) if it was not.
+// P0-04: release no longer unlinks lockPath at all, and no longer publishes
+// a reclaimable object as its first move either (see the design-rationale
+// comment above quarantinePublishedLock). It reserves over its own current
+// lock first -- verifying, through the reservation exchange's own private-
+// path readback, that what it displaced really was still our own lock --
+// and only then finalizes that reservation into a tombstone, independently
+// verified as displacing our own reservation and nothing else. `hooks` =
+// `{ reserve, finalize }`.
 function releaseStatusLock(dir, lock, hooks = {}) {
   if (!renameat2.available) {
     // Deliberately do not fall back to a path-based unlink here -- that is
@@ -690,14 +764,11 @@ function releaseStatusLock(dir, lock, hooks = {}) {
     throw fail('RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE',
       `renameat2(RENAME_EXCHANGE) is required to safely release a lock and is not available: ${renameat2.getUnavailableReason()}`);
   }
-  const candidatePath = exchangeCandidatePathFor(lock.lockPath);
-  prepareCandidate(candidatePath, tombstoneContentFor(lock.ownerToken));
+  const reserved = reserveOverLock(lock.lockPath, dir, owner => owner.ownerToken === lock.ownerToken, hooks.reserve);
+  if (!reserved.exchanged) return false;
 
-  const result = exchangeAndVerify(lock.lockPath, dir, candidatePath,
-    owner => owner.ownerToken === lock.ownerToken,
-    hooks);
-  discardCandidate(candidatePath);
-  return result.exchanged;
+  const finalized = finalizeReservationAsTombstone(lock.lockPath, dir, reserved.reservationToken, lock.ownerToken, hooks.finalize);
+  return finalized.exchanged;
 }
 
 export function acquireResearchRunStatusLock(root, runIdentity, options = {}) {

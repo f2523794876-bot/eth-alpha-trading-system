@@ -495,14 +495,14 @@ test('连续20轮获取与释放后，目标目录不residual任何锁或临时�
 // 手工重演的相似原语。
 // ---------------------------------------------------------------------------
 
-// 本轮(方案B)修复后，hook注入点是exchangeAndVerify内部、renameat2.renameExchangeSync()
-// 实际执行前的最后一刻(beforeExchange)——不再有"lstat检查"这一步骤本身，因为
-// exchange本身就是唯一的检查+行动点；安全性完全来自exchange之后的核验，不依赖
-// hook之前发生了什么。因此hook注入的"替换"无论多晚发生(哪怕就在renameat2系统调用
-// 前一刻)，都必须被下面的post-exchange核验捕获——这正是本轮独立复审要求覆盖的
-// "最后一次路径身份检查之后、实际破坏性系统调用之前"这一点，而不是通过缩短某个
-// pre-check窗口来"碰运气"。
-test('P0-03修复：quarantine在renameat2(RENAME_EXCHANGE)执行前发现目标已被替换为新owner时，绝不能移动/覆盖新锁(确定性同步点)', () => {
+// 本轮(方案B第二次修复)后，quarantine/release都是两段式：reserve(第一次exchange，
+// 换入的是一个与正常活跃claim完全同形的reservation，因而对任何正确的竞争者都不可
+// 抢占) -> finalize(第二次exchange，把reservation转成真正的tombstone)。hook形状
+// 从扁平的{beforeExchange}改为{reserve:{beforeExchange,afterExchange},
+// finalize:{beforeExchange,afterExchange}}，分别独立注入到两次exchangeAndVerify
+// 调用。以下三个测试复现的都是"reserve阶段的renameat2执行前，锁已被替换"这一幕，
+// 因此hook挂在reserve.beforeExchange上，语义与修复前完全对应，预期结果不变。
+test('P0-03修复：quarantine在reserve阶段renameat2执行前发现目标已被替换为新owner时，绝不能移动/覆盖新锁(确定性同步点)', () => {
   const rootPath = root();
   try {
     const runIdentity = identity();
@@ -513,24 +513,28 @@ test('P0-03修复：quarantine在renameat2(RENAME_EXCHANGE)执行前发现目标
 
     let newOwnerLock = null;
     const hooks = {
-      beforeExchange: () => {
-        // 场景：1.已验证A为stale(已发生，见上) 2.在我方renameat2调用前，A已被
-        // 其他真实恢复者(经由真实acquireResearchRunStatusLock，内部同样走
-        // exchange协议)合法替换为新owner B。
-        newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+      reserve: {
+        beforeExchange: () => {
+          // 场景：1.已验证A为stale(已发生，见上) 2.在我方reserve的renameat2调用
+          // 前，A已被其他真实恢复者(经由真实acquireResearchRunStatusLock，内部
+          // 同样走reserve+finalize协议)合法替换为新owner B。
+          newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+        }
       }
     };
 
     const quarantined = quarantinePublishedLockForTest(lockPath, dir, 10, hooks);
-    assert.equal(quarantined, false, '原恢复者不得把B的锁换入quarantine——必须放弃，不得声称成功');
+    assert.equal(quarantined, false, '原恢复者不得把B的锁换入reservation——必须放弃，不得声称成功');
     assert.equal(existsSync(lockPath), true, 'B的正式锁必须仍然存在于原路径');
     const stillB = JSON.parse(readFileSync(lockPath, 'utf8'));
     assert.equal(stillB.ownerToken, newOwnerLock.ownerToken, 'lockPath内容必须仍是B，未被换出/覆盖');
+    const dirEntries = readdirSync(dir).filter(name => name.includes('.exchange.'));
+    assert.deepEqual(dirEntries, [], `不得残留任何私有exchange候选文件: ${JSON.stringify(dirEntries)}`);
     assert.equal(releaseResearchRunStatusLock(newOwnerLock), true);
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
-test('P0-04修复：release在renameat2(RENAME_EXCHANGE)执行前发现锁已被替换为新owner时，绝不能覆盖/删除新锁(确定性同步点，非概率stress)', () => {
+test('P0-04修复：release在reserve阶段renameat2执行前发现锁已被替换为新owner时，绝不能覆盖/删除新锁(确定性同步点，非概率stress)', () => {
   const rootPath = root();
   try {
     const runIdentity = identity();
@@ -538,13 +542,15 @@ test('P0-04修复：release在renameat2(RENAME_EXCHANGE)执行前发现锁已被
 
     let newOwnerLock = null;
     const hooks = {
-      beforeExchange: () => {
-        // 旧owner仍合法持有中，正常协议下任何人都无法"合法"抢占它(这正是修复
-        // 要保证的)——此处模拟的是外部/异常干预直接删除了lockPath目录项(不经过
-        // 本协议)，随后一个全新进程合法bootstrap到这个(意外)空出的位置，即
-        // "旧owner的release在renameat2执行前发现目标已经不是自己"这一场景。
-        unlinkSync(oldLock.lockPath);
-        newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+      reserve: {
+        beforeExchange: () => {
+          // 旧owner仍合法持有中，正常协议下任何人都无法"合法"抢占它(这正是修复
+          // 要保证的)——此处模拟的是外部/异常干预直接删除了lockPath目录项(不经过
+          // 本协议)，随后一个全新进程合法bootstrap到这个(意外)空出的位置，即
+          // "旧owner的release在reserve的renameat2执行前发现目标已经不是自己"。
+          unlinkSync(oldLock.lockPath);
+          newOwnerLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+        }
       }
     };
 
@@ -557,7 +563,7 @@ test('P0-04修复：release在renameat2(RENAME_EXCHANGE)执行前发现锁已被
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
-test('第三owner：hook内先由B替换A、B又合法释放为tombstone、C再合法接管，我方仍不得覆盖/删除C', () => {
+test('第三owner(reserve阶段前)：hook内先由B替换A、B又合法释放为tombstone、C再合法接管，我方仍不得覆盖/删除C', () => {
   const rootPath = root();
   try {
     const runIdentity = identity();
@@ -567,14 +573,16 @@ test('第三owner：hook内先由B替换A、B又合法释放为tombstone、C再�
 
     let cLock = null;
     const hooks = {
-      beforeExchange: () => {
-        // A(stale) -> B(真实acquire，合法替换A) -> B真实release(合法留下
-        // tombstone) -> C(真实acquire，合法接管B留下的tombstone)。三方链路
-        //全部经过真实生产函数，我方对A的quarantine尝试直到此刻才真正执行
-        // 它自己的renameat2调用。
-        const bLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
-        assert.equal(releaseResearchRunStatusLock(bLock), true);
-        cLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+      reserve: {
+        beforeExchange: () => {
+          // A(stale) -> B(真实acquire，合法替换A) -> B真实release(合法留下
+          // tombstone) -> C(真实acquire，合法接管B留下的tombstone)。三方链路
+          // 全部经过真实生产函数，我方对A的quarantine尝试直到此刻才真正执行
+          // 它自己reserve阶段的renameat2调用。
+          const bLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+          assert.equal(releaseResearchRunStatusLock(bLock), true);
+          cLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+        }
       }
     };
 
@@ -584,6 +592,162 @@ test('第三owner：hook内先由B替换A、B又合法释放为tombstone、C再�
     const stillC = JSON.parse(readFileSync(lockPath, 'utf8'));
     assert.equal(stillC.ownerToken, cLock.ownerToken, 'lockPath内容必须仍是C，未被覆盖/删除');
     assert.equal(releaseResearchRunStatusLock(cLock), true);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------------------
+// 独立复审第二轮(本轮)新增：reserve阶段本身自己的renameat2完成之后、finalize
+// 尚未开始之间的窗口——即round2被指出的确切缺陷所在的窗口。用生产实现内部新增的
+// afterExchange钩子(位于exchangeAndVerify的renameat2调用之后、读回/裁决displaced
+// 对象之前)在此刻注入一个真实第三方acquire尝试，证明reservation存活期间它必须
+// 被拒绝(超时，而不是窃取成功)；随后再用同一afterExchange钩子挂在finalize阶段，
+// 证明只有tombstone真正落地(finalize的exchange已提交)之后，第三方才可以合法接管，
+// 且我方finalize自身的裁决(依据私有candidatePath读回，不受第三方后续动作影响)
+// 仍然正确报告成功，不破坏第三方刚接管的锁。quarantine与release两条路径都覆盖。
+// ---------------------------------------------------------------------------
+
+test('reservation阶段(quarantine)：afterExchange窗口内第三方无法抢占非tombstone的reservation，必须等待超时', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const { dir, lockPath } = lockPathFor(rootPath, runIdentity);
+    publishRawLock(lockPath, validOwnerJson({ ownerToken: 'a'.repeat(64), pid: 99999999 }));
+    age(lockPath, 60_000);
+
+    let thirdPartyTimedOut = false;
+    const hooks = {
+      reserve: {
+        afterExchange: () => {
+          // reserve的renameat2已经提交：lockPath现在持有我方reservation(与
+          // 普通活跃claim同形，非released:true)。我方尚未读回/裁决displaced内容。
+          // 此刻一个真实第三方尝试acquire——正确实现下它必须判定该锁为'active'
+          // 并等待/超时，绝不能把它当作可抢占对象换出。
+          try {
+            acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 120, staleLockMs: 10 });
+          } catch (error) {
+            thirdPartyTimedOut = error.code === 'RUN_STATUS_LOCK_TIMEOUT';
+          }
+        }
+      }
+    };
+
+    const quarantined = quarantinePublishedLockForTest(lockPath, dir, 10, hooks);
+    assert.equal(thirdPartyTimedOut, true, 'reservation存在期间第三方必须超时失败，不得抢占成功');
+    assert.equal(quarantined, true, '第三方未能抢占，我方自己的reserve+finalize应正常完成');
+    assert.equal(existsSync(lockPath), true, 'lockPath必须仍然存在');
+    const finalContent = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(finalContent.released, true, '正常完成后lockPath应是我方发布的tombstone');
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `不得残留任何临时/exchange候选文件: ${JSON.stringify(stray)}`);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('reservation阶段(release)：afterExchange窗口内第三方无法抢占非tombstone的reservation，必须等待超时', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const oldLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+
+    let thirdPartyTimedOut = false;
+    const hooks = {
+      reserve: {
+        afterExchange: () => {
+          try {
+            acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 120, staleLockMs: 10 });
+          } catch (error) {
+            thirdPartyTimedOut = error.code === 'RUN_STATUS_LOCK_TIMEOUT';
+          }
+        }
+      }
+    };
+
+    const released = releaseResearchRunStatusLockForTest(oldLock, hooks);
+    assert.equal(thirdPartyTimedOut, true, 'reservation存在期间第三方必须超时失败，不得抢占成功');
+    assert.equal(released, true, '第三方未能抢占，我方自己的release应正常完成');
+    const finalContent = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
+    assert.equal(finalContent.released, true, '正常完成后lockPath应是我方发布的tombstone');
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('finalize发布后(quarantine)：tombstone一旦落地，第三方才可合法接管，且我方finalize自身裁决不受影响、不覆盖第三方新锁', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const { dir, lockPath } = lockPathFor(rootPath, runIdentity);
+    publishRawLock(lockPath, validOwnerJson({ ownerToken: 'a'.repeat(64), pid: 99999999 }));
+    age(lockPath, 60_000);
+
+    let cLock = null;
+    const hooks = {
+      finalize: {
+        afterExchange: () => {
+          // finalize的renameat2已经提交：lockPath现在真正是tombstone(released:
+          // true)，这是一个合法、已完成的"已释放"状态——第三方此刻legitimately
+          // 接管它，不是竞态，是协议允许的正常后续。
+          cLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 10 });
+        }
+      }
+    };
+
+    const quarantined = quarantinePublishedLockForTest(lockPath, dir, 10, hooks);
+    assert.notEqual(cLock, null, '第三方在tombstone落地后必须能合法接管');
+    assert.equal(quarantined, true, '我方自身对已私有捕获的displaced内容的裁决不受第三方后续动作影响，仍应正确报告完成');
+    const stillC = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(stillC.ownerToken, cLock.ownerToken, 'lockPath必须仍是第三方C的活跃claim，未被我方事后动作覆盖/删除');
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `不得残留任何临时/exchange候选文件: ${JSON.stringify(stray)}`);
+    assert.equal(releaseResearchRunStatusLock(cLock), true);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('finalize发布后(release)：tombstone一旦落地，第三方才可合法接管，且我方release自身裁决不受影响、不覆盖第三方新锁', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const oldLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+
+    let cLock = null;
+    const hooks = {
+      finalize: {
+        afterExchange: () => {
+          cLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 10 });
+        }
+      }
+    };
+
+    const released = releaseResearchRunStatusLockForTest(oldLock, hooks);
+    assert.notEqual(cLock, null, '第三方在tombstone落地后必须能合法接管');
+    assert.equal(released, true, '我方自身release裁决不受第三方后续动作影响，仍应正确报告完成');
+    const stillC = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
+    assert.equal(stillC.ownerToken, cLock.ownerToken, 'lockPath必须仍是第三方C的活跃claim，未被我方release事后动作覆盖/删除');
+    assert.equal(releaseResearchRunStatusLock(cLock), true);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('finalize自身核验(release)：若reservation在finalize执行前被非法替换(协议不应允许的伪造场景)，finalize必须检测到并安全放弃，不得盲目声称转换成功', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const oldLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+
+    const hooks = {
+      finalize: {
+        beforeExchange: () => {
+          // reserve已经成功、reservation正合法持有lockPath。这里模拟一个不应该
+          // 发生的场景(非法/带外篡改，绕开整个协议直接改写目录项)：finalize自己的
+          // renameat2执行前，lockPath的内容被替换成一个与我方reservation完全无关
+          // 的伪造owner。finalize必须凭自己对"被换出对象是否是我方reservation"的
+          // 独立核验发现这一点，而不是盲目相信"reserve成功了所以finalize也一定对"。
+          unlinkSync(oldLock.lockPath);
+          publishRawLock(oldLock.lockPath, validOwnerJson({ ownerToken: 'f'.repeat(64), pid: 99999999 }));
+        }
+      }
+    };
+
+    const released = releaseResearchRunStatusLockForTest(oldLock, hooks);
+    assert.equal(released, false, '被替换成非我方reservation的对象时，finalize必须安全放弃，不得声称release成功');
+    const stillForged = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
+    assert.equal(stillForged.ownerToken, 'f'.repeat(64), '带外伪造内容必须原样保留，未被我方进一步破坏');
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
