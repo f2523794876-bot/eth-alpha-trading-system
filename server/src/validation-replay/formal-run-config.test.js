@@ -118,6 +118,16 @@ test('T1 signs all artifact publication controls and every mutation changes the 
   }
 });
 
+test('T1完整运行身份的任一真实字段变化都改变canonical config hash', () => {
+  const original = freezeFormalRunConfig(input());
+  for (const [field, value] of [
+    ['datasetVersion', `v1.4d-sha256-${'b'.repeat(64)}`],
+    ['algorithmVersion', 'algorithm-2'], ['ruleVersion', 'rule-2'],
+    ['weightVersion', 'weight-2'], ['evaluationVersion', 'evaluation-2'],
+    ['researchTo', '2025-06-30T23:59:59.999Z'], ['fixedAsOf', '2025-07-05T00:00:00.000Z']
+  ]) assert.notEqual(freezeFormalRunConfig(input({ [field]: value })).sha256, original.sha256, field);
+});
+
 test('T1 rejects every missing or invalid artifact publication control', () => {
   for (const field of ['artifactRoot', 'lockTimeoutMs', 'staleLockRecovery', 'maxArtifactBytes']) {
     const missing = input();

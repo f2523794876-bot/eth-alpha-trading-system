@@ -16,7 +16,7 @@ function authenticity(horizon) {
     gate_status: 'PASSED', expected_count: 1, attempted_count: 1, inserted_count: 1,
     reused_identical_count: 0, conflict_count: 0, blocked_count: 0, evaluated_count: 1
     } }, calibratedProbabilitiesStatus: 'null (V1.4D not eligible)', errorAttributionSummary: {},
-    algorithmVersion: 'algorithm-v1', ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
+    algorithmVersion: 'v1.4c-server-po-rule-1', ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
   const { datasetVersion: ignoredDatasetVersion, ...content } = report;
   return { ...report, contentHash: canonicalJsonHash(content) };
 }
@@ -28,7 +28,7 @@ const member = { symbol: 'ETHUSDT', intervalName: '15m', openTime: Date.parse('2
 function contextRow(overrides = {}) {
   return {
     validationRunId: run, validationRunStatus: 'SUCCEEDED', dryRun: false,
-    datasetVersion: `v1.4d-sha256-${hash}`, manifestContentHash: hash, algorithmVersion: 'algorithm-v1', ruleVersion: 'rule-v1',
+    datasetVersion: `v1.4d-sha256-${hash}`, manifestContentHash: hash, algorithmVersion: 'v1.4c-server-po-rule-1', ruleVersion: 'rule-v1',
     runHorizons: ['24h'], fromUtc: new Date('2026-01-01T00:00:00Z'), toUtc: new Date('2026-01-10T00:00:00Z'),
     trainEndUtc: new Date('2026-01-04T00:00:00Z'), validationEndUtc: new Date('2026-01-07T00:00:00Z'),
     validationStartedAt: new Date('2026-02-01T00:00:00Z'), validationFinishedAt: new Date('2026-02-02T00:00:00Z'),
@@ -51,10 +51,12 @@ function databaseRow(overrides = {}) {
   return {
     predictionId: '22222222-2222-4222-8222-222222222222', generationRunId: '33333333-3333-4333-8333-333333333333',
     evaluationRunId: '44444444-4444-4444-8444-444444444444', datasetVersion: `v1.4d-sha256-${hash}`,
+    replayAlgorithmVersion: 'v1.4c-server-po-rule-1', replayRuleVersion: 'rule-v1', replayWeightVersion: 'weight-v1',
+    featureEngineVersion: 'v1.4b-feature-engine-1',
     horizon: '24h', targetStartTime: new Date('2026-01-02T00:00:00Z'), targetEndTime: new Date('2026-01-03T00:00:00Z'),
     predictedDirection: 'UP', proxyStateAtGeneration: 'PO', trend4hAtGeneration: 'RANGE', featureValuesUsed: { trend4h: 'RANGE' },
     directionThreshold: '0.01', featureRecordIds: [555], featureLineage: [{ featureRecordId: 555,
-      sourceDatasetVersion: `v1.4d-sha256-${hash}`, algorithmVersion: 'algorithm-v1',
+      sourceDatasetVersion: `v1.4d-sha256-${hash}`, algorithmVersion: 'v1.4b-feature-engine-1',
       sourceVintageRefs: [{ vintageId: member.vintageId, symbol: member.symbol, interval: member.intervalName, revision: member.revisionNumber }] }],
     actualMarketBarLineage: [{ vintageId: member.vintageId, symbol: member.symbol, interval: member.intervalName,
       openTime: member.openTime, closeTime: member.closeTime, revisionNumber: member.revisionNumber, ...barValues }],
@@ -92,6 +94,20 @@ test('T13精确绑定validation/generation/evaluation身份链，并从数据库
   assert.equal(result.rows[0].actualReturn, 0.02);
   assert.equal(result.auditTrail.validationRunId, run);
   assert.equal(result.auditTrail.authenticityGateStatus, 'PASSED');
+});
+
+test('P0 Feature与Replay使用不同版本域，并分别fail-closed校验', async () => {
+  const valid = await loadFormalResearchRows(poolFor(), { validationRunId: run, evaluationVersion: 'eval-v1' });
+  assert.equal(valid.length, 1);
+  for (const [override, code] of [
+    [{ featureEngineVersion: null }, 'FORMAL_RESEARCH_DATABASE_ROW_INVALID'],
+    [{ featureLineage: [{ ...databaseRow().featureLineage[0], algorithmVersion: 'tampered-feature' }] }, 'FORMAL_RESEARCH_FEATURE_LINEAGE_MISMATCH'],
+    [{ replayAlgorithmVersion: 'tampered-replay' }, 'FORMAL_RESEARCH_DATABASE_IDENTITY_CHAIN_INVALID'],
+    [{ featureRecordIds: [556] }, 'FORMAL_RESEARCH_FEATURE_LINEAGE_MISMATCH']
+  ]) {
+    await assert.rejects(loadFormalResearchRows(poolFor(databaseRow(override)),
+      { validationRunId: run, evaluationVersion: 'eval-v1' }), error => error.code === code);
+  }
 });
 
 test('repository边界对NULL、非有限数、非法枚举/JSON、时间倒置和不安全精度逐行fail-closed', async () => {

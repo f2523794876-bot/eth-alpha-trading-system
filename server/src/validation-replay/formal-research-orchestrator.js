@@ -20,6 +20,7 @@ import {
   loadFormalResearchContext, loadFormalResearchPage, countFormalResearchRows, deriveFormalResearchAuditTrail
 } from './formal-research-data-repository.js';
 import { assertGuardedResearchPgPool } from '../db/research-database-guard.js';
+import { freezeFormalRunConfig } from './formal-run-config.js';
 import {
   createResearchRunIdentity, readRunStatus, writeRunStatus, initialRunStatus, withBatchPlan, withBatchCompleted, withBlocked, withCompleted, withFailed
 } from './research-run-status.js';
@@ -56,7 +57,12 @@ function verifyCompletedArtifact(artifactRoot, status) {
   const pair = readArtifactPair(artifactTargetDir(artifactRoot, status.artifactMode, status.validationRunId, status.evaluationVersion));
   if (pair.readerStatus !== 'ACCEPTED' || pair.sidecar.fullMainArtifactSha256 !== status.publishedArtifactSha256 ||
       pair.artifact.core.validationRunId !== status.validationRunId || pair.artifact.core.evaluationVersion !== status.evaluationVersion ||
-      pair.artifact.artifactMode !== status.artifactMode) {
+      pair.artifact.artifactMode !== status.artifactMode ||
+      (status.sourceCommit !== null && pair.artifact.core.sourceCommit !== status.sourceCommit) ||
+      (status.datasetVersion !== null && pair.artifact.core.auditTrail?.datasetVersion !== status.datasetVersion) ||
+      (status.researchFrom !== null && pair.artifact.core.researchFrom !== status.researchFrom) ||
+      (status.researchTo !== null && pair.artifact.core.researchTo !== status.researchTo) ||
+      (status.fixedAsOf !== null && pair.artifact.core.fixedAsOf !== status.fixedAsOf)) {
     throw fail('ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID', 'COMPLETED status is not backed by the exact published artifact pair');
   }
   return pair;
@@ -84,8 +90,14 @@ function verifyCompletedPrefix(status, batches) {
 
 function persistFailure(statusRoot, status, state, code) {
   const next = state === 'BLOCKED' ? withBlocked(status, code) : withFailed(status, code);
-  writeRunStatus(statusRoot, next);
-  return next;
+  try { return writeRunStatus(statusRoot, next); }
+  catch (error) {
+    if (error?.code === 'RUN_STATUS_STALE_UPDATE' || error?.code === 'RUN_STATUS_ILLEGAL_TRANSITION') {
+      const latest = readRunStatus(statusRoot, status);
+      if (latest) return latest;
+    }
+    throw error;
+  }
 }
 
 export function runFormalResearchOrchestrator(options) {
@@ -109,14 +121,14 @@ export function runFormalResearchOrchestrator(options) {
   if (status?.runState === 'COMPLETED') {
     try { verifyCompletedArtifact(artifactRoot, status); }
     catch (error) {
-      status = persistFailure(statusRoot, status, 'BLOCKED', safeCode(error, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID'));
-      return { runStatus: status, published: false, error: { code: status.blockedReasonCode, message: status.blockedReasonCode } };
+      const code = safeCode(error, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID');
+      return { runStatus: status, published: false, error: { code, message: code } };
     }
     return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
   }
   if (!status) {
     status = initialRunStatus({ runIdentity, totalBatches: batches.length });
-    writeRunStatus(statusRoot, status);
+    status = writeRunStatus(statusRoot, status);
   } else if (status.totalBatches !== batches.length) {
     throw fail('ORCHESTRATOR_BATCH_PLAN_MISMATCH', 'resumed run batch plan differs from the persisted plan');
   }
@@ -142,7 +154,7 @@ export function runFormalResearchOrchestrator(options) {
       statistics = computeMarketRegimeStatistics(accumulatedGovernanceRows);
       scorecardResult = buildDeterministicScorecard(accumulatedScorecardRows, scorecardOptions, { validationRunFinishedAt });
       status = withBatchCompleted(status, batch.batchIndex, { checkpoint: checkpointForBatch(batch, batch.cursor ?? null) });
-      writeRunStatus(statusRoot, status);
+      status = writeRunStatus(statusRoot, status);
     } catch (error) {
       const code = safeCode(error, 'ORCHESTRATOR_BATCH_VALIDATION_FAILED');
       status = persistFailure(statusRoot, status, 'BLOCKED', code);
@@ -200,7 +212,7 @@ export function runFormalResearchOrchestrator(options) {
   const publishedPair = verifyCompletedArtifact(artifactRoot, { ...status, evaluationVersion, artifactMode,
     publishedArtifactSha256: readArtifactPair(artifactTargetDir(artifactRoot, artifactMode, validationRunId, evaluationVersion)).sidecar?.fullMainArtifactSha256 });
   status = withCompleted(status, { publishedArtifactSha256: publishedPair.sidecar.fullMainArtifactSha256 });
-  writeRunStatus(statusRoot, status);
+  status = writeRunStatus(statusRoot, status);
   return { runStatus: status, published: true, publishResult, decision, statistics, scorecardResult };
 }
 
@@ -213,6 +225,13 @@ function checkpointPath(statusRoot, runIdentity, batchIndex) {
   return path.join(checkpointDirectory(statusRoot, runIdentity), `${batchIndex}.json`);
 }
 
+function checkpointIdentity(runIdentity) {
+  const { validationRunId, artifactMode, configSha256, sourceCommit, datasetVersion, algorithmVersion, ruleVersion,
+    evaluationVersion, weightVersion, horizons, researchFrom, researchTo, fixedAsOf, runIdentitySha256 } = runIdentity;
+  return { validationRunId, artifactMode, configSha256, sourceCommit, datasetVersion, algorithmVersion, ruleVersion,
+    evaluationVersion, weightVersion, horizons, researchFrom, researchTo, fixedAsOf, runIdentitySha256 };
+}
+
 function readDatabasePageCheckpoint(statusRoot, runIdentity, checkpoint) {
   const target = checkpointPath(statusRoot, runIdentity, checkpoint.batchIndex);
   const stat = lstatIfExists(target);
@@ -220,7 +239,9 @@ function readDatabasePageCheckpoint(statusRoot, runIdentity, checkpoint) {
   const { bytes } = readFileNoFollowSymlink(target, 50_000_000);
   let payload;
   try { payload = JSON.parse(bytes.toString('utf8')); } catch { throw fail('ORCHESTRATOR_CHECKPOINT_CONFLICT', 'database page checkpoint is not valid JSON'); }
-  if (payload.runIdentitySha256 !== runIdentity.runIdentitySha256) throw fail('ORCHESTRATOR_CHECKPOINT_IDENTITY_MISMATCH', 'database checkpoint belongs to another run identity');
+  if (canonicalJson(payload.runIdentity) !== canonicalJson(checkpointIdentity(runIdentity))) {
+    throw fail('ORCHESTRATOR_CHECKPOINT_IDENTITY_MISMATCH', 'database checkpoint belongs to another run identity');
+  }
   const batch = { batchIndex: payload.batchIndex, governanceRows: payload.rows, scorecardRows: payload.rows, cursor: payload.nextCursor };
   if (checkpoint.sha256 !== sha256(batch) || checkpoint.rowCount !== payload.rows?.length) {
     throw fail('ORCHESTRATOR_CHECKPOINT_CONFLICT', 'database page checkpoint hash mismatch');
@@ -232,7 +253,7 @@ function writeDatabasePageCheckpoint(statusRoot, runIdentity, batch) {
   const dir = checkpointDirectory(statusRoot, runIdentity);
   ensureDirectorySafe(dir, statusRoot);
   const target = checkpointPath(statusRoot, runIdentity, batch.batchIndex);
-  const payload = { schemaVersion: 'v1.4d-formal-db-page-checkpoint/2', runIdentitySha256: runIdentity.runIdentitySha256,
+  const payload = { schemaVersion: 'v1.4d-formal-db-page-checkpoint/3', runIdentity: checkpointIdentity(runIdentity),
     batchIndex: batch.batchIndex, rows: batch.scorecardRows, nextCursor: batch.cursor };
   const bytes = Buffer.from(canonicalJson(payload), 'utf8');
   if (lstatIfExists(target)) {
@@ -253,41 +274,63 @@ function writeDatabasePageCheckpoint(statusRoot, runIdentity, batch) {
 // RUNNING status write; repository, mapping, artifact-core and publication
 // failures therefore always leave an auditable terminal state.
 export async function runFormalResearchFromDatabase(options) {
-  const { pool, validationRunId, evaluationVersion, batchSize = 1000, artifactMode, statusRoot } = options;
-  assertGuardedResearchPgPool(pool);
+  const frozen = freezeFormalRunConfig(options.formalRunConfig);
+  const config = frozen.config;
+  const { pool, batchSize = 1000, statusRoot } = options;
+  const { validationRunId, evaluationVersion, artifactMode } = config;
+  if (options.validationRunId !== undefined && options.validationRunId !== validationRunId ||
+      options.evaluationVersion !== undefined && options.evaluationVersion !== evaluationVersion ||
+      options.artifactMode !== undefined && options.artifactMode !== artifactMode ||
+      options.artifactRoot !== undefined && options.artifactRoot !== config.artifactRoot) {
+    throw fail('ORCHESTRATOR_RUN_CONFIG_MISMATCH', 'runtime options conflict with the frozen formal run config');
+  }
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 10_000) throw fail('ORCHESTRATOR_INVALID_INPUT', 'batchSize must be 1..10000');
 
-  let context, count;
-  try {
-    context = await loadFormalResearchContext(pool, { validationRunId });
-    count = await countFormalResearchRows(pool, { validationRunId, evaluationVersion });
-  } catch (error) {
-    const code = safeCode(error, 'ORCHESTRATOR_REPOSITORY_FAILED');
-    return { runStatus: null, published: false, error: { code, message: code } };
-  }
-  const databaseScorecardOptions = { ...options.scorecardOptions, trainEnd: context.trainEnd, validationEnd: context.validationEnd };
-  const resolvedOptions = { ...options, scorecardOptions: databaseScorecardOptions,
-    validationRunFinishedAt: context.validationRunFinishedAt, manifestContentHash: context.manifestContentHash };
-  const runIdentity = createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode,
-    config: runConfig(resolvedOptions, 'DATABASE', { datasetVersion: context.datasetVersion }) });
+  const runIdentity = createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode, config });
   let status = readRunStatus(statusRoot, runIdentity);
   if (status?.runState === 'COMPLETED') {
-    try { verifyCompletedArtifact(options.artifactRoot, status); }
+    try { verifyCompletedArtifact(config.artifactRoot, status); }
     catch (error) {
-      status = persistFailure(statusRoot, status, 'BLOCKED', safeCode(error, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID'));
-      return { runStatus: status, published: false, error: { code: status.blockedReasonCode, message: status.blockedReasonCode } };
+      const code = safeCode(error, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID');
+      return { runStatus: status, published: false, error: { code, message: code } };
     }
     return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
   }
+  if (status?.runState === 'FAILED' || status?.runState === 'BLOCKED') {
+    const code = status.blockedReasonCode;
+    return { runStatus: status, published: false, resumed: true, error: { code, message: code } };
+  }
   if (!status) {
-    status = initialRunStatus({ runIdentity, totalBatches: Math.max(1, Math.ceil(count / batchSize)) });
-    writeRunStatus(statusRoot, status);
+    status = initialRunStatus({ runIdentity, totalBatches: 1 });
+    try { status = writeRunStatus(statusRoot, status); }
+    catch { throw fail('ORCHESTRATOR_STATUS_PERSIST_FAILED', 'unable to persist startup audit status'); }
   }
 
+  let context, count;
+  try {
+    assertGuardedResearchPgPool(pool);
+    context = await loadFormalResearchContext(pool, { validationRunId });
+    if (context.datasetVersion !== config.datasetVersion || context.algorithmVersion !== config.algorithmVersion ||
+        context.ruleVersion !== config.ruleVersion || context.from !== Date.parse(config.researchFrom) ||
+        context.to !== Date.parse(config.researchTo)) {
+      throw fail('ORCHESTRATOR_RUN_CONFIG_DATABASE_MISMATCH', 'database validation identity conflicts with frozen config');
+    }
+    context = { ...context, weightVersion: config.weightVersion };
+    count = await countFormalResearchRows(pool, { validationRunId, evaluationVersion });
+  } catch (error) {
+    const code = safeCode(error, 'ORCHESTRATOR_REPOSITORY_FAILED');
+    try { status = persistFailure(statusRoot, status, 'FAILED', code); }
+    catch { throw fail('ORCHESTRATOR_STATUS_PERSIST_FAILED', 'unable to persist repository failure status'); }
+    return { runStatus: status, published: false, error: { code, message: code } };
+  }
+  const databaseScorecardOptions = { feeBps: config.costs.feeBps, slippageBps: config.costs.slippageBps,
+    trainEnd: context.trainEnd, validationEnd: context.validationEnd };
+  const resolvedOptions = { ...options, scorecardOptions: databaseScorecardOptions,
+    validationRunFinishedAt: context.validationRunFinishedAt, manifestContentHash: context.manifestContentHash };
   const totalBatches = Math.max(1, Math.ceil(count / batchSize));
   if (status.completedBatchIndices.length === 0 && status.totalBatches !== totalBatches) {
     status = withBatchPlan(status, totalBatches);
-    writeRunStatus(statusRoot, status);
+    status = writeRunStatus(statusRoot, status);
   } else if (status.totalBatches !== totalBatches) {
     const code = 'ORCHESTRATOR_BATCH_PLAN_MISMATCH';
     status = persistFailure(statusRoot, status, 'BLOCKED', code);
@@ -312,7 +355,7 @@ export async function runFormalResearchFromDatabase(options) {
         buildDeterministicScorecard(prefixRows, databaseScorecardOptions, { validationRunFinishedAt: context.validationRunFinishedAt });
         writeDatabasePageCheckpoint(statusRoot, runIdentity, batch);
         status = withBatchCompleted(status, batchIndex, { checkpoint: checkpointForBatch(batch, page.nextCursor) });
-        writeRunStatus(statusRoot, status);
+        status = writeRunStatus(statusRoot, status);
       }
       batches.push(batch);
       cursor = batch.cursor;
@@ -336,7 +379,11 @@ export async function runFormalResearchFromDatabase(options) {
     return { runStatus: status, published: false, error: { code, message: code } };
   }
   return runFormalResearchOrchestrator({
-    ...options, batches, assembleD8Input: null, databaseAuditTrail,
+    ...options, artifactRoot: config.artifactRoot, validationRunId, evaluationVersion, artifactMode,
+    lockTimeoutMs: config.lockTimeoutMs, staleLockRecovery: config.staleLockRecovery === 'ENABLED',
+    thresholds: config.thresholds, batches, assembleD8Input: null, databaseAuditTrail,
+    buildArtifactCore: args => ({ ...options.buildArtifactCore(args), gitObjectFormat: config.gitObjectFormat,
+      sourceCommit: config.sourceCommit, researchFrom: config.researchFrom, researchTo: config.researchTo, fixedAsOf: config.fixedAsOf }),
     validationRunFinishedAt: context.validationRunFinishedAt,
     scorecardOptions: databaseScorecardOptions,
     manifestContentHash: context.manifestContentHash,

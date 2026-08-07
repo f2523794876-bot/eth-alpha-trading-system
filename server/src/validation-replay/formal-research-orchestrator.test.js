@@ -148,7 +148,7 @@ test('P0完整run identity拒绝不同evaluation/config和旧状态，精确相�
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });
 
-test('P0 COMPLETED快捷路径必须回读artifact pair；缺失或身份/hash不一致即BLOCKED', () => {
+test('P0 COMPLETED快捷路径必须回读artifact pair；损坏时拒绝复用且不得把COMPLETED回退为BLOCKED', () => {
   for (const damage of ['missing', 'mismatch']) {
     const root = makeRoot(), statusRoot = makeRoot();
     try {
@@ -165,7 +165,7 @@ test('P0 COMPLETED快捷路径必须回读artifact pair；缺失或身份/hash�
       }
       const resumed = runFormalResearchOrchestrator(opts);
       assert.equal(resumed.published, false);
-      assert.equal(resumed.runStatus.runState, 'BLOCKED');
+      assert.equal(resumed.runStatus.runState, 'COMPLETED');
       assert.equal(resumed.error.code, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID');
     } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
   }

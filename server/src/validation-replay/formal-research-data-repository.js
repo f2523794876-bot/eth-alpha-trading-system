@@ -288,8 +288,14 @@ function mapRow(row, context) {
         evaluationStartedAt < context.startedAt || evaluationFinishedAt > context.finishedAt || evaluationStartedAt > evaluatedAt || evaluatedAt > evaluationFinishedAt) {
       throw fail('FORMAL_RESEARCH_DATABASE_TIME_BARRIER_FAILED', 'row violates run, maturity or as-of boundaries');
     }
+    const replayAlgorithmVersion = text(row.replayAlgorithmVersion, 'replayAlgorithmVersion');
+    const replayRuleVersion = text(row.replayRuleVersion, 'replayRuleVersion');
+    const replayWeightVersion = text(row.replayWeightVersion, 'replayWeightVersion');
+    const featureEngineVersion = text(row.featureEngineVersion, 'featureEngineVersion');
     if (row.generationStatus !== 'SUCCEEDED' || row.evaluationStatus !== 'SUCCEEDED' || row.sourceOrigin !== 'HISTORICAL_REPLAY' ||
         row.outcomeSourceOrigin !== 'HISTORICAL_REPLAY' || row.datasetVersion !== context.datasetVersion ||
+        replayAlgorithmVersion !== context.algorithmVersion || replayRuleVersion !== context.ruleVersion ||
+        (context.weightVersion !== undefined && replayWeightVersion !== context.weightVersion) ||
         row.researchAvailabilityRuleVersion !== context.researchAvailabilityRuleVersion) {
       throw fail('FORMAL_RESEARCH_DATABASE_IDENTITY_CHAIN_INVALID', 'row identity/status chain conflicts with the validation run');
     }
@@ -346,7 +352,7 @@ function mapRow(row, context) {
       throw fail('FORMAL_RESEARCH_FEATURE_LINEAGE_MISMATCH', 'feature records do not exactly match the snapshot identity');
     }
     for (const [index, feature] of featureLineage.entries()) {
-      if (feature.sourceDatasetVersion !== context.datasetVersion || feature.algorithmVersion !== context.algorithmVersion ||
+      if (feature.sourceDatasetVersion !== context.datasetVersion || feature.algorithmVersion !== featureEngineVersion ||
           !Array.isArray(feature.sourceVintageRefs) || !feature.sourceVintageRefs.length) {
         throw fail('FORMAL_RESEARCH_FEATURE_LINEAGE_MISMATCH', 'feature identity or source lineage is incomplete');
       }
@@ -397,7 +403,9 @@ export async function loadFormalResearchPage(pool, { validationRunId, evaluation
   try {
     const result = await pool.query(
       `SELECT s.prediction_id AS "predictionId", s.generation_run_id AS "generationRunId", e.evaluation_run_id AS "evaluationRunId",
-              s.dataset_version AS "datasetVersion", s.horizon, s.target_start_time AS "targetStartTime", s.target_end_time AS "targetEndTime",
+              s.dataset_version AS "datasetVersion", s.algorithm_version AS "replayAlgorithmVersion",
+              s.rule_version AS "replayRuleVersion", s.weight_version AS "replayWeightVersion",
+              s.feature_engine_version AS "featureEngineVersion", s.horizon, s.target_start_time AS "targetStartTime", s.target_end_time AS "targetEndTime",
               s.expected_direction AS "predictedDirection", s.direction_threshold AS "directionThreshold", s.proxy_state_at_generation AS "proxyStateAtGeneration",
               s.feature_values_used->>'trend4h' AS "trend4hAtGeneration", s.feature_values_used AS "featureValuesUsed", s.feature_record_ids AS "featureRecordIds",
               s.historical_as_of_time AS "snapshotHistoricalAsOfTime", s.research_data_vintage AS "snapshotResearchDataVintage",

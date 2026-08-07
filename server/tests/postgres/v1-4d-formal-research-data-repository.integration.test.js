@@ -20,6 +20,8 @@ const rule = 'v1.4d-research-availability/1';
 const evaluationVersion = 'r3-batch4-real-postgres';
 const datasetHash = 'd'.repeat(64);
 const datasetVersion = `v1.4d-sha256-${datasetHash}`;
+const replayAlgorithmVersion = 'v1.4c-server-po-rule-1';
+const featureAlgorithmVersion = 'v1.4b-feature-engine-1';
 const targetRun = randomUUID();
 const otherRun = randomUUID();
 const runFrom = '2026-01-01T00:00:00.000Z';
@@ -59,8 +61,8 @@ function vintage(asOfTime, vintageId = member.vintageId) {
 async function insertValidationRun(validationRunId, { status = 'SUCCEEDED', horizons = ['24h', '72h'] } = {}) {
   await pool.query(`INSERT INTO historical_validation.validation_runs
     (validation_run_id,dataset_version,symbol,horizons,from_utc,to_utc,algorithm_version,rule_version,train_end_utc,validation_end_utc,dry_run,status,started_at,finished_at)
-    VALUES ($1,$2,'ETHUSDT',$3::jsonb,$4,$5,'algorithm-v1','rule-v1',$6,$7,false,$8,$9,$10)`,
-  [validationRunId, datasetVersion, JSON.stringify(horizons), runFrom, runTo, trainEnd, validationEnd, status, runStarted, runFinished]);
+    VALUES ($1,$2,'ETHUSDT',$3::jsonb,$4,$5,$11,'rule-v1',$6,$7,false,$8,$9,$10)`,
+  [validationRunId, datasetVersion, JSON.stringify(horizons), runFrom, runTo, trainEnd, validationEnd, status, runStarted, runFinished, replayAlgorithmVersion]);
 }
 
 async function insertReport(validationRunId, horizon, expectedCount) {
@@ -70,13 +72,13 @@ async function insertReport(validationRunId, horizon, expectedCount) {
     directionEffectiveSampleCount: expectedCount, pathRawSampleCount: expectedCount, pathEffectiveSampleCount: expectedCount,
     sampleSufficient: true, purgedStraddlingCount: 0, poStateBreakdown: {}, upDownRangeBreakdown: {},
     formalProxyDisclosure: proof, calibratedProbabilitiesStatus: 'null (V1.4D not eligible)', errorAttributionSummary: {},
-    algorithmVersion: 'algorithm-v1', ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
+    algorithmVersion: replayAlgorithmVersion, ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
   await pool.query(`INSERT INTO historical_validation.validation_reports
     (report_id,validation_run_id,dataset_version,horizon,report_scope,direction_raw_sample_count,direction_effective_sample_count,
      path_raw_sample_count,path_effective_sample_count,sample_sufficient,formal_proxy_disclosure,algorithm_version,rule_version,
      research_availability_rule_version,content_hash)
-    VALUES ($1,$2,$3,$4,'ALL',$5,$5,$5,$5,true,$6::jsonb,'algorithm-v1','rule-v1',$7,$8)`,
-  [randomUUID(), validationRunId, datasetVersion, horizon, expectedCount, JSON.stringify(proof), rule, canonicalJsonHash(content)]);
+    VALUES ($1,$2,$3,$4,'ALL',$5,$5,$5,$5,true,$6::jsonb,$9,'rule-v1',$7,$8)`,
+  [randomUUID(), validationRunId, datasetVersion, horizon, expectedCount, JSON.stringify(proof), rule, canonicalJsonHash(content), replayAlgorithmVersion]);
 }
 
 async function updateReportCount(validationRunId, horizon, expectedCount) {
@@ -86,7 +88,7 @@ async function updateReportCount(validationRunId, horizon, expectedCount) {
     directionEffectiveSampleCount: expectedCount, pathRawSampleCount: expectedCount, pathEffectiveSampleCount: expectedCount,
     sampleSufficient: true, purgedStraddlingCount: 0, poStateBreakdown: {}, upDownRangeBreakdown: {},
     formalProxyDisclosure: proof, calibratedProbabilitiesStatus: 'null (V1.4D not eligible)', errorAttributionSummary: {},
-    algorithmVersion: 'algorithm-v1', ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
+    algorithmVersion: replayAlgorithmVersion, ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
   await pool.query(`UPDATE historical_validation.validation_reports SET direction_raw_sample_count=$3,direction_effective_sample_count=$3,
     path_raw_sample_count=$3,path_effective_sample_count=$3,formal_proxy_disclosure=$4::jsonb,content_hash=$5
     WHERE validation_run_id=$1 AND horizon=$2 AND report_scope='ALL'`,
@@ -114,9 +116,10 @@ async function insertReplayRow(validationRunId, { horizon, start, direction, suf
      feature_engine_version,content_hash,auxiliary_evidence,historical_as_of_time,research_data_vintage,research_availability_rule_version,source_origin)
     VALUES ($1,$2,$3,'ETHUSDT',$4,$5,$5,$5,$6,2000,'{}'::jsonb,$7,$8,0.02,0.02,$9,$10,'threshold-v1',1,
       'UNKNOWN','PO','UNKNOWN','[]'::jsonb,34,33,33,'rule_based','{}'::jsonb,'{}'::jsonb,'{}'::jsonb,
-      'algorithm-v1','weight-v1','rule-v1','[]'::jsonb,jsonb_build_object('trend4h',$8::text),$11::jsonb,'feature-v1',$12,'{}'::jsonb,$5,$13::jsonb,$14,'HISTORICAL_REPLAY')`,
+      $15,'weight-v1','rule-v1','[]'::jsonb,jsonb_build_object('trend4h',$8::text),$11::jsonb,$16,$12,'{}'::jsonb,$5,$13::jsonb,$14,'HISTORICAL_REPLAY')`,
   [predictionId, generationRunId, datasetVersion, horizon, start, end, horizon === '24h' ? 96 : 288, direction,
-    horizon === '24h' ? 0.008 : 0.015, horizon === '24h' ? 0.05 : 0.08, featureIds, 'a'.repeat(64), JSON.stringify(vintage(start, vintageId)), rule]);
+    horizon === '24h' ? 0.008 : 0.015, horizon === '24h' ? 0.05 : 0.08, featureIds, 'a'.repeat(64), JSON.stringify(vintage(start, vintageId)), rule,
+    replayAlgorithmVersion, featureAlgorithmVersion]);
   const maturity = outcomeAsOf || end;
   await pool.query(`INSERT INTO historical_validation.replay_evaluation_runs
     (evaluation_run_id,validation_run_id,historical_as_of_time,status,evaluated_count,started_at,finished_at)
@@ -165,6 +168,15 @@ function artifactCore({ decision, governanceRef, d8Input, validationRunId, evalu
     decision, governanceAuthorizationRef: governanceRef };
 }
 
+function formalConfig(validationRunId, artifactRoot) {
+  return { schemaVersion: 'v1.4d-formal-run-config/1', validationRunId, artifactMode: 'DRY_RUN', artifactRoot,
+    lockTimeoutMs: 30_000, staleLockRecovery: 'ENABLED', maxArtifactBytes: 64 * 1024 * 1024, databaseIdentity: 'test',
+    researchFrom: runFrom, researchTo: runTo, fixedAsOf: runTo, symbols: ['ETHUSDT', 'BTCUSDT'],
+    intervals: ['15m', '1h', '4h'], horizons: ['24h', '72h'], datasetVersion,
+    algorithmVersion: replayAlgorithmVersion, ruleVersion: 'rule-v1', weightVersion: 'weight-v1', evaluationVersion,
+    costs: { feeBps: 5, slippageBps: 3 }, thresholds };
+}
+
 before(async () => {
   if (skip) return;
   pool = await createGuardedResearchPgPool({ databaseUrl: url, connectionString: url, max: 1 }, {
@@ -197,16 +209,16 @@ before(async () => {
   [datasetVersion, runFrom, runTo, rule, JSON.stringify([member])]);
   const featureSetVersion = `r3-batch5-${randomUUID()}`;
   await pool.query(`INSERT INTO public.feature_sets(feature_set_version,algorithm_version,schema_version,definition,definition_hash,active)
-    VALUES($1,'algorithm-v1','r3-batch5','{}'::jsonb,$2,true)`, [featureSetVersion, '9'.repeat(64)]);
+    VALUES($1,$3,'r3-batch6','{}'::jsonb,$2,true)`, [featureSetVersion, '9'.repeat(64), featureAlgorithmVersion]);
   const insertedFeature = await pool.query(`INSERT INTO public.feature_records(
     feature_id,symbol,target_interval,target_bar_open_time,target_bar_close_time,as_of_time,generated_at,feature_set_version,
     algorithm_version,source_dataset_version,revision_number,completeness,quality_state,missing_features,degraded_reasons,
     source_vintage_refs,source_revision_refs,feature_values,availability,content_hash)
-    VALUES($1,'ETHUSDT','15m',$2,$3,$3,'2026-04-01T00:00:00Z',$4,'algorithm-v1',$5,0,1,'HEALTHY','[]'::jsonb,'[]'::jsonb,
+    VALUES($1,'ETHUSDT','15m',$2,$3,$3,'2026-04-01T00:00:00Z',$4,$8,$5,0,1,'HEALTHY','[]'::jsonb,'[]'::jsonb,
       $6::jsonb,'[]'::jsonb,'{}'::jsonb,'{}'::jsonb,$7) RETURNING feature_record_id`,
   [`r3b5-feature-${randomUUID()}`, new Date(member.openTime), new Date(member.closeTime), featureSetVersion, datasetVersion,
     JSON.stringify([{ vintageId: member.vintageId, symbol: member.symbol, interval: member.intervalName, marketType: member.marketType,
-      sourceName: member.source, revision: member.revisionNumber, contentHash: member.rowContentHash }]), '8'.repeat(64)]);
+      sourceName: member.source, revision: member.revisionNumber, contentHash: member.rowContentHash }]), '8'.repeat(64), featureAlgorithmVersion]);
   featureRecordId = insertedFeature.rows[0].feature_record_id;
   fixtureRows = (await seedFullRun(targetRun)).sort((a, b) => a.horizon.localeCompare(b.horizon) || Date.parse(a.start) - Date.parse(b.start) || a.predictionId.localeCompare(b.predictionId));
   await insertValidationRun(otherRun, { horizons: ['24h'] });
@@ -314,6 +326,7 @@ test('真实PostgreSQL：guarded database orchestrator正常运行、重复执�
   const statusRoot = mkdtempSync(path.join('/private/tmp', 'r3b4-pg-status-'));
   try {
     const options = { pool, validationRunId: targetRun, evaluationVersion, artifactMode: 'DRY_RUN', statusRoot, artifactRoot,
+      formalRunConfig: formalConfig(targetRun, artifactRoot),
       batchSize: 3, scorecardOptions: { feeBps: 5, slippageBps: 3, trainEnd: 0, validationEnd: 1 },
       thresholds, buildArtifactCore: artifactCore, manifestContentHash: datasetHash };
     const first = await runFormalResearchFromDatabase(options);
@@ -326,7 +339,8 @@ test('真实PostgreSQL：guarded database orchestrator正常运行、重复执�
     const failedStatusRoot = mkdtempSync(path.join('/private/tmp', 'r3b4-pg-failed-status-'));
     try {
       const invalidRoot = path.join(artifactRoot, 'does-not-exist');
-      await assert.rejects(runFormalResearchFromDatabase({ ...options, statusRoot: failedStatusRoot, artifactRoot: invalidRoot }),
+      await assert.rejects(runFormalResearchFromDatabase({ ...options, statusRoot: failedStatusRoot, artifactRoot: invalidRoot,
+        formalRunConfig: formalConfig(targetRun, invalidRoot) }),
         error => error.code === 'ARTIFACT_ROOT_INVALID');
       assert.equal(findMostRecentRunStatus(failedStatusRoot, 'DRY_RUN').runState, 'FAILED');
     } finally { rmSync(failedStatusRoot, { recursive: true, force: true }); }
@@ -342,11 +356,11 @@ test('真实PostgreSQL：未知validation身份在建立run identity前失败且
   const statusRoot = mkdtempSync(path.join('/private/tmp', 'r3b4-empty-status-'));
   try {
     const result = await runFormalResearchFromDatabase({ pool, validationRunId: unknownRun, evaluationVersion, artifactMode: 'DRY_RUN',
-      statusRoot, artifactRoot, batchSize: 2, scorecardOptions: {}, thresholds, buildArtifactCore: artifactCore });
+      statusRoot, artifactRoot, formalRunConfig: formalConfig(unknownRun, artifactRoot), batchSize: 2, scorecardOptions: {}, thresholds, buildArtifactCore: artifactCore });
     assert.equal(result.published, false);
-    assert.equal(result.runStatus, null);
+    assert.equal(result.runStatus.runState, 'FAILED');
     assert.equal(result.error.code, 'FORMAL_RESEARCH_VALIDATION_RUN_NOT_FOUND');
-    assert.equal(findMostRecentRunStatus(statusRoot, 'DRY_RUN'), null);
+    assert.equal(findMostRecentRunStatus(statusRoot, 'DRY_RUN').runState, 'FAILED');
   } finally { rmSync(artifactRoot, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });
 
@@ -357,7 +371,7 @@ test('真实PostgreSQL：checkpoint持久化失败留下FAILED，且不进入art
   try {
     symlinkSync(symlinkTarget, path.join(statusRoot, 'database-page-checkpoints'));
     const result = await runFormalResearchFromDatabase({ pool, validationRunId: targetRun, evaluationVersion, artifactMode: 'DRY_RUN',
-      statusRoot, artifactRoot, batchSize: 2, scorecardOptions: { feeBps: 5, slippageBps: 3, trainEnd: Date.parse(trainEnd), validationEnd: Date.parse(validationEnd) },
+      statusRoot, artifactRoot, formalRunConfig: formalConfig(targetRun, artifactRoot), batchSize: 2, scorecardOptions: { feeBps: 5, slippageBps: 3, trainEnd: Date.parse(trainEnd), validationEnd: Date.parse(validationEnd) },
       thresholds, buildArtifactCore: artifactCore });
     assert.equal(result.published, false);
     assert.equal(result.runStatus.runState, 'FAILED');
@@ -372,8 +386,11 @@ test('真实PostgreSQL：checkpoint持久化失败留下FAILED，且不进入art
 
 test('database orchestrator拒绝未经guard capability验证的pool，生产wiring不能绕过', { skip }, async () => {
   const statusRoot = mkdtempSync(path.join('/private/tmp', 'r3b4-unguarded-status-'));
+  const artifactRoot = mkdtempSync(path.join('/private/tmp', 'r3b6-guard-artifact-'));
   try {
-    await assert.rejects(runFormalResearchFromDatabase({ pool: { query: pool.query.bind(pool) }, validationRunId: targetRun,
-      evaluationVersion, artifactMode: 'DRY_RUN', statusRoot }), error => error.code === 'DATABASE_POOL_NOT_GUARDED');
-  } finally { rmSync(statusRoot, { recursive: true, force: true }); }
+    const result = await runFormalResearchFromDatabase({ pool: { query: pool.query.bind(pool) }, validationRunId: targetRun,
+      evaluationVersion, artifactMode: 'DRY_RUN', statusRoot, formalRunConfig: formalConfig(targetRun, artifactRoot) });
+    assert.equal(result.error.code, 'DATABASE_POOL_NOT_GUARDED');
+    assert.equal(result.runStatus.runState, 'FAILED');
+  } finally { rmSync(statusRoot, { recursive: true, force: true }); rmSync(artifactRoot, { recursive: true, force: true }); }
 });

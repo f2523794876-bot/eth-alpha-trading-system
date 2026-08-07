@@ -137,7 +137,8 @@ export function ensureDirectorySafe(dirPath, root) {
   for (const segment of segments) {
     current = path.join(current, segment);
     if (!fs.existsSync(current)) {
-      fs.mkdirSync(current, { mode: 0o700 });
+      try { fs.mkdirSync(current, { mode: 0o700 }); }
+      catch (error) { if (error.code !== 'EEXIST') throw error; }
     }
     assertOwnedNonWorldWritableDirectory(current);
   }
