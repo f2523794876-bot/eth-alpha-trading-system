@@ -34,8 +34,22 @@ const DATABASE_GUARD_ERROR_CODES = new Set([
   'DATABASE_TARGET_REJECTED',
   'DATABASE_IDENTITY_REQUIRED',
   'DATABASE_IDENTITY_REJECTED',
-  'DATABASE_IDENTITY_CONFLICT'
+  'DATABASE_IDENTITY_CONFLICT',
+  'DATABASE_GUARD_CONNECTION_FAILED',
+  'DATABASE_GUARD_QUERY_FAILED',
+  'DATABASE_POOL_NOT_GUARDED'
 ]);
+
+const guardedPools = new WeakSet();
+
+export function assertGuardedResearchPgPool(pool) {
+  if (!pool || !guardedPools.has(pool)) {
+    throw Object.assign(new Error('FORMAL production path requires a guarded research database pool'), {
+      code: 'DATABASE_POOL_NOT_GUARDED'
+    });
+  }
+  return pool;
+}
 
 export function isDatabaseGuardErrorCode(code) {
   return DATABASE_GUARD_ERROR_CODES.has(code);
@@ -108,9 +122,19 @@ export function parseResearchDatabaseTarget(databaseUrl, env = process.env) {
 // 验证fail-closed路径，不需要真实PostgreSQL）。
 export async function createGuardedResearchPgPool(config, { createPgPool, env = process.env }) {
   const declaredDatabaseName = parseResearchDatabaseTarget(config.databaseUrl, env);
-  const pool = await createPgPool(config);
+  let pool;
   try {
-    const identity = await pool.query('SELECT current_database() AS database');
+    pool = await createPgPool(config);
+  } catch {
+    throw Object.assign(new Error('Research database connection failed'), { code: 'DATABASE_GUARD_CONNECTION_FAILED' });
+  }
+  try {
+    let identity;
+    try {
+      identity = await pool.query('SELECT current_database() AS database');
+    } catch {
+      throw Object.assign(new Error('Research database identity query failed'), { code: 'DATABASE_GUARD_QUERY_FAILED' });
+    }
     const actualDatabaseName = identity.rows?.[0]?.database;
     if (actualDatabaseName !== declaredDatabaseName) {
       throw Object.assign(
@@ -118,6 +142,7 @@ export async function createGuardedResearchPgPool(config, { createPgPool, env = 
         { code: 'DATABASE_TARGET_REJECTED', declaredDatabaseName, actualDatabaseName }
       );
     }
+    guardedPools.add(pool);
     return pool;
   } catch (error) {
     // Round 2（P2-B闭环）：pool.end()本身若失败，绝不能替换掉更有诊断价值的原始安全错误

@@ -85,7 +85,7 @@ test('DRY_RUN三批次首次运行：run-status COMPLETED，D7 artifact真实可
   try {
     const validationRunId = randomUUID();
     const result = runFormalResearchOrchestrator(baseOptions(root, statusRoot, validationRunId));
-    assert.equal(result.published, true);
+    assert.equal(result.published, true, JSON.stringify(result));
     assert.equal(result.publishResult.operationStatus, 'PUBLISHED');
     assert.equal(result.runStatus.runState, 'COMPLETED');
     assert.deepEqual(result.runStatus.completedBatchIndices, [0, 1, 2]);
@@ -125,7 +125,9 @@ test('批次计划不一致的resume：totalBatches与已记录run-status不符�
     const validationRunId = randomUUID();
     // 手工模拟"中断于3批计划、只完成批次0"的checkpoint。
     let seeded = initialRunStatus({ validationRunId, artifactMode: 'DRY_RUN', totalBatches: 3 });
-    seeded = withBatchCompleted(seeded, 0);
+    const firstBatch = syntheticBatches()[0];
+    const checkpointHash = createHash('sha256').update(canonicalJson(firstBatch), 'utf8').digest('hex');
+    seeded = withBatchCompleted(seeded, 0, { checkpoint: { batchIndex: 0, rowCount: firstBatch.scorecardRows.length, cursor: null, sha256: checkpointHash } });
     writeRunStatus(statusRoot, seeded);
     // 用只有2批的计划重放：必须拒绝，不得静默按新的、更短的计划继续。
     const opts = baseOptions(root, statusRoot, validationRunId, { batches: syntheticBatches().slice(0, 2) });
@@ -179,7 +181,7 @@ test('空batches数组：拒绝', () => {
   try {
     assert.throws(
       () => runFormalResearchOrchestrator(baseOptions(root, statusRoot, randomUUID(), { batches: [] })),
-      error => error.code === 'ORCHESTRATOR_INVALID_INPUT'
+      error => error.code === 'ORCHESTRATOR_BATCH_PLAN_INVALID'
     );
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });
@@ -205,15 +207,43 @@ test('真实结构DRY_RUN：无GO模板/无assemble hook，逐行数据组装D8�
     }
     const opts = baseOptions(root, statusRoot, validationRunId, {
       batches: [{ batchIndex: 0, governanceRows: rows, scorecardRows: rows }], assembleD8Input: null,
-      trainEnd, validationEnd, thresholds: GO_INPUT.thresholds,
-      auditTrail: { ...GO_INPUT.auditTrail, datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`, manifestContentHash: 'c'.repeat(64), backfillBatchIds: [], vintageIds: [] }
+      trainEnd, validationEnd, scorecardOptions: { feeBps: 5, slippageBps: 3, trainEnd, validationEnd }, thresholds: GO_INPUT.thresholds,
+      databaseAuditTrail: { ...GO_INPUT.auditTrail, validationRunId, evaluationVersion: 'v1.4d-eval-orchestrator-drill', evaluatedAt: '2026-01-08T00:05:00.000Z', datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`, manifestContentHash: 'c'.repeat(64), backfillBatchIds: [], vintageIds: [] }
     });
     const result = runFormalResearchOrchestrator(opts);
-    assert.equal(result.published, true);
+    assert.equal(result.published, true, JSON.stringify(result));
     assert.equal(result.runStatus.runState, 'COMPLETED');
     assert.equal(result.decision.validationRunId, validationRunId);
     assert.equal(result.decision.horizonResults['24h'].effectiveTest, 3);
     const dir = targetDirFor(root, 'dry-run', validationRunId, opts.evaluationVersion);
     assert.equal(readArtifactPair(dir).readerStatus, 'ACCEPTED');
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});
+
+test('scorecard失败不提前写checkpoint，assembly失败为BLOCKED，buildArtifactCore失败为FAILED且均不发布', () => {
+  for (const stage of ['scorecard', 'assembly', 'core']) {
+    const root = makeRoot();
+    const statusRoot = makeRoot();
+    try {
+      const validationRunId = randomUUID();
+      const overrides = stage === 'scorecard'
+        ? { scorecardOptions: {} }
+        : stage === 'assembly'
+          ? { assembleD8Input: () => { throw Object.assign(new Error('secret detail'), { code: 'ASSEMBLY_TEST_FAILURE' }); } }
+          : { buildArtifactCore: () => { throw Object.assign(new Error('secret detail'), { code: 'CORE_TEST_FAILURE' }); } };
+      const result = runFormalResearchOrchestrator(baseOptions(root, statusRoot, validationRunId, overrides));
+      assert.equal(result.published, false);
+      assert.equal(result.runStatus.runState, stage === 'core' ? 'FAILED' : 'BLOCKED');
+      assert.equal(result.error.message, result.error.code, '失败返回只能暴露稳定错误码');
+      if (stage === 'scorecard') assert.deepEqual(result.runStatus.completedBatchIndices, []);
+      const dir = targetDirFor(root, 'dry-run', validationRunId, 'v1.4d-eval-orchestrator-drill');
+      assert.equal(readArtifactPair(dir).readerStatus, 'REJECTED');
+    } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+  }
+});
+
+test('不连续checkpoint在状态机边界立即拒绝', () => {
+  const status = initialRunStatus({ validationRunId: randomUUID(), artifactMode: 'DRY_RUN', totalBatches: 2 });
+  assert.throws(() => withBatchCompleted(status, 1, { checkpoint: { batchIndex: 1, rowCount: 0, cursor: null, sha256: 'a'.repeat(64) } }),
+    error => error.code === 'RUN_STATUS_CHECKPOINT_INCONSISTENT');
 });

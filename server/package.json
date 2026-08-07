@@ -35,6 +35,7 @@
     "test:r3-batch1": "node --test src/formal-research/*.test.js src/validation-replay/formal-run-config.test.js",
     "test:r3-batch2": "node --test src/formal-research/go-no-go-evaluator.test.js",
     "test:postgres:r3-batch3": "node --test tests/postgres/v1-4d-formal-research-data-repository.integration.test.js",
+    "test:postgres:r3-batch4": "node --test tests/postgres/v1-4d-formal-research-data-repository.integration.test.js",
     "test:verification-bundle": "node --test src/validation-replay/research-scorecard.test.js scripts/v1-4d-scorecard-cli.test.mjs",
     "check": "node --check src/index.js && node --test tests/*.test.js tests/forecast/*.test.js"
   },

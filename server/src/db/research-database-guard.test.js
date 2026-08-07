@@ -343,7 +343,7 @@ test('createGuardedResearchPgPool（P2-B）：身份核验失败(DATABASE_TARGET
   assert.equal(pool.calls.end, 1, 'pool.end()仍必须被尝试调用一次，即使它自身会失败');
 });
 
-test('createGuardedResearchPgPool（P2-B）：query()本身抛出未分类异常、且随后pool.end()也抛出异常时，query()的原始异常仍必须是最终抛出的错误', async () => {
+test('createGuardedResearchPgPool：query()失败被稳定脱敏，且pool.end()失败不覆盖主错误', async () => {
   const originalError = Object.assign(new Error('ORIGINAL_QUERY_FAILURE'), { code: 'ORIGINAL_QUERY_FAILURE' });
   const pool = {
     async query() { throw originalError; },
@@ -352,7 +352,7 @@ test('createGuardedResearchPgPool（P2-B）：query()本身抛出未分类异常
   const createPgPool = async () => pool;
   await assert.rejects(
     createGuardedResearchPgPool({ databaseUrl: 'postgresql://u:p@localhost:5432/eth_alpha_v14d_test' }, { createPgPool }),
-    (e) => e === originalError
+    (e) => e.code === 'DATABASE_GUARD_QUERY_FAILED' && e.message === 'Research database identity query failed' && !e.message.includes('ORIGINAL_QUERY_FAILURE')
   );
 });
 
@@ -361,7 +361,7 @@ test('createGuardedResearchPgPool（P2-B）：query()本身抛出未分类异常
 // 这两条要求（createPgPool()调用在try块之外，其自身抛错时不会进入引用pool的catch块；
 // identity.rows?.[0]?.database的可选链在rows为空数组时安全求值为undefined，与目标库名比较不相等，
 // 走DATABASE_TARGET_REJECTED的既有fail-closed路径）。
-test('createGuardedResearchPgPool（边缘补充）：createPgPool()自身抛出的错误必须原样传播，不得尝试对不存在的pool调用end()，也不得产生任何二次/包装错误', async () => {
+test('createGuardedResearchPgPool：连接创建失败被稳定脱敏，且不存在pool时不调用end()', async () => {
   const originalError = Object.assign(new Error('ECONNREFUSED: connection refused'), { code: 'ECONNREFUSED' });
   let endCalled = false;
   const createPgPool = async () => {
@@ -373,7 +373,7 @@ test('createGuardedResearchPgPool（边缘补充）：createPgPool()自身抛出
   };
   await assert.rejects(
     createGuardedResearchPgPool({ databaseUrl: 'postgresql://u:p@localhost:5432/eth_alpha_v14d_test' }, { createPgPool }),
-    (e) => e === originalError && e.code === 'ECONNREFUSED'
+    (e) => e.code === 'DATABASE_GUARD_CONNECTION_FAILED' && e.message === 'Research database connection failed' && !e.message.includes('ECONNREFUSED')
   );
   assert.equal(endCalled, false, 'createPgPool()自身抛错时，不存在可供调用end()的pool，因此end()一定未被调用');
 });

@@ -280,6 +280,85 @@ function buildScope(rows, pathRows, costs, randomSeed) {
   };
 }
 
+function d8UnavailableReason(metric, baseline) {
+  const reason = String(metric?.reason || '');
+  if (baseline === 'historicalProportionRandom' && reason.includes('TRAIN-labelled')) return 'NO_TRAIN_SAMPLES';
+  if (baseline === 'follow4hTrend' && reason.includes('valid 4H trend')) return 'NO_VALID_TREND';
+  if (reason.includes('No VALIDATION or TEST') || reason.includes('No rows')) return 'NO_EVALUATION_ROWS';
+  return 'INPUT_MISSING';
+}
+
+function d8BaselineMetric(metric, baseline) {
+  return metric.status === 'EVALUATED'
+    ? { status: 'AVAILABLE', reasonCode: 'NONE', sampleCount: metric.sampleCount, macroF1: metric.macroF1,
+        preCostExpectedReturn: metric.economics.grossExpectedReturn, postCostExpectedReturn: metric.economics.costAdjustedExpectedReturn }
+    : { status: 'NOT_EVALUABLE', reasonCode: d8UnavailableReason(metric, baseline), sampleCount: 0, macroF1: null,
+        preCostExpectedReturn: null, postCostExpectedReturn: null };
+}
+
+function d8Lift(model, baselines, field) {
+  const names = ['alwaysRange', 'follow4hTrend', 'historicalProportionRandom'];
+  if (names.some(name => baselines[name].status !== 'AVAILABLE')) return null;
+  const reference = names.reduce((selected, name) => baselines[name][field] > baselines[selected][field] ? name : selected, names[0]);
+  return model[field] - baselines[reference][field];
+}
+
+// Canonical D8 projection source.  This lives inside the authoritative
+// scorecard pipeline so D8 never re-implements split, purge, Macro-F1,
+// economic cost or baseline formulas.  TEST membership is the already
+// labelled result of buildMetricPipeline(), whose split uses targetEndTime.
+function buildD8AuthoritativeMetrics(pipeline, costs, randomSeed) {
+  if (!pipeline.direction.segments) return null;
+  const directionRows = pipeline.direction.rows;
+  const testRows = directionRows.filter(row => row.split === 'TEST');
+  const trainingRows = directionRows.filter(row => row.split === 'TRAIN');
+  const pathTestRows = pipeline.path.rows.filter(row => row.split === 'TEST');
+  const scope = buildScope([...trainingRows, ...testRows], pathTestRows, costs, randomSeed);
+  const count = predicate => testRows.filter(predicate).length;
+  const classEffectiveTest = Object.fromEntries(DIRECTIONS.map(label => [label, count(row => row.actualDirection === label)]));
+  const predictedCounts = Object.fromEntries(DIRECTIONS.map(label => [label, count(row => row.predictedDirection === label)]));
+  const marketRegimeAtGeneration = Object.fromEntries(DIRECTIONS.map(label => [label, {
+    sampleCount: count(row => row.trend4hDirection === label),
+    directionCorrectCount: count(row => row.trend4hDirection === label && row.directionCorrect === true)
+  }]));
+  const sourceModel = scope.outOfSampleSystem || scope.system;
+  const model = sourceModel?.status === 'EVALUATED' ? {
+    directionCorrectCount: DIRECTIONS.reduce((sum, label) => sum + sourceModel.confusion[label][label], 0),
+    macroF1: sourceModel.macroF1,
+    preCostExpectedReturn: sourceModel.economics.grossExpectedReturn,
+    postCostExpectedReturn: sourceModel.economics.costAdjustedExpectedReturn
+  } : null;
+  const baselines = Object.fromEntries(Object.entries(scope.baselines).map(([name, metric]) => [name, d8BaselineMetric(metric, name)]));
+  const groupTotal = DIRECTIONS.reduce((sum, label) => sum + marketRegimeAtGeneration[label].sampleCount, 0);
+  const directionalCoverage = testRows.length ? (predictedCounts.UP + predictedCounts.DOWN) / testRows.length : null;
+  const marketRegimeCoverage = testRows.length ? groupTotal / testRows.length : null;
+  return {
+    sampleAccounting: {
+      rawTest: pipeline.direction.segments.TEST.rawSampleCount,
+      effectiveTest: pipeline.direction.segments.TEST.effectiveSampleCount,
+      classEffectiveTest,
+      predictedUpCount: predictedCounts.UP,
+      predictedDownCount: predictedCounts.DOWN,
+      predictedRangeCount: predictedCounts.RANGE
+    },
+    rangeAttribution: {
+      rangeTotal: classEffectiveTest.RANGE,
+      predictedRangeCount: predictedCounts.RANGE,
+      correctlyPredictedRangeCount: count(row => row.actualDirection === 'RANGE' && row.predictedDirection === 'RANGE'),
+      allPredictionsRange: testRows.length > 0 && predictedCounts.RANGE === testRows.length
+    },
+    marketRegimeAtGeneration,
+    predictedUpCount: predictedCounts.UP,
+    predictedDownCount: predictedCounts.DOWN,
+    directionalCoverage,
+    marketRegimeCoverage,
+    model,
+    baselines,
+    preCostLift: model ? d8Lift(model, baselines, 'preCostExpectedReturn') : null,
+    postCostLift: model ? d8Lift(model, baselines, 'postCostExpectedReturn') : null
+  };
+}
+
 function buildDataQuality(inputRows, eligibleRows, pathRows) {
   const count = predicate => inputRows.filter(predicate).length;
   const byHorizon = Object.fromEntries(['24h', '72h'].map(horizon => {
@@ -401,6 +480,7 @@ export function buildResearchScorecard(inputRows, options = {}) {
     const pipeline = pipelines[horizon];
     return [horizon, {
       ...buildScope(pipeline.direction.rows, pipeline.path.rows, costs, randomSeed + index),
+      authoritativeD8: buildD8AuthoritativeMetrics(pipeline, costs, randomSeed + index),
       directionSampleCounts: {
         rawSampleCount: pipeline.direction.rawSampleCount,
         effectiveSampleCount: pipeline.direction.effectiveSampleCount,

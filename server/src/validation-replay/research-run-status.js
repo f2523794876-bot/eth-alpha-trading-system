@@ -22,7 +22,7 @@ import {
   readFileNoFollowSymlink, lstatIfExists, newLockId
 } from './artifact-fs-primitives.js';
 
-const SCHEMA_VERSION = 'v1.4d-research-run-status/1';
+const SCHEMA_VERSION = 'v1.4d-research-run-status/2';
 const VALID_STATES = new Set(['RUNNING', 'BLOCKED', 'COMPLETED', 'FAILED']);
 const MAX_STATUS_BYTES = 1_000_000;
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -50,6 +50,17 @@ function assertStatus(status) {
   }
   if (new Set(status.completedBatchIndices).size !== status.completedBatchIndices.length) {
     throw fail('RUN_STATUS_INVALID', 'completedBatchIndices must not contain duplicates');
+  }
+  if (status.completedBatchIndices.some((value, index) => value !== index)) {
+    throw fail('RUN_STATUS_CHECKPOINT_INCONSISTENT', 'completed batch checkpoints must be one continuous prefix');
+  }
+  if (!Array.isArray(status.batchCheckpoints) || status.batchCheckpoints.length !== status.completedBatchIndices.length ||
+      status.batchCheckpoints.some((checkpoint, index) => checkpoint?.batchIndex !== index ||
+        !Number.isInteger(checkpoint.rowCount) || checkpoint.rowCount < 0 ||
+        typeof checkpoint.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint.sha256) ||
+        !(checkpoint.cursor === null || (checkpoint.cursor && typeof checkpoint.cursor.horizon === 'string' &&
+          Number.isSafeInteger(checkpoint.cursor.targetStartTime) && typeof checkpoint.cursor.predictionId === 'string')))) {
+    throw fail('RUN_STATUS_CHECKPOINT_INCONSISTENT', 'batch checkpoint evidence is invalid');
   }
   if (status.blockedReasonCode !== null && typeof status.blockedReasonCode !== 'string') {
     throw fail('RUN_STATUS_INVALID', 'blockedReasonCode must be a string or null');
@@ -117,14 +128,28 @@ export function writeRunStatus(root, status) {
 export function initialRunStatus({ validationRunId, artifactMode, totalBatches, now = new Date().toISOString() }) {
   return assertStatus({
     schemaVersion: SCHEMA_VERSION, validationRunId, artifactMode, runState: 'RUNNING',
-    totalBatches, completedBatchIndices: [], blockedReasonCode: null, updatedAt: now
+    totalBatches, completedBatchIndices: [], batchCheckpoints: [], blockedReasonCode: null, updatedAt: now
   });
 }
 
-export function withBatchCompleted(status, batchIndex, { now = new Date().toISOString() } = {}) {
+export function withBatchPlan(status, totalBatches, { now = new Date().toISOString() } = {}) {
+  if (status.completedBatchIndices.length || !Number.isInteger(totalBatches) || totalBatches < 1) {
+    throw fail('RUN_STATUS_CHECKPOINT_INCONSISTENT', 'batch plan can only be established before the first checkpoint');
+  }
+  return assertStatus({ ...status, totalBatches, updatedAt: now });
+}
+
+export function withBatchCompleted(status, batchIndex, { now = new Date().toISOString(), checkpoint = null } = {}) {
+  if (batchIndex !== status.completedBatchIndices.length) {
+    throw fail('RUN_STATUS_CHECKPOINT_INCONSISTENT', 'checkpoint must extend the continuous completed prefix');
+  }
   const completedBatchIndices = [...new Set([...status.completedBatchIndices, batchIndex])].sort((a, b) => a - b);
+  if (!checkpoint) throw fail('RUN_STATUS_CHECKPOINT_INCONSISTENT', 'validated checkpoint evidence is required');
+  const normalizedCheckpoint = checkpoint;
+  if (normalizedCheckpoint.batchIndex !== batchIndex) throw fail('RUN_STATUS_CHECKPOINT_INCONSISTENT', 'checkpoint batch index mismatch');
+  const batchCheckpoints = [...status.batchCheckpoints, normalizedCheckpoint];
   const allDone = completedBatchIndices.length === status.totalBatches;
-  return assertStatus({ ...status, completedBatchIndices, runState: allDone ? status.runState : 'RUNNING', updatedAt: now });
+  return assertStatus({ ...status, completedBatchIndices, batchCheckpoints, runState: allDone ? status.runState : 'RUNNING', updatedAt: now });
 }
 
 export function withBlocked(status, blockedReasonCode, { now = new Date().toISOString() } = {}) {
