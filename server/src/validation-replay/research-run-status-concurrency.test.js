@@ -724,7 +724,14 @@ test('finalize发布后(release)：tombstone一旦落地，第三方才可合法
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 
-test('finalize自身核验(release)：若reservation在finalize执行前被非法替换(协议不应允许的伪造场景)，finalize必须检测到并安全放弃，不得盲目声称转换成功', () => {
+// 独立复审第三轮：round2最初把"身份不匹配"统一处理为undo，但finalize换入的是
+// tombstone——一旦finalize自己的exchange提交，它就是无条件、真实发布的，从此刻起
+// 可能已经被第三方合法接管。若finalize在"发现displaced不是自己的reservation"时
+// 仍然对lockPath执行undo，就会把该第三方从lockPath换走——这正是round2被拒绝的
+// 同一类竞态，只是从reserve分支转移到了finalize分支。修复后finalize绝不对lockPath
+// 执行undo：只允许discard自己的私有candidatePath并抛出一个明确的不变量违反错误，
+// lockPath本身(不论是刚发布的tombstone还是已被第三方合法接管的新claim)保持不变。
+test('finalize自身核验(release)：reservation在finalize执行前被非法替换(协议不应允许的伪造场景)时，finalize必须检测到并安全放弃——但不得对已发布的tombstone执行undo', () => {
   const rootPath = root();
   try {
     const runIdentity = identity();
@@ -744,10 +751,88 @@ test('finalize自身核验(release)：若reservation在finalize执行前被非�
       }
     };
 
-    const released = releaseResearchRunStatusLockForTest(oldLock, hooks);
-    assert.equal(released, false, '被替换成非我方reservation的对象时，finalize必须安全放弃，不得声称release成功');
-    const stillForged = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
-    assert.equal(stillForged.ownerToken, 'f'.repeat(64), '带外伪造内容必须原样保留，未被我方进一步破坏');
+    assert.throws(() => releaseResearchRunStatusLockForTest(oldLock, hooks),
+      error => error.code === 'RUN_STATUS_LOCK_FINALIZE_IDENTITY_VIOLATION');
+    // finalize的renameat2本身是无条件的：tombstone已经真实发布到lockPath。修复后
+    // finalize不再对已发布的lockPath执行不安全的undo(那样才会破坏后来的合法owner)，
+    // 所以lockPath此刻是我方刚发布的tombstone，而不是(不安全地)恢复成被替换的伪造
+    // 内容。
+    const afterThrow = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
+    assert.equal(afterThrow.released, true, 'lockPath必须是已发布的tombstone，不得被不安全地undo回伪造内容');
+    const dir = path.dirname(oldLock.lockPath);
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `不得残留任何私有exchange候选文件: ${JSON.stringify(stray)}`);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('finalize身份不匹配且第三方已合法接管(quarantine)：不得把第三方从lockPath换走，不得误报成功，不得残留私有exchange文件', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const { dir, lockPath } = lockPathFor(rootPath, runIdentity);
+    publishRawLock(lockPath, validOwnerJson({ ownerToken: 'a'.repeat(64), pid: 99999999 }));
+    age(lockPath, 60_000);
+
+    let cLock = null;
+    const hooks = {
+      finalize: {
+        beforeExchange: () => {
+          // 模拟带外/异常替换：finalize自己的renameat2执行前，reservation被替换
+          // 为B(正常协议下不可能发生，这里是刻意构造的防御性场景，复现独立复审
+          // 指出的确切危险时序)。
+          unlinkSync(lockPath);
+          publishRawLock(lockPath, validOwnerJson({ ownerToken: 'b'.repeat(64), pid: 99999999 }));
+        },
+        afterExchange: () => {
+          // finalize自己的exchange已经无条件提交：tombstone(不论被换出的是B还是
+          // 我方reservation，exchange本身都会执行)现在真实地位于lockPath。第三方
+          // C此刻通过真实acquireResearchRunStatusLock合法接管这个刚发布的tombstone
+          // ——这是协议允许的正常后续，不是竞态。
+          cLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 10 });
+        }
+      }
+    };
+
+    assert.throws(() => quarantinePublishedLockForTest(lockPath, dir, 10, hooks),
+      error => error.code === 'RUN_STATUS_LOCK_FINALIZE_IDENTITY_VIOLATION');
+    assert.notEqual(cLock, null, 'C必须已经合法接管tombstone');
+    assert.equal(existsSync(lockPath), true, 'lockPath必须仍然存在');
+    const stillC = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(stillC.ownerToken, cLock.ownerToken, 'lockPath必须仍是C的活跃claim，未被身份不匹配处理换走/覆盖/删除');
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `不得残留任何私有exchange候选文件: ${JSON.stringify(stray)}`);
+    assert.equal(releaseResearchRunStatusLock(cLock), true);
+  } finally { rmSync(rootPath, { recursive: true, force: true }); }
+});
+
+test('finalize身份不匹配且第三方已合法接管(release)：不得把第三方从lockPath换走，不得误报成功，不得残留私有exchange文件', () => {
+  const rootPath = root();
+  try {
+    const runIdentity = identity();
+    const oldLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 50 });
+    const dir = path.dirname(oldLock.lockPath);
+
+    let cLock = null;
+    const hooks = {
+      finalize: {
+        beforeExchange: () => {
+          unlinkSync(oldLock.lockPath);
+          publishRawLock(oldLock.lockPath, validOwnerJson({ ownerToken: 'b'.repeat(64), pid: 99999999 }));
+        },
+        afterExchange: () => {
+          cLock = acquireResearchRunStatusLock(rootPath, runIdentity, { lockTimeoutMs: 500, staleLockMs: 10 });
+        }
+      }
+    };
+
+    assert.throws(() => releaseResearchRunStatusLockForTest(oldLock, hooks),
+      error => error.code === 'RUN_STATUS_LOCK_FINALIZE_IDENTITY_VIOLATION');
+    assert.notEqual(cLock, null, 'C必须已经合法接管tombstone');
+    const stillC = JSON.parse(readFileSync(oldLock.lockPath, 'utf8'));
+    assert.equal(stillC.ownerToken, cLock.ownerToken, 'lockPath必须仍是C的活跃claim，未被身份不匹配处理换走/覆盖/删除');
+    const stray = readdirSync(dir).filter(name => name.includes('.tmp.') || name.includes('.exchange.'));
+    assert.deepEqual(stray, [], `不得残留任何私有exchange候选文件: ${JSON.stringify(stray)}`);
+    assert.equal(releaseResearchRunStatusLock(cLock), true);
   } finally { rmSync(rootPath, { recursive: true, force: true }); }
 });
 

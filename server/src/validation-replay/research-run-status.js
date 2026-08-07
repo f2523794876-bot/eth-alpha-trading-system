@@ -570,19 +570,32 @@ function discardCandidate(candidatePath) {
 // path, immune to further tampering), whether the exchange should stand.
 // Returns `{ exchanged: true }` on success (lockPath now holds our
 // candidate; candidatePath now holds the displaced object, not yet
-// discarded -- caller inspects/discards it) or `{ exchanged: false }` if
-// undone (candidatePath restored to exactly its pre-exchange state; lockPath
-// untouched from any outside observer's perspective across the whole
-// sequence). The undo is unconditionally safe -- not best-effort -- whenever
-// the exchanged-in candidate was itself non-reclaimable (a live reservation
-// or a direct active claim): nothing else could have taken lockPath in the
-// interim, so swapping back restores exactly what was there. If this ever
-// fires on the *finalize* step (converting a reservation to its tombstone),
-// reaching it at all means our own just-installed, supposedly-untouchable
-// reservation was somehow displaced -- which the caller (see
-// finalizeReservationAsTombstone) must treat as a failed conversion, not
-// paper over by assuming the undo alone made everything consistent again.
-function exchangeAndVerify(lockPath, dir, candidatePath, acceptDisplaced, hooks = {}) {
+// discarded -- caller inspects/discards it).
+//
+// On rejection (the read-back failed, or acceptDisplaced returned false),
+// this function does *not* decide what to do -- it calls
+// `onRejected({ displacedOwner, displacedStat, readError })` and returns (or
+// throws) whatever that callback does. This split exists because "is it safe
+// to swap back?" depends entirely on whether the *candidate we just
+// exchanged in* was reclaimable by a correct competitor during the window
+// between the syscall and this verification -- and that differs by caller:
+//   - A reservation or a direct active claim (acquireStatusLock's own
+//     candidate) is *not* reclaimable: nothing else could have touched
+//     lockPath in the interim, so undoing is unconditionally safe and
+//     restores exactly what was there. Callers with this property pass an
+//     `onRejected` that calls undoExchange.
+//   - A tombstone (the finalize step) *is* reclaimable by design -- the
+//     moment it lands at lockPath, a legitimate third owner may already have
+//     exchanged it away for their own claim before this function ever gets
+//     here. Blindly swapping lockPath's *current* contents back in that case
+//     would tear that legitimate claim back out -- this is the exact defect
+//     independent review found in round 2 (there, applied to the reserve
+//     step publishing a tombstone directly; here it is the same trap
+//     reachable through finalize's own rejection path if it naively reused
+//     the same undo). Callers with this property (see
+//     finalizeReservationAsTombstone) must *not* call undoExchange -- they
+//     may only leave lockPath alone and surface a loud diagnostic.
+function exchangeAndVerify(lockPath, dir, candidatePath, acceptDisplaced, onRejected, hooks = {}) {
   if (!renameat2.available) {
     throw fail('RUN_STATUS_ATOMIC_EXCHANGE_UNAVAILABLE',
       `renameat2(RENAME_EXCHANGE) is required to safely displace an existing lock and is not available: ${renameat2.getUnavailableReason()}`);
@@ -600,27 +613,27 @@ function exchangeAndVerify(lockPath, dir, candidatePath, acceptDisplaced, hooks 
   // else can have touched candidatePath, ever -- its name is derived from a
   // CSPRNG token nobody else has seen -- so this read is definitive, not
   // advisory.
-  let displacedStat, displacedOwner;
+  let displacedStat, displacedOwner, readError = null;
   try {
     const fd = fs.openSync(candidatePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     try { ({ stat: displacedStat, owner: displacedOwner } = readOwnerFromFd(fd)); }
     finally { fs.closeSync(fd); }
   } catch (error) {
-    undoExchange(candidatePath, lockPath, dir);
-    throw fail('RUN_STATUS_LOCK_QUARANTINE_IDENTITY_CHANGED', `displaced lock object failed verification: ${error.message}`);
+    readError = error;
   }
 
-  if (!acceptDisplaced(displacedOwner, displacedStat)) {
-    undoExchange(candidatePath, lockPath, dir);
-    return { exchanged: false, reason: 'identity-mismatch', displacedOwner };
+  if (readError || !acceptDisplaced(displacedOwner, displacedStat)) {
+    return onRejected({ displacedOwner, displacedStat, readError });
   }
 
   fsyncDirectory(dir);
   return { exchanged: true, displacedOwner, displacedStat };
 }
 
-// See exchangeAndVerify's doc comment for exactly when this is
-// unconditionally safe. If the undo itself fails (e.g. the addon becomes
+// Only ever safe to call when the exchanged-in candidate was itself
+// non-reclaimable across the whole window since the exchange committed (see
+// exchangeAndVerify's doc comment) -- reserve and acquireStatusLock's direct
+// claim, never finalize. If the undo itself fails (e.g. the addon becomes
 // unavailable mid-sequence, which should not happen but is not assumed
 // away), that is surfaced loudly rather than silently leaving the displaced
 // object stranded and unlogged.
@@ -632,6 +645,16 @@ function undoExchange(candidatePath, lockPath, dir) {
     throw fail('RUN_STATUS_LOCK_EXCHANGE_UNDO_FAILED',
       `failed to restore displaced lock object after a failed verification (it remains intact, un-deleted, at ${candidatePath}): ${error.message}`);
   }
+}
+
+// Shared rejection handler for exchanges whose candidate is provably
+// non-reclaimable (reserve; acquireStatusLock's direct claim): swap back
+// (unconditionally safe here) and report failure without silently
+// swallowing a corrupt/unreadable displaced object.
+function undoAndReportRejected(candidatePath, lockPath, dir, { readError }) {
+  undoExchange(candidatePath, lockPath, dir);
+  if (readError) throw fail('RUN_STATUS_LOCK_QUARANTINE_IDENTITY_CHANGED', `displaced lock object failed verification: ${readError.message}`);
+  return { exchanged: false, reason: 'identity-mismatch' };
 }
 
 // Phase 1 of quarantine/release: install a reservation (ownerContentFor() --
@@ -646,7 +669,8 @@ function reserveOverLock(lockPath, dir, acceptDisplaced, hooks = {}) {
   const reservationToken = newOwnerToken();
   const reservePath = exchangeCandidatePathFor(lockPath);
   prepareCandidate(reservePath, ownerContentFor(reservationToken));
-  const result = exchangeAndVerify(lockPath, dir, reservePath, acceptDisplaced, hooks);
+  const result = exchangeAndVerify(lockPath, dir, reservePath, acceptDisplaced,
+    rejection => undoAndReportRejected(reservePath, lockPath, dir, rejection), hooks);
   discardCandidate(reservePath);
   return { ...result, reservationToken };
 }
@@ -656,10 +680,29 @@ function reserveOverLock(lockPath, dir, acceptDisplaced, hooks = {}) {
 // tombstone. Independently verifies what this second exchange displaced was
 // really our own reservation, by its distinct ownerToken -- never assumed
 // just because phase 1 succeeded.
+//
+// Unlike reserveOverLock, rejection here does *not* undo (see
+// exchangeAndVerify's doc comment for why: the tombstone this step just
+// published is, by design, immediately reclaimable, so lockPath's current
+// contents may already belong to a legitimate third owner by the time this
+// runs). If what we displaced was not our own reservation, that is an
+// invariant violation -- something outside this operation's own two
+// exchanges touched our supposedly-untouchable reservation before we could
+// finalize it, which should be impossible under the protocol -- and it is
+// surfaced as a loud, distinct, thrown error rather than papered over as an
+// ordinary "operation returned false" outcome (the tombstone's publication
+// itself is not, and cannot safely be, retracted).
 function finalizeReservationAsTombstone(lockPath, dir, reservationToken, precedingOwnerToken, hooks = {}) {
   const tombstonePath = exchangeCandidatePathFor(lockPath);
   prepareCandidate(tombstonePath, tombstoneContentFor(precedingOwnerToken));
-  const result = exchangeAndVerify(lockPath, dir, tombstonePath, owner => owner.ownerToken === reservationToken, hooks);
+  const onRejected = ({ displacedOwner, readError }) => {
+    discardCandidate(tombstonePath);
+    throw fail('RUN_STATUS_LOCK_FINALIZE_IDENTITY_VIOLATION', readError
+      ? `reservation finalize displaced an unreadable/invalid object instead of its own reservation (protocol invariant violated): ${readError.message}`
+      : `reservation finalize displaced ownerToken=${displacedOwner?.ownerToken} instead of its own reservation ${reservationToken} ` +
+        '(protocol invariant violated) -- lockPath left untouched and not rolled back, because by this point it may already hold a legitimately reclaimed owner');
+  };
+  const result = exchangeAndVerify(lockPath, dir, tombstonePath, owner => owner.ownerToken === reservationToken, onRejected, hooks);
   discardCandidate(tombstonePath);
   return result;
 }
@@ -732,7 +775,8 @@ function acquireStatusLock(dir, identity, { lockTimeoutMs = 5_000, staleLockMs =
     }
 
     const result = exchangeAndVerify(lockPath, dir, claimPath,
-      (owner, stat) => classifyOwnerDisposition(owner, stat, staleLockMs).status === 'stale-with-owner');
+      (owner, stat) => classifyOwnerDisposition(owner, stat, staleLockMs).status === 'stale-with-owner',
+      rejection => undoAndReportRejected(claimPath, lockPath, dir, rejection));
     if (!result.exchanged) {
       discardCandidate(claimPath);
       if (Date.now() >= deadline) throw fail('RUN_STATUS_LOCK_TIMEOUT', 'timed out acquiring run status lock');
