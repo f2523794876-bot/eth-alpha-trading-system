@@ -110,12 +110,30 @@ test('重复执行、输入行顺序和对象插入顺序不改变canonical D8�
   assert.notEqual(a.input.scorecard.horizons['24h'].model.postCostExpectedReturn, a.input.scorecard.horizons['24h'].model.preCostExpectedReturn);
 });
 
-test('空数据与权威model NOT_EVALUABLE必须fail-closed，不得默认零或自行变为可评估', () => {
+test('P1 effectiveTest=0生成schema合法、确定且可审计的DATA_GATE_FAILED，不伪装为FORMAL成功', () => {
   const scorecardResult = buildDeterministicScorecard([], { feeBps: 0, slippageBps: 0, trainEnd, validationEnd }, { validationRunFinishedAt: finished });
   const validationRunId = randomUUID();
-  assert.throws(() => assembleD8InputFromResearchRows({ scorecardResult, validationRunId, evaluationVersion: 'empty', evaluatedAt: finished,
-    thresholds, databaseAuditTrail: { validationRunId, evaluationVersion: 'empty', evaluatedAt: finished } }),
-  error => error.code === 'D8_AUTHORITATIVE_NOT_EVALUABLE');
+  const args = { scorecardResult, validationRunId, evaluationVersion: 'empty', evaluatedAt: finished, thresholds,
+    databaseAuditTrail: { schemaVersion: 'v1.4d-audit-trail/1', validationRunId, evaluationVersion: 'empty', evaluatedAt: finished,
+      validationRunStatus: 'SUCCEEDED', authenticityGateStatus: 'PASSED', manifestCoverage: 0, featureCoverage: 0,
+      datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`, manifestContentHash: 'b'.repeat(64), backfillBatchIds: [], vintageIds: [],
+      generationSummary: { expected: 0, attempted: 0, inserted: 0, reusedIdentical: 0, conflicts: 0, blocked: 0, evaluated: 0 } } };
+  const input = assembleD8InputFromResearchRows(args);
+  const repeat = assembleD8InputFromResearchRows(args);
+  assert.equal(canonicalJson(input), canonicalJson(repeat));
+  for (const horizon of ['24h', '72h']) {
+    assert.deepEqual(input.scorecard.horizons[horizon].model, { directionCorrectCount: 0, macroF1: 0,
+      preCostExpectedReturn: 0, postCostExpectedReturn: 0 });
+    assert.equal(input.sampleAccounting[horizon].effectiveTest, 0);
+    for (const baseline of Object.values(input.baselineAvailabilityInput[horizon])) assert.equal(baseline.status, 'NOT_EVALUABLE');
+  }
+  const decision = evaluateGoNoGo(input);
+  assert.equal(decision.overall.status, 'DATA_GATE_FAILED');
+  for (const horizon of ['24h', '72h']) {
+    assert.ok(decision.horizonResults[horizon].reasonCodes.includes('EFFECTIVE_TEST_ZERO'));
+    assert.equal(decision.horizonResults[horizon].wilson95.lower, null);
+    assert.equal(decision.horizonResults[horizon].wilson95.upper, null);
+  }
 });
 
 test('单类别输入保持权威可评估性/不可评估性，不生成未授权补类统计', () => {

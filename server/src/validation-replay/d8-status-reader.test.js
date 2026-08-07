@@ -10,7 +10,7 @@ import path from 'node:path';
 import { readD8DisplayStatus } from './d8-status-reader.js';
 import { findLatestFormalArtifactDir } from './d8-artifact-discovery.js';
 import { publishArtifact } from './artifact-publisher.js';
-import { writeRunStatus, initialRunStatus, withBlocked, withFailed } from './research-run-status.js';
+import { createResearchRunIdentity, writeRunStatus, initialRunStatus, withBlocked, withFailed } from './research-run-status.js';
 import { evaluateGoNoGo } from '../formal-research/go-no-go-evaluator.js';
 import { canonicalJson } from '../formal-research/canonical-json.js';
 
@@ -25,6 +25,10 @@ const GO_DECISION = evaluateGoNoGo(GO_INPUT);
 
 function sha256Hex(text) { return createHash('sha256').update(text, 'utf8').digest('hex'); }
 function makeRoot() { return mkdtempSync(path.join(os.tmpdir(), 'd8-status-reader-')); }
+function initial(validationRunId, totalBatches, now) {
+  return initialRunStatus({ runIdentity: createResearchRunIdentity({ validationRunId, evaluationVersion: 'display-status-test',
+    artifactMode: 'FORMAL', config: { test: 'd8-status-reader' } }), totalBatches, ...(now ? { now } : {}) });
+}
 
 function governanceRef(validationRunId) {
   const thresholdsSha256 = sha256Hex(canonicalJson(GO_INPUT.thresholds));
@@ -86,7 +90,7 @@ test('RUNNING：首次运行、尚无任何已发布artifact时也必须能观�
   const statusRoot = makeRoot();
   try {
     const validationRunId = randomUUID();
-    writeRunStatus(statusRoot, initialRunStatus({ validationRunId, artifactMode: 'FORMAL', totalBatches: 5 }));
+    writeRunStatus(statusRoot, initial(validationRunId, 5));
     const result = readD8DisplayStatus({ artifactRoot: root, statusRoot });
     assert.equal(result.state, 'RUNNING');
     assert.equal(result.progress.totalBatches, 5);
@@ -100,7 +104,7 @@ test('RUNNING：已有一次GO发布之后，同一validationRunId的run-status�
   try {
     const validationRunId = randomUUID();
     publishGo(root, validationRunId);
-    let status = initialRunStatus({ validationRunId, artifactMode: 'FORMAL', totalBatches: 4 });
+    let status = initial(validationRunId, 4);
     writeRunStatus(statusRoot, status);
     const result = readD8DisplayStatus({ artifactRoot: root, statusRoot });
     assert.equal(result.state, 'RUNNING');
@@ -114,7 +118,7 @@ test('BLOCKED：run-status为BLOCKED时展示阻塞原因，不展示任何虚�
   try {
     const validationRunId = randomUUID();
     publishGo(root, validationRunId);
-    let status = initialRunStatus({ validationRunId, artifactMode: 'FORMAL', totalBatches: 4 });
+    let status = initial(validationRunId, 4);
     status = withBlocked(status, 'GOVERNANCE_AUTHORIZATION_MISSING');
     writeRunStatus(statusRoot, status);
     const result = readD8DisplayStatus({ artifactRoot: root, statusRoot });
@@ -145,7 +149,7 @@ test('FAILED（编排失败，非artifact读取失败）：runState为FAILED时�
   const statusRoot = makeRoot();
   try {
     const validationRunId = randomUUID();
-    let status = initialRunStatus({ validationRunId, artifactMode: 'FORMAL', totalBatches: 2 });
+    let status = initial(validationRunId, 2);
     status = withFailed(status, 'ORCHESTRATOR_PUBLISH_THREW');
     writeRunStatus(statusRoot, status);
     const result = readD8DisplayStatus({ artifactRoot: root, statusRoot });
@@ -157,8 +161,8 @@ test('FAILED（编排失败，非artifact读取失败）：runState为FAILED时�
 test('findMostRecentRunStatus：多个run-status文件并存时只取updatedAt最新的一条', () => {
   const statusRoot = makeRoot();
   try {
-    const older = initialRunStatus({ validationRunId: randomUUID(), artifactMode: 'FORMAL', totalBatches: 3, now: '2026-01-01T00:00:00.000Z' });
-    const newer = initialRunStatus({ validationRunId: randomUUID(), artifactMode: 'FORMAL', totalBatches: 7, now: '2026-01-08T00:00:00.000Z' });
+    const older = initial(randomUUID(), 3, '2026-01-01T00:00:00.000Z');
+    const newer = initial(randomUUID(), 7, '2026-01-08T00:00:00.000Z');
     writeRunStatus(statusRoot, older);
     writeRunStatus(statusRoot, newer);
     const root = makeRoot();

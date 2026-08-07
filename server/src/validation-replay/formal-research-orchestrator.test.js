@@ -2,13 +2,13 @@
 // 真实文件系统（mkdtemp隔离临时目录），真实驱动T13/T14/T16/T17/T18，不mock任何一层。
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, lstatSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, lstatSync, mkdirSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { runFormalResearchOrchestrator } from './formal-research-orchestrator.js';
 import { readArtifactPair, SIDECAR_FILE_NAME } from './artifact-reader.js';
-import { readRunStatus, writeRunStatus, initialRunStatus, withBatchCompleted } from './research-run-status.js';
+import { createResearchRunIdentity, writeRunStatus, initialRunStatus, withBatchCompleted } from './research-run-status.js';
 import { canonicalJson } from '../formal-research/canonical-json.js';
 
 const CONTRACT_TEXT = readFileSync(new URL('../../../V1_4D_FORMAL_RESEARCH_EXECUTION_CONTRACT_V8_FINAL_R3.md', import.meta.url), 'utf8');
@@ -79,6 +79,16 @@ function baseOptions(root, statusRoot, validationRunId, overrides = {}) {
   };
 }
 
+function identityForOptions(options) {
+  return createResearchRunIdentity({ validationRunId: options.validationRunId, evaluationVersion: options.evaluationVersion,
+    artifactMode: options.artifactMode, config: { source: 'MEMORY', scorecardOptions: options.scorecardOptions,
+      validationRunFinishedAt: options.validationRunFinishedAt, thresholds: options.thresholds ?? null,
+      expectedThresholdsSha256: options.expectedThresholdsSha256 ?? null,
+      governanceRecordSha256: options.governanceRecord == null ? null : sha256Hex(canonicalJson(options.governanceRecord)),
+      manifestContentHash: options.manifestContentHash ?? null,
+      batchSize: null, batchPlanSha256: sha256Hex(canonicalJson(options.batches)) } });
+}
+
 test('DRY_RUN三批次首次运行：run-status COMPLETED，D7 artifact真实可独立回读，三批progress全部记录', () => {
   const root = makeRoot();
   const statusRoot = makeRoot();
@@ -104,8 +114,6 @@ test('幂等重放：COMPLETED后再次调用直接短路，不重新发布、�
   try {
     const validationRunId = randomUUID();
     const opts = baseOptions(root, statusRoot, validationRunId);
-    const before = readRunStatus(statusRoot, 'DRY_RUN', validationRunId);
-    assert.equal(before, null);
     const result = runFormalResearchOrchestrator(opts);
     assert.equal(result.runStatus.runState, 'COMPLETED');
     const dir = targetDirFor(root, 'dry-run', validationRunId, 'v1.4d-eval-orchestrator-drill');
@@ -118,13 +126,59 @@ test('幂等重放：COMPLETED后再次调用直接短路，不重新发布、�
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });
 
+test('P0完整run identity拒绝不同evaluation/config和旧状态，精确相同identity才允许resume', () => {
+  const root = makeRoot(), statusRoot = makeRoot();
+  try {
+    const validationRunId = randomUUID();
+    const opts = baseOptions(root, statusRoot, validationRunId);
+    assert.equal(runFormalResearchOrchestrator(opts).published, true);
+    assert.throws(() => runFormalResearchOrchestrator({ ...opts, evaluationVersion: 'other-evaluation' }),
+      error => error.code === 'RUN_STATUS_IDENTITY_MISMATCH');
+    assert.throws(() => runFormalResearchOrchestrator({ ...opts, scorecardOptions: { feeBps: 6, slippageBps: 3 } }),
+      error => error.code === 'RUN_STATUS_IDENTITY_MISMATCH');
+    const otherRoot = makeRoot();
+    try {
+      const legacyId = randomUUID();
+      const legacyDir = path.join(otherRoot, 'run-status', 'dry-run');
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(path.join(legacyDir, `${legacyId}.status.json`), '{}');
+      assert.throws(() => runFormalResearchOrchestrator(baseOptions(root, otherRoot, legacyId)),
+        error => error.code === 'RUN_STATUS_LEGACY_REJECTED');
+    } finally { rmSync(otherRoot, { recursive: true, force: true }); }
+  } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+});
+
+test('P0 COMPLETED快捷路径必须回读artifact pair；缺失或身份/hash不一致即BLOCKED', () => {
+  for (const damage of ['missing', 'mismatch']) {
+    const root = makeRoot(), statusRoot = makeRoot();
+    try {
+      const validationRunId = randomUUID();
+      const opts = baseOptions(root, statusRoot, validationRunId);
+      assert.equal(runFormalResearchOrchestrator(opts).published, true);
+      const dir = targetDirFor(root, 'dry-run', validationRunId, opts.evaluationVersion);
+      if (damage === 'missing') rmSync(path.join(dir, SIDECAR_FILE_NAME));
+      else {
+        const sidecarPath = path.join(dir, SIDECAR_FILE_NAME);
+        const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8'));
+        sidecar.fullMainArtifactSha256 = 'f'.repeat(64);
+        writeFileSync(sidecarPath, canonicalJson(sidecar));
+      }
+      const resumed = runFormalResearchOrchestrator(opts);
+      assert.equal(resumed.published, false);
+      assert.equal(resumed.runStatus.runState, 'BLOCKED');
+      assert.equal(resumed.error.code, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID');
+    } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+  }
+});
+
 test('批次计划不一致的resume：totalBatches与已记录run-status不符时拒绝，不静默改写计划', () => {
   const root = makeRoot();
   const statusRoot = makeRoot();
   try {
     const validationRunId = randomUUID();
     // 手工模拟"中断于3批计划、只完成批次0"的checkpoint。
-    let seeded = initialRunStatus({ validationRunId, artifactMode: 'DRY_RUN', totalBatches: 3 });
+    const seededOptions = baseOptions(root, statusRoot, validationRunId);
+    let seeded = initialRunStatus({ runIdentity: identityForOptions(seededOptions), totalBatches: 3 });
     const firstBatch = syntheticBatches()[0];
     const checkpointHash = createHash('sha256').update(canonicalJson(firstBatch), 'utf8').digest('hex');
     seeded = withBatchCompleted(seeded, 0, { checkpoint: { batchIndex: 0, rowCount: firstBatch.scorecardRows.length, cursor: null, sha256: checkpointHash } });
@@ -133,7 +187,7 @@ test('批次计划不一致的resume：totalBatches与已记录run-status不符�
     const opts = baseOptions(root, statusRoot, validationRunId, { batches: syntheticBatches().slice(0, 2) });
     assert.throws(
       () => runFormalResearchOrchestrator(opts),
-      error => error.code === 'ORCHESTRATOR_BATCH_PLAN_MISMATCH'
+      error => error.code === 'RUN_STATUS_IDENTITY_MISMATCH'
     );
     // 用正确的3批计划重放：必须能安全续跑并完成，且批次0不会被"重复计入"导致计数错误。
     const correctResume = runFormalResearchOrchestrator(baseOptions(root, statusRoot, validationRunId));
@@ -220,6 +274,41 @@ test('真实结构DRY_RUN：无GO模板/无assemble hook，逐行数据组装D8�
   } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });
 
+test('P1零有效TEST：DRY_RUN可审计地产生DATA_GATE_FAILED，FORMAL即使授权有效也不得发布成功artifact', () => {
+  for (const artifactMode of ['DRY_RUN', 'FORMAL']) {
+    const root = makeRoot(), statusRoot = makeRoot();
+    try {
+      const validationRunId = randomUUID();
+      const thresholdHash = sha256Hex(canonicalJson(GO_INPUT.thresholds));
+      const governanceRecord = artifactMode === 'FORMAL' ? {
+        schemaVersion: 'v1.4d-governance-authorization/1', hashAlgorithm: 'SHA-256', validationRunId,
+        thresholdsSha256: thresholdHash, authorizationScope: 'FORMAL_RESEARCH_EXECUTION', decision: 'APPROVE',
+        authorizedByRole: 'CHAIRMAN', authorizedAt: '2026-01-08T00:05:00.000Z'
+      } : null;
+      const opts = baseOptions(root, statusRoot, validationRunId, {
+        artifactMode, batches: [{ batchIndex: 0, governanceRows: [], scorecardRows: [] }], assembleD8Input: null,
+        scorecardOptions: { feeBps: 5, slippageBps: 3, trainEnd: Date.parse('2026-01-04T00:00:00Z'), validationEnd: Date.parse('2026-01-07T00:00:00Z') },
+        thresholds: GO_INPUT.thresholds, expectedThresholdsSha256: thresholdHash, governanceRecord,
+        databaseAuditTrail: { schemaVersion: 'v1.4d-audit-trail/1', validationRunId,
+          evaluationVersion: 'v1.4d-eval-orchestrator-drill', evaluatedAt: '2026-01-08T00:05:00.000Z',
+          validationRunStatus: 'SUCCEEDED', authenticityGateStatus: 'PASSED', manifestCoverage: 0, featureCoverage: 0,
+          datasetVersion: `v1.4d-sha256-${'a'.repeat(64)}`, manifestContentHash: 'c'.repeat(64), backfillBatchIds: [], vintageIds: [],
+          generationSummary: { expected: 0, attempted: 0, inserted: 0, reusedIdentical: 0, conflicts: 0, blocked: 0, evaluated: 0 } }
+      });
+      const result = runFormalResearchOrchestrator(opts);
+      assert.equal(result.decision.overall.status, 'DATA_GATE_FAILED');
+      assert.ok(result.decision.horizonResults['24h'].reasonCodes.includes('EFFECTIVE_TEST_ZERO'));
+      if (artifactMode === 'DRY_RUN') assert.equal(result.published, true);
+      else {
+        assert.equal(result.published, false);
+        assert.equal(result.runStatus.runState, 'BLOCKED');
+        assert.equal(result.error.code, 'ORCHESTRATOR_FORMAL_DATA_GATE_FAILED');
+        assert.equal(readArtifactPair(targetDirFor(root, 'formal', validationRunId, opts.evaluationVersion)).readerStatus, 'REJECTED');
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
+  }
+});
+
 test('scorecard失败不提前写checkpoint，assembly失败为BLOCKED，buildArtifactCore失败为FAILED且均不发布', () => {
   for (const stage of ['scorecard', 'assembly', 'core']) {
     const root = makeRoot();
@@ -243,7 +332,8 @@ test('scorecard失败不提前写checkpoint，assembly失败为BLOCKED，buildAr
 });
 
 test('不连续checkpoint在状态机边界立即拒绝', () => {
-  const status = initialRunStatus({ validationRunId: randomUUID(), artifactMode: 'DRY_RUN', totalBatches: 2 });
+  const status = initialRunStatus({ runIdentity: createResearchRunIdentity({ validationRunId: randomUUID(), evaluationVersion: 'eval',
+    artifactMode: 'DRY_RUN', config: { test: true } }), totalBatches: 2 });
   assert.throws(() => withBatchCompleted(status, 1, { checkpoint: { batchIndex: 1, rowCount: 0, cursor: null, sha256: 'a'.repeat(64) } }),
     error => error.code === 'RUN_STATUS_CHECKPOINT_INCONSISTENT');
 });

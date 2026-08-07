@@ -3,6 +3,10 @@
 // Database evidence is authoritative; caller-supplied audit claims are never
 // accepted as a substitute for persisted manifest, lineage, vintage or status.
 
+import { canonicalJsonHash } from '../domain/hash.js';
+import { classifyDirection } from '../forecast/threshold-formula.js';
+import { computeRowContentHash } from './canonical-manifest-content.js';
+
 const HORIZONS = new Set(['24h', '72h']);
 const DIRECTIONS = new Set(['UP', 'DOWN', 'RANGE']);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -48,6 +52,79 @@ function bool(value, field, { nullable = false } = {}) {
 function text(value, field) {
   if (typeof value !== 'string' || !value.trim()) throw fail('FORMAL_RESEARCH_DATABASE_ROW_INVALID', `${field} must be non-empty text`);
   return value;
+}
+
+function integer(value, field) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) throw fail('FORMAL_RESEARCH_DATABASE_ROW_INVALID', `${field} must be a safe integer`);
+  return number;
+}
+
+function canonicalMember(member, index) {
+  object(member, `manifest.manifestMembers[${index}]`);
+  const normalized = {
+    symbol: member.symbol == null ? null : text(member.symbol, `manifest.member[${index}].symbol`),
+    interval: text(member.intervalName ?? member.interval, `manifest.member[${index}].interval`),
+    marketType: member.marketType == null ? null : text(member.marketType, `manifest.member[${index}].marketType`),
+    source: member.source == null ? null : text(member.source, `manifest.member[${index}].source`),
+    openTime: epoch(member.openTime, `manifest.member[${index}].openTime`),
+    closeTime: member.closeTime == null ? null : epoch(member.closeTime, `manifest.member[${index}].closeTime`),
+    revisionNumber: integer(member.revisionNumber, `manifest.member[${index}].revisionNumber`),
+    vintageId: text(member.vintageId, `manifest.member[${index}].vintageId`),
+    rowContentHash: text(member.rowContentHash, `manifest.member[${index}].rowContentHash`)
+  };
+  if (!SHA256.test(normalized.rowContentHash)) throw fail('FORMAL_RESEARCH_MANIFEST_MEMBER_INVALID', 'manifest member row content hash is invalid');
+  return normalized;
+}
+
+function canonicalManifestMembers(value) {
+  const members = array(value, 'manifest.manifestMembers', { nonEmpty: true }).map(canonicalMember);
+  const ids = members.map(member => member.vintageId);
+  if (new Set(ids).size !== ids.length) throw fail('FORMAL_RESEARCH_MANIFEST_MEMBER_DUPLICATE', 'manifest contains duplicate vintage identity');
+  return members.sort((a, b) => a.vintageId.localeCompare(b.vintageId));
+}
+
+function verifyConsumedBar(bar, membersByVintage, field) {
+  object(bar, field);
+  const vintageId = text(bar.vintageId, `${field}.vintageId`);
+  const member = membersByVintage.get(vintageId);
+  if (!member) throw fail('FORMAL_RESEARCH_MANIFEST_MEMBER_ROGUE', `${field} is not a frozen manifest member`);
+  const comparisons = [];
+  if (bar.symbol != null) comparisons.push(['symbol', bar.symbol, member.symbol]);
+  if (bar.interval != null) comparisons.push(['interval', bar.interval, member.interval]);
+  if (bar.marketType != null) comparisons.push(['marketType', bar.marketType, member.marketType]);
+  if ((bar.source ?? bar.sourceId) != null) {
+    const source = (bar.source ?? bar.sourceId) === 'binance-spot-rest' ? 'binance-spot' : (bar.source ?? bar.sourceId);
+    comparisons.push(['source', source, member.source]);
+  }
+  if (bar.openTime != null) comparisons.push(['openTime', epoch(bar.openTime, `${field}.openTime`), member.openTime]);
+  if (bar.revisionNumber != null) comparisons.push(['revisionNumber', integer(bar.revisionNumber, `${field}.revisionNumber`), member.revisionNumber]);
+  if (member.closeTime !== null && bar.closeTime != null) comparisons.push(['closeTime', epoch(bar.closeTime, `${field}.closeTime`), member.closeTime]);
+  if (bar.rowContentHash != null) comparisons.push(['rowContentHash', bar.rowContentHash, member.rowContentHash]);
+  if (comparisons.some(([, actual, expected]) => expected !== null && actual !== expected)) {
+    throw fail('FORMAL_RESEARCH_MANIFEST_MEMBER_IDENTITY_MISMATCH', `${field} conflicts with frozen member identity`);
+  }
+  return vintageId;
+}
+
+function reportContent(report) {
+  return {
+    validationRunId: report.validationRunId, horizon: report.horizon, reportScope: report.reportScope,
+    directionRawSampleCount: integer(report.directionRawSampleCount, 'report.directionRawSampleCount'),
+    directionEffectiveSampleCount: integer(report.directionEffectiveSampleCount, 'report.directionEffectiveSampleCount'),
+    pathRawSampleCount: integer(report.pathRawSampleCount, 'report.pathRawSampleCount'),
+    pathEffectiveSampleCount: integer(report.pathEffectiveSampleCount, 'report.pathEffectiveSampleCount'),
+    sampleSufficient: bool(report.sampleSufficient, 'report.sampleSufficient'),
+    purgedStraddlingCount: integer(report.purgedStraddlingCount, 'report.purgedStraddlingCount'),
+    poStateBreakdown: object(report.poStateBreakdown, 'report.poStateBreakdown'),
+    upDownRangeBreakdown: object(report.upDownRangeBreakdown, 'report.upDownRangeBreakdown'),
+    formalProxyDisclosure: object(report.formalProxyDisclosure, 'report.formalProxyDisclosure'),
+    calibratedProbabilitiesStatus: text(report.calibratedProbabilitiesStatus, 'report.calibratedProbabilitiesStatus'),
+    errorAttributionSummary: object(report.errorAttributionSummary, 'report.errorAttributionSummary'),
+    algorithmVersion: text(report.algorithmVersion, 'report.algorithmVersion'),
+    ruleVersion: text(report.ruleVersion, 'report.ruleVersion'),
+    researchAvailabilityRuleVersion: text(report.researchAvailabilityRuleVersion, 'report.researchAvailabilityRuleVersion')
+  };
 }
 
 const DECIMAL = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
@@ -113,7 +190,7 @@ function validateContextRow(row, validationRunId) {
       row.sourceFormalSemantics !== 'market_bars:formal:spot') {
     throw fail('FORMAL_RESEARCH_DATABASE_EVIDENCE_INVALID', 'manifest does not cover the validation window');
   }
-  array(row.manifestMembers, 'manifest.manifestMembers', { nonEmpty: true });
+  const manifestMembers = canonicalManifestMembers(row.manifestMembers);
   array(row.manifestBackfillBatchIds, 'manifest.backfillBatchIds');
   const integrity = object(row.integrityCheckResult, 'manifest.integrityCheckResult');
   if (!Object.keys(integrity).length || Object.values(integrity).some(entry => !entry || Number(entry.gapCount) !== 0 || Number(entry.duplicateCount) !== 0 || Number(entry.outOfOrderCount) !== 0)) {
@@ -121,10 +198,20 @@ function validateContextRow(row, validationRunId) {
   }
   const reports = array(row.authenticityReports, 'validation.authenticityReports', { nonEmpty: true });
   const runHorizons = array(row.runHorizons, 'validation.horizons', { nonEmpty: true });
+  if (new Set(runHorizons).size !== runHorizons.length || reports.length !== runHorizons.length || new Set(reports.map(report => report.horizon)).size !== reports.length) {
+    throw fail('FORMAL_RESEARCH_DATABASE_AUTHENTICITY_NOT_PROVEN', 'authenticity reports must exactly cover each run horizon once');
+  }
   for (const horizon of runHorizons) {
     if (!HORIZONS.has(horizon)) throw fail('FORMAL_RESEARCH_DATABASE_EVIDENCE_INVALID', 'validation run contains an invalid horizon');
     const report = reports.find(candidate => candidate.horizon === horizon);
-    const authenticity = report?.formalProxyDisclosure?.rerunAuthenticity;
+    const content = reportContent(report);
+    if (content.validationRunId !== validationRunId || report.datasetVersion !== row.datasetVersion || content.reportScope !== 'ALL' ||
+        content.algorithmVersion !== row.algorithmVersion || content.ruleVersion !== row.ruleVersion ||
+        content.researchAvailabilityRuleVersion !== row.manifestAvailabilityRuleVersion ||
+        !SHA256.test(report.contentHash || '') || canonicalJsonHash(content) !== report.contentHash) {
+      throw fail('FORMAL_RESEARCH_DATABASE_AUTHENTICITY_IDENTITY_MISMATCH', `authenticity report identity/hash is invalid for ${horizon}`);
+    }
+    const authenticity = content.formalProxyDisclosure.rerunAuthenticity;
     if (!authenticity || authenticity.gate_status !== 'PASSED' || authenticity.conflict_count !== 0 || authenticity.blocked_count !== 0 ||
         authenticity.attempted_count !== authenticity.expected_count || authenticity.evaluated_count !== authenticity.expected_count) {
       throw fail('FORMAL_RESEARCH_DATABASE_AUTHENTICITY_NOT_PROVEN', `authenticity is not proven for ${horizon}`);
@@ -138,10 +225,11 @@ function validateContextRow(row, validationRunId) {
     datasetVersion: row.datasetVersion,
     manifestContentHash: row.manifestContentHash,
     manifestBackfillBatchIds: [...new Set(row.manifestBackfillBatchIds)].sort(),
-    manifestMembers: row.manifestMembers,
+    manifestMembers,
     researchAvailabilityRuleVersion: row.manifestAvailabilityRuleVersion,
-    authenticityReports: reports,
-    algorithmVersion: text(row.algorithmVersion, 'validation.algorithmVersion')
+    authenticityReports: reports.map(report => ({ ...report, formalProxyDisclosure: report.formalProxyDisclosure })),
+    algorithmVersion: text(row.algorithmVersion, 'validation.algorithmVersion'),
+    ruleVersion: text(row.ruleVersion, 'validation.ruleVersion')
   };
 }
 
@@ -150,13 +238,21 @@ export async function loadFormalResearchContext(pool, { validationRunId }) {
   try {
     const result = await pool.query(
       `SELECT vr.validation_run_id AS "validationRunId", vr.status AS "validationRunStatus", vr.dry_run AS "dryRun",
-              vr.dataset_version AS "datasetVersion", vr.algorithm_version AS "algorithmVersion", vr.horizons AS "runHorizons",
+              vr.dataset_version AS "datasetVersion", vr.algorithm_version AS "algorithmVersion", vr.rule_version AS "ruleVersion", vr.horizons AS "runHorizons",
               vr.from_utc AS "fromUtc", vr.to_utc AS "toUtc", vr.train_end_utc AS "trainEndUtc",
               vr.validation_end_utc AS "validationEndUtc", vr.started_at AS "validationStartedAt", vr.finished_at AS "validationFinishedAt",
               dm.content_hash AS "manifestContentHash", dm.data_from AS "manifestDataFrom", dm.data_to AS "manifestDataTo",
               dm.source_formal_semantics AS "sourceFormalSemantics", dm.research_availability_rule_version AS "manifestAvailabilityRuleVersion",
               dm.backfill_batch_ids AS "manifestBackfillBatchIds", dm.integrity_check_result AS "integrityCheckResult", dm.manifest_members AS "manifestMembers",
-              COALESCE((SELECT jsonb_agg(jsonb_build_object('horizon',r.horizon,'formalProxyDisclosure',r.formal_proxy_disclosure) ORDER BY r.horizon)
+              COALESCE((SELECT jsonb_agg(jsonb_build_object(
+                         'validationRunId',r.validation_run_id,'datasetVersion',r.dataset_version,'horizon',r.horizon,'reportScope',r.report_scope,
+                         'directionRawSampleCount',r.direction_raw_sample_count,'directionEffectiveSampleCount',r.direction_effective_sample_count,
+                         'pathRawSampleCount',r.path_raw_sample_count,'pathEffectiveSampleCount',r.path_effective_sample_count,
+                         'sampleSufficient',r.sample_sufficient,'purgedStraddlingCount',r.purged_straddling_count,
+                         'poStateBreakdown',r.po_state_breakdown,'upDownRangeBreakdown',r.up_down_range_breakdown,
+                         'formalProxyDisclosure',r.formal_proxy_disclosure,'calibratedProbabilitiesStatus',r.calibrated_probabilities_status,
+                         'errorAttributionSummary',r.error_attribution_summary,'algorithmVersion',r.algorithm_version,'ruleVersion',r.rule_version,
+                         'researchAvailabilityRuleVersion',r.research_availability_rule_version,'contentHash',r.content_hash) ORDER BY r.horizon)
                           FROM historical_validation.validation_reports r
                          WHERE r.validation_run_id=vr.validation_run_id AND r.report_scope='ALL'),'[]'::jsonb) AS "authenticityReports"
          FROM historical_validation.validation_runs vr
@@ -206,12 +302,23 @@ function mapRow(row, context) {
     const pathEligible = bool(row.pathEligibleForStatistics, 'pathEligibleForStatistics');
     const endpointDataComplete = bool(row.endpointDataComplete, 'endpointDataComplete');
     const pathDataComplete = bool(row.pathDataComplete, 'pathDataComplete');
+    if (directionEligible !== endpointDataComplete || pathEligible !== (endpointDataComplete && pathDataComplete)) {
+      throw fail('FORMAL_RESEARCH_DATABASE_DERIVED_SEMANTICS_INVALID', 'eligibility flags conflict with completeness evidence');
+    }
     const actualDirection = row.actualDirection === null ? null : text(row.actualDirection, 'actualDirection');
     const directionCorrect = bool(row.directionCorrect, 'directionCorrect', { nullable: true });
     const actualReturn = numeric(row.actualReturn, 'actualReturn', { nullable: true });
     if ((directionEligible && (!DIRECTIONS.has(actualDirection) || actualReturn === null || directionCorrect === null)) ||
         (!directionEligible && (actualDirection !== null || actualReturn !== null || directionCorrect !== null))) {
       throw fail('FORMAL_RESEARCH_DATABASE_ROW_INVALID', 'direction nullable contract is violated');
+    }
+    const directionThreshold = numeric(row.directionThreshold, 'directionThreshold');
+    if (!(directionThreshold > 0)) throw fail('FORMAL_RESEARCH_DATABASE_DERIVED_SEMANTICS_INVALID', 'direction threshold must be positive');
+    if (directionEligible) {
+      const recomputedDirection = classifyDirection(actualReturn, directionThreshold);
+      if (recomputedDirection !== actualDirection || directionCorrect !== (actualDirection === predictedDirection)) {
+        throw fail('FORMAL_RESEARCH_DATABASE_DERIVED_SEMANTICS_INVALID', 'persisted direction semantics do not match the frozen classifier');
+      }
     }
     const mfe = numeric(row.mfe, 'mfe', { nullable: true });
     const mae = numeric(row.mae, 'mae', { nullable: true });
@@ -221,6 +328,48 @@ function mapRow(row, context) {
     const featureRecordIds = array(row.featureRecordIds, 'featureRecordIds', { nonEmpty: true });
     const snapshotVintage = assertVintage(row.snapshotResearchDataVintage, 'snapshotResearchDataVintage', historicalAsOfTime, context.researchAvailabilityRuleVersion);
     const outcomeVintage = assertVintage(row.outcomeResearchDataVintage, 'outcomeResearchDataVintage', evaluationAsOfTime, context.researchAvailabilityRuleVersion);
+    if (!snapshotVintage.consumedBars.length || !outcomeVintage.consumedBars.length) {
+      throw fail('FORMAL_RESEARCH_MANIFEST_LINEAGE_EMPTY', 'persisted research rows require non-empty consumed bar lineage');
+    }
+    const membersByVintage = new Map(context.manifestMembers.map(member => [member.vintageId, member]));
+    const consumedVintageIds = [...snapshotVintage.consumedBars.map((bar, index) => verifyConsumedBar(bar, membersByVintage, `snapshot.consumedBars[${index}]`)),
+      ...outcomeVintage.consumedBars.map((bar, index) => verifyConsumedBar(bar, membersByVintage, `outcome.consumedBars[${index}]`))];
+    const snapshotBackfill = row.snapshotBackfillBatchId == null ? [] : [String(row.snapshotBackfillBatchId)];
+    const consumedBackfills = [...snapshotBackfill, ...snapshotVintage.backfillBatchIds.map(String), ...outcomeVintage.backfillBatchIds.map(String)];
+    if (consumedBackfills.some(id => !context.manifestBackfillBatchIds.includes(id))) {
+      throw fail('FORMAL_RESEARCH_MANIFEST_BACKFILL_MISMATCH', 'consumed backfill batch is outside the frozen manifest');
+    }
+    const featureLineage = array(row.featureLineage, 'featureLineage', { nonEmpty: true });
+    const expectedFeatureIds = featureRecordIds.map(value => integer(value, 'featureRecordIds[]')).sort((a, b) => a - b);
+    const actualFeatureIds = featureLineage.map(value => integer(value.featureRecordId, 'featureLineage[].featureRecordId')).sort((a, b) => a - b);
+    if (new Set(actualFeatureIds).size !== actualFeatureIds.length || JSON.stringify(expectedFeatureIds) !== JSON.stringify(actualFeatureIds)) {
+      throw fail('FORMAL_RESEARCH_FEATURE_LINEAGE_MISMATCH', 'feature records do not exactly match the snapshot identity');
+    }
+    for (const [index, feature] of featureLineage.entries()) {
+      if (feature.sourceDatasetVersion !== context.datasetVersion || feature.algorithmVersion !== context.algorithmVersion ||
+          !Array.isArray(feature.sourceVintageRefs) || !feature.sourceVintageRefs.length) {
+        throw fail('FORMAL_RESEARCH_FEATURE_LINEAGE_MISMATCH', 'feature identity or source lineage is incomplete');
+      }
+      for (const [refIndex, ref] of feature.sourceVintageRefs.entries()) {
+        const vintageId = verifyConsumedBar({
+          vintageId: ref.vintageId, symbol: ref.symbol, interval: ref.interval,
+          marketType: ref.marketType, source: ref.source ?? ref.sourceName,
+          revisionNumber: ref.revisionNumber ?? ref.revision
+        }, membersByVintage, `featureLineage[${index}].sourceVintageRefs[${refIndex}]`);
+        consumedVintageIds.push(vintageId);
+      }
+    }
+    const actualLineage = array(row.actualMarketBarLineage, 'actualMarketBarLineage', { nonEmpty: true });
+    const expectedVintageIds = [...new Set(consumedVintageIds)].sort();
+    const actualVintageIds = actualLineage.map((bar, index) => {
+      const vintageId = verifyConsumedBar({ ...bar,
+        rowContentHash: computeRowContentHash({ open: bar.open, high: bar.high, low: bar.low, close: bar.close,
+          volume: bar.volume, quoteVolume: bar.quoteVolume }) }, membersByVintage, `actualMarketBarLineage[${index}]`);
+      return vintageId;
+    }).sort();
+    if (new Set(actualVintageIds).size !== actualVintageIds.length || JSON.stringify(actualVintageIds) !== JSON.stringify(expectedVintageIds)) {
+      throw fail('FORMAL_RESEARCH_MANIFEST_MEMBER_IDENTITY_MISMATCH', 'database market-bar lineage does not exactly match consumed identities');
+    }
     object(row.featureValuesUsed, 'featureValuesUsed');
     return {
       predictionId: text(row.predictionId, 'predictionId'), horizon, targetStartTime, targetEndTime,
@@ -231,7 +380,8 @@ function mapRow(row, context) {
       pathEligibleForStatistics: pathEligible, isDirectionSample: directionEligible, isMarketRegimeSample: directionEligible,
       endpointDataComplete, pathDataComplete, mfe, mae,
       generationRunId: row.generationRunId, evaluationRunId: row.evaluationRunId,
-      featureRecordIds, snapshotVintage, outcomeVintage
+      featureRecordIds, featureLineage, consumedVintageIds: [...new Set(consumedVintageIds)].sort(),
+      consumedBackfillBatchIds: [...new Set(consumedBackfills)].sort(), snapshotVintage, outcomeVintage
     };
   } catch (error) {
     throw repositoryFailure(error);
@@ -248,9 +398,10 @@ export async function loadFormalResearchPage(pool, { validationRunId, evaluation
     const result = await pool.query(
       `SELECT s.prediction_id AS "predictionId", s.generation_run_id AS "generationRunId", e.evaluation_run_id AS "evaluationRunId",
               s.dataset_version AS "datasetVersion", s.horizon, s.target_start_time AS "targetStartTime", s.target_end_time AS "targetEndTime",
-              s.expected_direction AS "predictedDirection", s.proxy_state_at_generation AS "proxyStateAtGeneration",
+              s.expected_direction AS "predictedDirection", s.direction_threshold AS "directionThreshold", s.proxy_state_at_generation AS "proxyStateAtGeneration",
               s.feature_values_used->>'trend4h' AS "trend4hAtGeneration", s.feature_values_used AS "featureValuesUsed", s.feature_record_ids AS "featureRecordIds",
               s.historical_as_of_time AS "snapshotHistoricalAsOfTime", s.research_data_vintage AS "snapshotResearchDataVintage",
+              s.backfill_batch_id AS "snapshotBackfillBatchId", fl."featureLineage", ml."actualMarketBarLineage",
               s.research_availability_rule_version AS "researchAvailabilityRuleVersion", s.source_origin AS "sourceOrigin",
               g.status AS "generationStatus", g.started_at AS "generationStartedAt", g.finished_at AS "generationFinishedAt",
               er.status AS "evaluationStatus", er.historical_as_of_time AS "evaluationHistoricalAsOfTime",
@@ -272,6 +423,31 @@ export async function loadFormalResearchPage(pool, { validationRunId, evaluation
          JOIN historical_validation.replay_evaluation_runs er
            ON er.evaluation_run_id=e.evaluation_run_id AND er.validation_run_id=vr.validation_run_id AND er.status='SUCCEEDED'
           AND er.historical_as_of_time=e.historical_as_of_time
+         LEFT JOIN LATERAL (
+           SELECT jsonb_agg(jsonb_build_object(
+                    'featureRecordId',f.feature_record_id,'sourceDatasetVersion',f.source_dataset_version,
+                    'algorithmVersion',f.algorithm_version,'sourceVintageRefs',f.source_vintage_refs)
+                    ORDER BY f.feature_record_id) AS "featureLineage"
+             FROM public.feature_records f
+            WHERE f.feature_record_id IN (SELECT (jsonb_array_elements_text(s.feature_record_ids))::bigint)
+         ) fl ON true
+         LEFT JOIN LATERAL (
+           SELECT jsonb_agg(jsonb_build_object(
+                    'vintageId',mb.vintage_id,'symbol',mb.instrument,'interval',mb.interval_name,'marketType',mb.market_type,
+                    'source',CASE WHEN mb.source_id='binance-spot-rest' THEN 'binance-spot' ELSE mb.source_id END,
+                    'openTime',(extract(epoch from mb.open_time)*1000)::bigint,
+                    'closeTime',(extract(epoch from mb.close_time)*1000)::bigint,'revisionNumber',mb.revision_number,
+                    'open',mb.open::text,'high',mb.high::text,'low',mb.low::text,'close',mb.close::text,
+                    'volume',mb.volume::text,'quoteVolume',mb.quote_volume::text) ORDER BY mb.vintage_id) AS "actualMarketBarLineage"
+             FROM public.market_bars mb
+            WHERE mb.vintage_id IN (
+              SELECT value->>'vintageId' FROM jsonb_array_elements(s.research_data_vintage->'consumedBars') value
+              UNION SELECT value->>'vintageId' FROM jsonb_array_elements(e.research_data_vintage->'consumedBars') value
+              UNION SELECT ref->>'vintageId' FROM public.feature_records fx,
+                jsonb_array_elements(fx.source_vintage_refs) ref
+               WHERE fx.feature_record_id IN (SELECT (jsonb_array_elements_text(s.feature_record_ids))::bigint)
+            )
+         ) ml ON true
         WHERE vr.validation_run_id=$1 AND vr.status='SUCCEEDED' AND vr.dry_run=false
           AND s.target_start_time>=vr.from_utc AND s.target_end_time<=vr.to_utc
           AND s.historical_as_of_time=s.target_start_time AND s.data_cutoff_time<=s.historical_as_of_time
@@ -325,8 +501,8 @@ export async function countFormalResearchRows(pool, { validationRunId, evaluatio
 }
 
 export function deriveFormalResearchAuditTrail({ context, rows, validationRunId, evaluationVersion }) {
-  if (!context || !Array.isArray(rows) || !rows.length) throw fail('FORMAL_RESEARCH_NO_ELIGIBLE_ROWS', 'validation run contains no eligible persisted FORMAL rows');
-  const vintageIds = [...new Set(rows.flatMap(row => [...row.snapshotVintage.consumedBars, ...row.outcomeVintage.consumedBars].map(bar => bar.vintageId)))].sort();
+  if (!context || !Array.isArray(rows)) throw fail('FORMAL_RESEARCH_NO_ELIGIBLE_ROWS', 'validation run evidence is unavailable');
+  const vintageIds = [...new Set(rows.flatMap(row => row.consumedVintageIds))].sort();
   const featureIds = new Set(rows.flatMap(row => row.featureRecordIds.map(String)));
   const generationRuns = new Set(rows.map(row => row.generationRunId));
   const evaluationRuns = new Set(rows.map(row => row.evaluationRunId));
@@ -347,10 +523,17 @@ export function deriveFormalResearchAuditTrail({ context, rows, validationRunId,
     blocked_count: sum.blocked_count + proof.blocked_count,
     evaluated_count: sum.evaluated_count + proof.evaluated_count
   }), { expected_count: 0, attempted_count: 0, inserted_count: 0, reused_identical_count: 0, conflict_count: 0, blocked_count: 0, evaluated_count: 0 });
+  const manifestIds = new Set(context.manifestMembers.map(member => member.vintageId));
+  const coveredManifestCount = vintageIds.filter(id => manifestIds.has(id)).length;
+  const manifestCoverage = manifestIds.size ? coveredManifestCount / manifestIds.size : 0;
+  const consumedBackfillIds = new Set(rows.flatMap(row => row.consumedBackfillBatchIds));
+  if ([...consumedBackfillIds].some(id => !context.manifestBackfillBatchIds.includes(id))) {
+    throw fail('FORMAL_RESEARCH_MANIFEST_BACKFILL_MISMATCH', 'audit contains a non-manifest backfill batch');
+  }
   const auditTrail = {
     schemaVersion: 'v1.4d-audit-trail/1', validationRunId, evaluationVersion,
     evaluatedAt: context.validationRunFinishedAt, validationRunStatus: 'SUCCEEDED', authenticityGateStatus: 'PASSED',
-    manifestCoverage: 1, featureCoverage: featureIds.size > 0 && rows.every(row => row.featureRecordIds.length > 0) ? 1 : 0,
+    manifestCoverage, featureCoverage: featureIds.size > 0 && rows.every(row => row.featureRecordIds.length > 0) ? 1 : 0,
     datasetVersion: context.datasetVersion, manifestContentHash: context.manifestContentHash,
     backfillBatchIds: context.manifestBackfillBatchIds, vintageIds,
     generationSummary: {
@@ -359,7 +542,7 @@ export function deriveFormalResearchAuditTrail({ context, rows, validationRunId,
       conflicts: authenticity.conflict_count, blocked: authenticity.blocked_count, evaluated: authenticity.evaluated_count
     }
   };
-  if (auditTrail.featureCoverage !== 1 || generationRuns.size === 0 || evaluationRuns.size === 0) {
+  if (rows.length && (auditTrail.manifestCoverage !== 1 || auditTrail.featureCoverage !== 1 || generationRuns.size === 0 || evaluationRuns.size === 0)) {
     throw fail('FORMAL_RESEARCH_DATABASE_AUTHENTICITY_NOT_PROVEN', 'feature/run lineage is incomplete');
   }
   return auditTrail;

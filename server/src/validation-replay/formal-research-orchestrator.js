@@ -14,22 +14,53 @@ import { evaluateGoNoGo } from '../formal-research/go-no-go-evaluator.js';
 import { canonicalJson } from '../formal-research/canonical-json.js';
 import { resolveGovernanceAuthorizationRef } from './governance-authorization.js';
 import { publishArtifact } from './artifact-publisher.js';
+import { readArtifactPair } from './artifact-reader.js';
 import { assembleD8InputFromResearchRows } from './d8-input-assembler.js';
 import {
   loadFormalResearchContext, loadFormalResearchPage, countFormalResearchRows, deriveFormalResearchAuditTrail
 } from './formal-research-data-repository.js';
 import { assertGuardedResearchPgPool } from '../db/research-database-guard.js';
 import {
-  readRunStatus, writeRunStatus, initialRunStatus, withBatchPlan, withBatchCompleted, withBlocked, withCompleted, withFailed
+  createResearchRunIdentity, readRunStatus, writeRunStatus, initialRunStatus, withBatchPlan, withBatchCompleted, withBlocked, withCompleted, withFailed
 } from './research-run-status.js';
 import {
   ensureDirectorySafe, writeTempFileDurable, renameNoReplace, fsyncDirectory,
-  readFileNoFollowSymlink, lstatIfExists, newLockId
+  readFileNoFollowSymlink, lstatIfExists, newLockId, evaluationIdentity
 } from './artifact-fs-primitives.js';
 
 function fail(code, message = code) { return Object.assign(new Error(message), { code }); }
+const DATABASE_RUN_IDENTITY = Symbol('databaseRunIdentity');
 function safeCode(error, fallback) { return /^[A-Z0-9_]+$/.test(error?.code || '') ? error.code : fallback; }
 function sha256(value) { return createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex'); }
+
+function runConfig(options, source, extra = {}) {
+  return {
+    source,
+    scorecardOptions: options.scorecardOptions ?? null,
+    validationRunFinishedAt: options.validationRunFinishedAt ?? null,
+    thresholds: options.thresholds ?? null,
+    expectedThresholdsSha256: options.expectedThresholdsSha256 ?? null,
+    governanceRecordSha256: options.governanceRecord == null ? null : sha256(options.governanceRecord),
+    manifestContentHash: options.manifestContentHash ?? null,
+    batchSize: source === 'DATABASE' ? (options.batchSize ?? 1000) : null,
+    batchPlanSha256: source === 'MEMORY' ? sha256(options.batches) : null,
+    ...extra
+  };
+}
+
+function artifactTargetDir(root, artifactMode, validationRunId, evaluationVersion) {
+  return path.join(root, artifactMode === 'FORMAL' ? 'formal' : 'dry-run', validationRunId, evaluationIdentity(evaluationVersion));
+}
+
+function verifyCompletedArtifact(artifactRoot, status) {
+  const pair = readArtifactPair(artifactTargetDir(artifactRoot, status.artifactMode, status.validationRunId, status.evaluationVersion));
+  if (pair.readerStatus !== 'ACCEPTED' || pair.sidecar.fullMainArtifactSha256 !== status.publishedArtifactSha256 ||
+      pair.artifact.core.validationRunId !== status.validationRunId || pair.artifact.core.evaluationVersion !== status.evaluationVersion ||
+      pair.artifact.artifactMode !== status.artifactMode) {
+    throw fail('ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID', 'COMPLETED status is not backed by the exact published artifact pair');
+  }
+  return pair;
+}
 
 function validateBatchPlan(batches) {
   if (!Array.isArray(batches) || !batches.length || batches.some((batch, index) =>
@@ -72,10 +103,19 @@ export function runFormalResearchOrchestrator(options) {
   if (assembleD8Input !== null && typeof assembleD8Input !== 'function') throw fail('ORCHESTRATOR_INVALID_INPUT', 'assembleD8Input must be a function');
   if (typeof buildArtifactCore !== 'function') throw fail('ORCHESTRATOR_INVALID_INPUT', 'buildArtifactCore hook is required');
 
-  let status = readRunStatus(statusRoot, artifactMode, validationRunId);
-  if (status?.runState === 'COMPLETED') return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
+  const runIdentity = options[DATABASE_RUN_IDENTITY] ||
+    createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode, config: runConfig(options, 'MEMORY') });
+  let status = readRunStatus(statusRoot, runIdentity);
+  if (status?.runState === 'COMPLETED') {
+    try { verifyCompletedArtifact(artifactRoot, status); }
+    catch (error) {
+      status = persistFailure(statusRoot, status, 'BLOCKED', safeCode(error, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID'));
+      return { runStatus: status, published: false, error: { code: status.blockedReasonCode, message: status.blockedReasonCode } };
+    }
+    return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
+  }
   if (!status) {
-    status = initialRunStatus({ validationRunId, artifactMode, totalBatches: batches.length });
+    status = initialRunStatus({ runIdentity, totalBatches: batches.length });
     writeRunStatus(statusRoot, status);
   } else if (status.totalBatches !== batches.length) {
     throw fail('ORCHESTRATOR_BATCH_PLAN_MISMATCH', 'resumed run batch plan differs from the persisted plan');
@@ -124,10 +164,13 @@ export function runFormalResearchOrchestrator(options) {
     governanceRef = resolveGovernanceAuthorizationRef({
       artifactMode, record: governanceRecord, expectedValidationRunId: validationRunId, expectedThresholdsSha256
     });
+    if (artifactMode === 'FORMAL' && decision.overall.status === 'DATA_GATE_FAILED') {
+      throw fail('ORCHESTRATOR_FORMAL_DATA_GATE_FAILED', 'FORMAL publication is forbidden when D8 data gates fail');
+    }
   } catch (error) {
     const code = safeCode(error, 'ORCHESTRATOR_EVALUATION_FAILED');
     status = persistFailure(statusRoot, status, 'BLOCKED', code);
-    return { runStatus: status, published: false, error: { code, message: code } };
+    return { runStatus: status, published: false, decision, error: { code, message: code } };
   }
 
   try {
@@ -154,26 +197,30 @@ export function runFormalResearchOrchestrator(options) {
     status = persistFailure(statusRoot, status, 'FAILED', code);
     return { runStatus: status, published: false, publishResult };
   }
-  status = withCompleted(status);
+  const publishedPair = verifyCompletedArtifact(artifactRoot, { ...status, evaluationVersion, artifactMode,
+    publishedArtifactSha256: readArtifactPair(artifactTargetDir(artifactRoot, artifactMode, validationRunId, evaluationVersion)).sidecar?.fullMainArtifactSha256 });
+  status = withCompleted(status, { publishedArtifactSha256: publishedPair.sidecar.fullMainArtifactSha256 });
   writeRunStatus(statusRoot, status);
   return { runStatus: status, published: true, publishResult, decision, statistics, scorecardResult };
 }
 
-function checkpointDirectory(statusRoot, artifactMode, validationRunId) {
-  return path.join(statusRoot, 'database-page-checkpoints', artifactMode === 'FORMAL' ? 'formal' : 'dry-run', validationRunId);
+function checkpointDirectory(statusRoot, runIdentity) {
+  return path.join(statusRoot, 'database-page-checkpoints', runIdentity.artifactMode === 'FORMAL' ? 'formal' : 'dry-run',
+    runIdentity.validationRunId, runIdentity.runIdentitySha256);
 }
 
-function checkpointPath(statusRoot, artifactMode, validationRunId, batchIndex) {
-  return path.join(checkpointDirectory(statusRoot, artifactMode, validationRunId), `${batchIndex}.json`);
+function checkpointPath(statusRoot, runIdentity, batchIndex) {
+  return path.join(checkpointDirectory(statusRoot, runIdentity), `${batchIndex}.json`);
 }
 
-function readDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, checkpoint) {
-  const target = checkpointPath(statusRoot, artifactMode, validationRunId, checkpoint.batchIndex);
+function readDatabasePageCheckpoint(statusRoot, runIdentity, checkpoint) {
+  const target = checkpointPath(statusRoot, runIdentity, checkpoint.batchIndex);
   const stat = lstatIfExists(target);
   if (!stat || stat.isSymbolicLink()) throw fail('ORCHESTRATOR_CHECKPOINT_MISSING', 'database page checkpoint is missing');
   const { bytes } = readFileNoFollowSymlink(target, 50_000_000);
   let payload;
   try { payload = JSON.parse(bytes.toString('utf8')); } catch { throw fail('ORCHESTRATOR_CHECKPOINT_CONFLICT', 'database page checkpoint is not valid JSON'); }
+  if (payload.runIdentitySha256 !== runIdentity.runIdentitySha256) throw fail('ORCHESTRATOR_CHECKPOINT_IDENTITY_MISMATCH', 'database checkpoint belongs to another run identity');
   const batch = { batchIndex: payload.batchIndex, governanceRows: payload.rows, scorecardRows: payload.rows, cursor: payload.nextCursor };
   if (checkpoint.sha256 !== sha256(batch) || checkpoint.rowCount !== payload.rows?.length) {
     throw fail('ORCHESTRATOR_CHECKPOINT_CONFLICT', 'database page checkpoint hash mismatch');
@@ -181,14 +228,15 @@ function readDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, c
   return batch;
 }
 
-function writeDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, batch) {
-  const dir = checkpointDirectory(statusRoot, artifactMode, validationRunId);
+function writeDatabasePageCheckpoint(statusRoot, runIdentity, batch) {
+  const dir = checkpointDirectory(statusRoot, runIdentity);
   ensureDirectorySafe(dir, statusRoot);
-  const target = checkpointPath(statusRoot, artifactMode, validationRunId, batch.batchIndex);
-  const payload = { schemaVersion: 'v1.4d-formal-db-page-checkpoint/1', batchIndex: batch.batchIndex, rows: batch.scorecardRows, nextCursor: batch.cursor };
+  const target = checkpointPath(statusRoot, runIdentity, batch.batchIndex);
+  const payload = { schemaVersion: 'v1.4d-formal-db-page-checkpoint/2', runIdentitySha256: runIdentity.runIdentitySha256,
+    batchIndex: batch.batchIndex, rows: batch.scorecardRows, nextCursor: batch.cursor };
   const bytes = Buffer.from(canonicalJson(payload), 'utf8');
   if (lstatIfExists(target)) {
-    const existing = readDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, checkpointForBatch(batch, batch.cursor));
+    const existing = readDatabasePageCheckpoint(statusRoot, runIdentity, checkpointForBatch(batch, batch.cursor));
     if (existing.batchIndex === batch.batchIndex) return;
   }
   const temp = path.join(dir, `.${batch.batchIndex}.tmp.${process.pid}.${newLockId()}`);
@@ -196,7 +244,7 @@ function writeDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, 
   try { renameNoReplace(temp, target); } catch (error) {
     try { fs.unlinkSync(temp); } catch { /* best-effort orphan cleanup */ }
     if (!lstatIfExists(target)) throw error;
-    readDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, checkpointForBatch(batch, batch.cursor));
+    readDatabasePageCheckpoint(statusRoot, runIdentity, checkpointForBatch(batch, batch.cursor));
   }
   fsyncDirectory(dir);
 }
@@ -209,25 +257,34 @@ export async function runFormalResearchFromDatabase(options) {
   assertGuardedResearchPgPool(pool);
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 10_000) throw fail('ORCHESTRATOR_INVALID_INPUT', 'batchSize must be 1..10000');
 
-  let status = readRunStatus(statusRoot, artifactMode, validationRunId);
-  if (status?.runState === 'COMPLETED') return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
-  if (!status) {
-    status = initialRunStatus({ validationRunId, artifactMode, totalBatches: 1 });
-    writeRunStatus(statusRoot, status);
-  }
-
   let context, count;
   try {
     context = await loadFormalResearchContext(pool, { validationRunId });
     count = await countFormalResearchRows(pool, { validationRunId, evaluationVersion });
-    if (count === 0) throw fail('ORCHESTRATOR_NO_RESEARCH_ROWS', 'no evaluated research rows found for validation run');
   } catch (error) {
     const code = safeCode(error, 'ORCHESTRATOR_REPOSITORY_FAILED');
-    status = persistFailure(statusRoot, status, 'FAILED', code);
-    return { runStatus: status, published: false, error: { code, message: code } };
+    return { runStatus: null, published: false, error: { code, message: code } };
   }
-  const totalBatches = Math.ceil(count / batchSize);
   const databaseScorecardOptions = { ...options.scorecardOptions, trainEnd: context.trainEnd, validationEnd: context.validationEnd };
+  const resolvedOptions = { ...options, scorecardOptions: databaseScorecardOptions,
+    validationRunFinishedAt: context.validationRunFinishedAt, manifestContentHash: context.manifestContentHash };
+  const runIdentity = createResearchRunIdentity({ validationRunId, evaluationVersion, artifactMode,
+    config: runConfig(resolvedOptions, 'DATABASE', { datasetVersion: context.datasetVersion }) });
+  let status = readRunStatus(statusRoot, runIdentity);
+  if (status?.runState === 'COMPLETED') {
+    try { verifyCompletedArtifact(options.artifactRoot, status); }
+    catch (error) {
+      status = persistFailure(statusRoot, status, 'BLOCKED', safeCode(error, 'ORCHESTRATOR_COMPLETED_ARTIFACT_INVALID'));
+      return { runStatus: status, published: false, error: { code: status.blockedReasonCode, message: status.blockedReasonCode } };
+    }
+    return { runStatus: status, published: true, resumed: true, skippedRecompute: true };
+  }
+  if (!status) {
+    status = initialRunStatus({ runIdentity, totalBatches: Math.max(1, Math.ceil(count / batchSize)) });
+    writeRunStatus(statusRoot, status);
+  }
+
+  const totalBatches = Math.max(1, Math.ceil(count / batchSize));
   if (status.completedBatchIndices.length === 0 && status.totalBatches !== totalBatches) {
     status = withBatchPlan(status, totalBatches);
     writeRunStatus(statusRoot, status);
@@ -243,15 +300,17 @@ export async function runFormalResearchFromDatabase(options) {
     for (let batchIndex = 0; batchIndex < totalBatches; batchIndex += 1) {
       let batch;
       if (status.completedBatchIndices.includes(batchIndex)) {
-        batch = readDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, status.batchCheckpoints[batchIndex]);
+        batch = readDatabasePageCheckpoint(statusRoot, runIdentity, status.batchCheckpoints[batchIndex]);
       } else {
-        const page = await loadFormalResearchPage(pool, { validationRunId, evaluationVersion, context, limit: batchSize, cursor });
-        if (!page.rows.length) throw fail('ORCHESTRATOR_PARTIAL_REPOSITORY_RESULT', 'repository ended before the declared count');
+        const page = count === 0
+          ? { rows: [], nextCursor: null }
+          : await loadFormalResearchPage(pool, { validationRunId, evaluationVersion, context, limit: batchSize, cursor });
+        if (count !== 0 && !page.rows.length) throw fail('ORCHESTRATOR_PARTIAL_REPOSITORY_RESULT', 'repository ended before the declared count');
         batch = { batchIndex, governanceRows: page.rows, scorecardRows: page.rows, cursor: page.nextCursor };
         const prefixRows = [...batches.flatMap(value => value.scorecardRows), ...page.rows];
         computeMarketRegimeStatistics(prefixRows);
         buildDeterministicScorecard(prefixRows, databaseScorecardOptions, { validationRunFinishedAt: context.validationRunFinishedAt });
-        writeDatabasePageCheckpoint(statusRoot, artifactMode, validationRunId, batch);
+        writeDatabasePageCheckpoint(statusRoot, runIdentity, batch);
         status = withBatchCompleted(status, batchIndex, { checkpoint: checkpointForBatch(batch, page.nextCursor) });
         writeRunStatus(statusRoot, status);
       }
@@ -280,6 +339,7 @@ export async function runFormalResearchFromDatabase(options) {
     ...options, batches, assembleD8Input: null, databaseAuditTrail,
     validationRunFinishedAt: context.validationRunFinishedAt,
     scorecardOptions: databaseScorecardOptions,
-    manifestContentHash: context.manifestContentHash
+    manifestContentHash: context.manifestContentHash,
+    [DATABASE_RUN_IDENTITY]: runIdentity
   });
 }

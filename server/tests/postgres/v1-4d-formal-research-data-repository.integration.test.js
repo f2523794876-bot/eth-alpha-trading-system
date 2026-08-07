@@ -8,8 +8,11 @@ import { isPostgresIntegrationTestAuthorized } from './_pg-integration-gate.js';
 import { createGuardedResearchPgPool } from '../../src/db/research-database-guard.js';
 import { loadFormalResearchContext, loadFormalResearchDataset, loadFormalResearchRows } from '../../src/validation-replay/formal-research-data-repository.js';
 import { runFormalResearchFromDatabase } from '../../src/validation-replay/formal-research-orchestrator.js';
-import { readRunStatus } from '../../src/validation-replay/research-run-status.js';
+import { findMostRecentRunStatus } from '../../src/validation-replay/research-run-status.js';
 import { canonicalJson } from '../../src/formal-research/canonical-json.js';
+import { canonicalJsonHash } from '../../src/domain/hash.js';
+import { computeRowContentHash } from '../../src/validation-replay/canonical-manifest-content.js';
+import { backfillInterval } from '../../src/backfill/binance-kline-backfill.js';
 
 const url = process.env.TEST_DATABASE_URL;
 const skip = !isPostgresIntegrationTestAuthorized(url);
@@ -27,6 +30,8 @@ const runStarted = '2026-04-01T00:00:00.000Z';
 const runFinished = '2026-04-02T00:00:00.000Z';
 let pool;
 let fixtureRows = [];
+let featureRecordId;
+let member;
 
 const thresholds = {
   schemaVersion: 'v1.4d-go-no-go-thresholds/1', minEffectiveTest: { '24h': 1, '72h': 1 }, minClassEffectiveTest: { '24h': 0, '72h': 0 },
@@ -36,8 +41,18 @@ const thresholds = {
 };
 
 function sha256(text) { return createHash('sha256').update(text, 'utf8').digest('hex'); }
-function vintage(asOfTime) {
-  return { researchAvailabilityRuleVersion: rule, asOfTime, consumedBars: [], backfillBatchIds: [],
+function oneBarAdapter(openTime, closeTime) {
+  let called = false;
+  return {
+    serverTime: async () => ({ body: { serverTime: closeTime + 60_000 }, requestId: randomUUID() }),
+    spotKlines: async () => ({ body: called ? [] : (called = true, [[openTime, '1000.00', '1010.00', '990.00', '1005.00', '10.00', closeTime, '10050.00', 5, '5.00', '5025.00']]),
+      requestId: randomUUID(), status: 200, headers: {} })
+  };
+}
+function vintage(asOfTime, vintageId = member.vintageId) {
+  return { researchAvailabilityRuleVersion: rule, asOfTime, consumedBars: [{ vintageId, symbol: member.symbol,
+    interval: member.intervalName, openTime: member.openTime, closeTime: member.closeTime, availableAt: member.closeTime,
+    fetchedAt: member.closeTime, sourceId: member.source, revisionNumber: member.revisionNumber }], backfillBatchIds: [],
     disclosure: 'FROZEN_POLICY: researchAvailability(bar)=bar.close_time' };
 }
 
@@ -51,16 +66,35 @@ async function insertValidationRun(validationRunId, { status = 'SUCCEEDED', hori
 async function insertReport(validationRunId, horizon, expectedCount) {
   const proof = { rerunAuthenticity: { gate_status: 'PASSED', expected_count: expectedCount, attempted_count: expectedCount,
     inserted_count: expectedCount, reused_identical_count: 0, conflict_count: 0, blocked_count: 0, evaluated_count: expectedCount } };
+  const content = { validationRunId, horizon, reportScope: 'ALL', directionRawSampleCount: expectedCount,
+    directionEffectiveSampleCount: expectedCount, pathRawSampleCount: expectedCount, pathEffectiveSampleCount: expectedCount,
+    sampleSufficient: true, purgedStraddlingCount: 0, poStateBreakdown: {}, upDownRangeBreakdown: {},
+    formalProxyDisclosure: proof, calibratedProbabilitiesStatus: 'null (V1.4D not eligible)', errorAttributionSummary: {},
+    algorithmVersion: 'algorithm-v1', ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
   await pool.query(`INSERT INTO historical_validation.validation_reports
     (report_id,validation_run_id,dataset_version,horizon,report_scope,direction_raw_sample_count,direction_effective_sample_count,
      path_raw_sample_count,path_effective_sample_count,sample_sufficient,formal_proxy_disclosure,algorithm_version,rule_version,
      research_availability_rule_version,content_hash)
     VALUES ($1,$2,$3,$4,'ALL',$5,$5,$5,$5,true,$6::jsonb,'algorithm-v1','rule-v1',$7,$8)`,
-  [randomUUID(), validationRunId, datasetVersion, horizon, expectedCount, JSON.stringify(proof), rule, 'e'.repeat(64)]);
+  [randomUUID(), validationRunId, datasetVersion, horizon, expectedCount, JSON.stringify(proof), rule, canonicalJsonHash(content)]);
+}
+
+async function updateReportCount(validationRunId, horizon, expectedCount) {
+  const proof = { rerunAuthenticity: { gate_status: 'PASSED', expected_count: expectedCount, attempted_count: expectedCount,
+    inserted_count: expectedCount, reused_identical_count: 0, conflict_count: 0, blocked_count: 0, evaluated_count: expectedCount } };
+  const content = { validationRunId, horizon, reportScope: 'ALL', directionRawSampleCount: expectedCount,
+    directionEffectiveSampleCount: expectedCount, pathRawSampleCount: expectedCount, pathEffectiveSampleCount: expectedCount,
+    sampleSufficient: true, purgedStraddlingCount: 0, poStateBreakdown: {}, upDownRangeBreakdown: {},
+    formalProxyDisclosure: proof, calibratedProbabilitiesStatus: 'null (V1.4D not eligible)', errorAttributionSummary: {},
+    algorithmVersion: 'algorithm-v1', ruleVersion: 'rule-v1', researchAvailabilityRuleVersion: rule };
+  await pool.query(`UPDATE historical_validation.validation_reports SET direction_raw_sample_count=$3,direction_effective_sample_count=$3,
+    path_raw_sample_count=$3,path_effective_sample_count=$3,formal_proxy_disclosure=$4::jsonb,content_hash=$5
+    WHERE validation_run_id=$1 AND horizon=$2 AND report_scope='ALL'`,
+  [validationRunId, horizon, expectedCount, JSON.stringify(proof), canonicalJsonHash(content)]);
 }
 
 async function insertReplayRow(validationRunId, { horizon, start, direction, suffix, outcomeAsOf = null, numeric = null, nullDirection = false,
-  generationStatus = 'SUCCEEDED', evaluationStatus = 'SUCCEEDED' }) {
+  generationStatus = 'SUCCEEDED', evaluationStatus = 'SUCCEEDED', vintageId = member.vintageId }) {
   const hours = horizon === '24h' ? 24 : 72;
   const end = new Date(Date.parse(start) + hours * 3_600_000).toISOString();
   const predictionId = `${validationRunId}-${horizon}-${suffix}`;
@@ -70,7 +104,7 @@ async function insertReplayRow(validationRunId, { horizon, start, direction, suf
     (generation_run_id,validation_run_id,instrument,horizon,historical_as_of_time,status,generated_count,started_at,finished_at)
     VALUES ($1,$2,'ETHUSDT',$3,$4,$5,1,'2026-04-01T01:00:00Z','2026-04-01T02:00:00Z')`,
   [generationRunId, validationRunId, horizon, start, generationStatus]);
-  const featureIds = JSON.stringify([randomUUID()]);
+  const featureIds = JSON.stringify([featureRecordId]);
   await pool.query(`INSERT INTO historical_validation.replay_snapshots
     (prediction_id,generation_run_id,dataset_version,instrument,horizon,generated_at,data_cutoff_time,target_start_time,target_end_time,
      reference_price,reference_bar_ref,expected_bar_count,expected_direction,direction_threshold,raw_threshold,threshold_floor,threshold_ceiling,
@@ -82,7 +116,7 @@ async function insertReplayRow(validationRunId, { horizon, start, direction, suf
       'UNKNOWN','PO','UNKNOWN','[]'::jsonb,34,33,33,'rule_based','{}'::jsonb,'{}'::jsonb,'{}'::jsonb,
       'algorithm-v1','weight-v1','rule-v1','[]'::jsonb,jsonb_build_object('trend4h',$8::text),$11::jsonb,'feature-v1',$12,'{}'::jsonb,$5,$13::jsonb,$14,'HISTORICAL_REPLAY')`,
   [predictionId, generationRunId, datasetVersion, horizon, start, end, horizon === '24h' ? 96 : 288, direction,
-    horizon === '24h' ? 0.008 : 0.015, horizon === '24h' ? 0.05 : 0.08, featureIds, 'a'.repeat(64), JSON.stringify(vintage(start)), rule]);
+    horizon === '24h' ? 0.008 : 0.015, horizon === '24h' ? 0.05 : 0.08, featureIds, 'a'.repeat(64), JSON.stringify(vintage(start, vintageId)), rule]);
   const maturity = outcomeAsOf || end;
   await pool.query(`INSERT INTO historical_validation.replay_evaluation_runs
     (evaluation_run_id,validation_run_id,historical_as_of_time,status,evaluated_count,started_at,finished_at)
@@ -97,7 +131,7 @@ async function insertReplayRow(validationRunId, { horizon, start, direction, suf
     VALUES ($1,$2,$3,$4,'2026-04-01T03:30:00Z',$5,$5,true,true,true,true,$6,$7,true,1,1,0.03,0.01,'{}'::jsonb,
       '[]'::jsonb,$8::jsonb,'[]'::jsonb,'[]'::jsonb,'[]'::jsonb,'HISTORICAL_REPLAY',$9)`,
   [predictionId, evaluationVersion, evaluationRunId, rule, maturity, nullDirection ? null : actualReturn, nullDirection ? null : direction,
-    JSON.stringify(vintage(maturity)), 'b'.repeat(64)]);
+    JSON.stringify(vintage(maturity, vintageId)), 'b'.repeat(64)]);
   return { predictionId, horizon, start, end };
 }
 
@@ -143,13 +177,37 @@ before(async () => {
   const identity = await pool.query('SELECT current_database() AS database');
   assert.equal(identity.rows[0].database, 'eth_alpha_v14d_authenticity_ci');
   await pool.query('BEGIN');
+  const memberOpen = Date.parse('2026-01-01T23:45:00Z');
+  const memberClose = Date.parse('2026-01-02T00:00:00Z');
+  await backfillInterval({ pool, adapter: oneBarAdapter(memberOpen, memberClose), symbol: 'ETHUSDT', interval: '15m',
+    startTime: memberOpen, endTime: memberOpen, now: () => memberClose + 60_000 });
+  const marketBar = (await pool.query(`SELECT instrument,interval_name,market_type,open_time,close_time,revision_number,vintage_id,
+    open::text,high::text,low::text,close::text,volume::text,quote_volume::text FROM public.market_bars WHERE instrument='ETHUSDT' AND open_time=$1`,
+  [new Date(memberOpen)])).rows[0];
+  member = { symbol: marketBar.instrument, intervalName: marketBar.interval_name, marketType: marketBar.market_type, source: 'binance-spot',
+    openTime: new Date(marketBar.open_time).getTime(), closeTime: new Date(marketBar.close_time).getTime(), revisionNumber: marketBar.revision_number,
+    vintageId: marketBar.vintage_id, rowContentHash: computeRowContentHash({ open: marketBar.open, high: marketBar.high, low: marketBar.low,
+      close: marketBar.close, volume: marketBar.volume, quoteVolume: marketBar.quote_volume }) };
   await pool.query(`INSERT INTO historical_validation.dataset_manifests
     (dataset_version,manifest_schema_version,manifest_hash_algorithm_version,symbol,intervals,data_from,data_to,backfill_batch_ids,
      source_formal_semantics,research_availability_rule_version,record_count,per_interval_record_count,integrity_check_result,manifest_members,
      manifest_contract_version,dataset_type)
     VALUES ($1,'manifest-v1','sha256','ETHUSDT','["15m"]'::jsonb,$2,$3,'[]'::jsonb,'market_bars:formal:spot',$4,1,
-      '{"15m":1}'::jsonb,'{"ETHUSDT":{"gapCount":0,"duplicateCount":0,"outOfOrderCount":0}}'::jsonb,'[{"symbol":"ETHUSDT"}]'::jsonb,1,'MARKET_BARS')`,
-  [datasetVersion, runFrom, runTo, rule]);
+      '{"15m":1}'::jsonb,'{"ETHUSDT":{"gapCount":0,"duplicateCount":0,"outOfOrderCount":0}}'::jsonb,$5::jsonb,1,'MARKET_BARS')`,
+  [datasetVersion, runFrom, runTo, rule, JSON.stringify([member])]);
+  const featureSetVersion = `r3-batch5-${randomUUID()}`;
+  await pool.query(`INSERT INTO public.feature_sets(feature_set_version,algorithm_version,schema_version,definition,definition_hash,active)
+    VALUES($1,'algorithm-v1','r3-batch5','{}'::jsonb,$2,true)`, [featureSetVersion, '9'.repeat(64)]);
+  const insertedFeature = await pool.query(`INSERT INTO public.feature_records(
+    feature_id,symbol,target_interval,target_bar_open_time,target_bar_close_time,as_of_time,generated_at,feature_set_version,
+    algorithm_version,source_dataset_version,revision_number,completeness,quality_state,missing_features,degraded_reasons,
+    source_vintage_refs,source_revision_refs,feature_values,availability,content_hash)
+    VALUES($1,'ETHUSDT','15m',$2,$3,$3,'2026-04-01T00:00:00Z',$4,'algorithm-v1',$5,0,1,'HEALTHY','[]'::jsonb,'[]'::jsonb,
+      $6::jsonb,'[]'::jsonb,'{}'::jsonb,'{}'::jsonb,$7) RETURNING feature_record_id`,
+  [`r3b5-feature-${randomUUID()}`, new Date(member.openTime), new Date(member.closeTime), featureSetVersion, datasetVersion,
+    JSON.stringify([{ vintageId: member.vintageId, symbol: member.symbol, interval: member.intervalName, marketType: member.marketType,
+      sourceName: member.source, revision: member.revisionNumber, contentHash: member.rowContentHash }]), '8'.repeat(64)]);
+  featureRecordId = insertedFeature.rows[0].feature_record_id;
   fixtureRows = (await seedFullRun(targetRun)).sort((a, b) => a.horizon.localeCompare(b.horizon) || Date.parse(a.start) - Date.parse(b.start) || a.predictionId.localeCompare(b.predictionId));
   await insertValidationRun(otherRun, { horizons: ['24h'] });
   await insertReplayRow(otherRun, { horizon: '24h', start: fixtureRows[0].start, direction: 'DOWN', suffix: 'same-timestamp-other-run' });
@@ -180,8 +238,21 @@ test('真实PostgreSQL：manifest/authenticity数据库证据缺失或冲突时�
     SET formal_proxy_disclosure=jsonb_set(formal_proxy_disclosure,'{rerunAuthenticity,gate_status}','"FAILED"'::jsonb)
     WHERE validation_run_id=$1 AND horizon='24h' AND report_scope='ALL'`, [targetRun]);
   await assert.rejects(loadFormalResearchContext(pool, { validationRunId: targetRun }),
-    error => error.code === 'FORMAL_RESEARCH_DATABASE_AUTHENTICITY_NOT_PROVEN');
+    error => error.code === 'FORMAL_RESEARCH_DATABASE_AUTHENTICITY_IDENTITY_MISMATCH');
   await pool.query('ROLLBACK TO SAVEPOINT authenticity_conflict');
+});
+
+test('真实PostgreSQL：真实Manifest成员可读取，等量rogue vintage在Feature输入前fail-closed', { skip }, async () => {
+  const valid = await loadFormalResearchDataset(pool, { validationRunId: targetRun, evaluationVersion });
+  assert.equal(valid.auditTrail.manifestCoverage, 1);
+  await pool.query('SAVEPOINT rogue_manifest_member');
+  const rogueRun = randomUUID();
+  await insertValidationRun(rogueRun, { horizons: ['24h'] });
+  await insertReplayRow(rogueRun, { horizon: '24h', start: '2026-02-10T00:00:00Z', direction: 'UP', suffix: 'rogue', vintageId: 'rogue-vintage-id' });
+  await insertReport(rogueRun, '24h', 1);
+  await assert.rejects(loadFormalResearchDataset(pool, { validationRunId: rogueRun, evaluationVersion }),
+    error => error.code === 'FORMAL_RESEARCH_MANIFEST_MEMBER_ROGUE');
+  await pool.query('ROLLBACK TO SAVEPOINT rogue_manifest_member');
 });
 
 test('真实PostgreSQL：空run、非SUCCEEDED validation/generation/evaluation均阻断', { skip }, async () => {
@@ -232,9 +303,7 @@ test('真实PostgreSQL：NULL、NaN与future/as-of越界行阻断整个FORMAL输
   ]) {
     await pool.query(`SAVEPOINT ${label}`);
     await insertReplayRow(targetRun, { horizon: '24h', start: '2026-02-10T00:00:00Z', direction: 'UP', suffix: label, ...options });
-    await pool.query(`UPDATE historical_validation.validation_reports SET formal_proxy_disclosure=jsonb_set(formal_proxy_disclosure,
-      '{rerunAuthenticity}', (formal_proxy_disclosure->'rerunAuthenticity') || '{"expected_count":8,"attempted_count":8,"inserted_count":8,"evaluated_count":8}'::jsonb)
-      WHERE validation_run_id=$1 AND horizon='24h' AND report_scope='ALL'`, [targetRun]);
+    await updateReportCount(targetRun, '24h', 8);
     await assert.rejects(loadFormalResearchDataset(pool, { validationRunId: targetRun, evaluationVersion }), error => error.code === expectedCode);
     await pool.query(`ROLLBACK TO SAVEPOINT ${label}`);
   }
@@ -259,7 +328,7 @@ test('真实PostgreSQL：guarded database orchestrator正常运行、重复执�
       const invalidRoot = path.join(artifactRoot, 'does-not-exist');
       await assert.rejects(runFormalResearchFromDatabase({ ...options, statusRoot: failedStatusRoot, artifactRoot: invalidRoot }),
         error => error.code === 'ARTIFACT_ROOT_INVALID');
-      assert.equal(readRunStatus(failedStatusRoot, 'DRY_RUN', targetRun).runState, 'FAILED');
+      assert.equal(findMostRecentRunStatus(failedStatusRoot, 'DRY_RUN').runState, 'FAILED');
     } finally { rmSync(failedStatusRoot, { recursive: true, force: true }); }
   } finally {
     rmSync(artifactRoot, { recursive: true, force: true });
@@ -267,7 +336,7 @@ test('真实PostgreSQL：guarded database orchestrator正常运行、重复执�
   }
 });
 
-test('真实PostgreSQL：repository空结果在读取前已有状态，并以FAILED终止且不发布', { skip }, async () => {
+test('真实PostgreSQL：未知validation身份在建立run identity前失败且不发布', { skip }, async () => {
   const unknownRun = randomUUID();
   const artifactRoot = mkdtempSync(path.join('/private/tmp', 'r3b4-empty-artifact-'));
   const statusRoot = mkdtempSync(path.join('/private/tmp', 'r3b4-empty-status-'));
@@ -275,9 +344,9 @@ test('真实PostgreSQL：repository空结果在读取前已有状态，并以FAI
     const result = await runFormalResearchFromDatabase({ pool, validationRunId: unknownRun, evaluationVersion, artifactMode: 'DRY_RUN',
       statusRoot, artifactRoot, batchSize: 2, scorecardOptions: {}, thresholds, buildArtifactCore: artifactCore });
     assert.equal(result.published, false);
-    assert.equal(result.runStatus.runState, 'FAILED');
-    assert.equal(result.runStatus.blockedReasonCode, 'FORMAL_RESEARCH_VALIDATION_RUN_NOT_FOUND');
-    assert.equal(readRunStatus(statusRoot, 'DRY_RUN', unknownRun).runState, 'FAILED');
+    assert.equal(result.runStatus, null);
+    assert.equal(result.error.code, 'FORMAL_RESEARCH_VALIDATION_RUN_NOT_FOUND');
+    assert.equal(findMostRecentRunStatus(statusRoot, 'DRY_RUN'), null);
   } finally { rmSync(artifactRoot, { recursive: true, force: true }); rmSync(statusRoot, { recursive: true, force: true }); }
 });
 
@@ -293,7 +362,7 @@ test('真实PostgreSQL：checkpoint持久化失败留下FAILED，且不进入art
     assert.equal(result.published, false);
     assert.equal(result.runStatus.runState, 'FAILED');
     assert.equal(result.runStatus.completedBatchIndices.length, 0);
-    assert.equal(readRunStatus(statusRoot, 'DRY_RUN', targetRun).runState, 'FAILED');
+    assert.equal(findMostRecentRunStatus(statusRoot, 'DRY_RUN').runState, 'FAILED');
   } finally {
     rmSync(statusRoot, { recursive: true, force: true });
     rmSync(artifactRoot, { recursive: true, force: true });

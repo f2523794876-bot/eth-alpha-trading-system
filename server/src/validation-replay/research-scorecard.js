@@ -322,7 +322,12 @@ function buildD8AuthoritativeMetrics(pipeline, costs, randomSeed) {
     directionCorrectCount: count(row => row.trend4hDirection === label && row.directionCorrect === true)
   }]));
   const sourceModel = scope.outOfSampleSystem || scope.system;
-  const model = sourceModel?.status === 'EVALUATED' ? {
+  const model = testRows.length === 0 ? {
+    directionCorrectCount: 0,
+    macroF1: 0,
+    preCostExpectedReturn: 0,
+    postCostExpectedReturn: 0
+  } : sourceModel?.status === 'EVALUATED' ? {
     directionCorrectCount: DIRECTIONS.reduce((sum, label) => sum + sourceModel.confusion[label][label], 0),
     macroF1: sourceModel.macroF1,
     preCostExpectedReturn: sourceModel.economics.grossExpectedReturn,
